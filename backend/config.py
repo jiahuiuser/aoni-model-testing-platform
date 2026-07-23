@@ -1,0 +1,30 @@
+"""
+AONI 模型测试平台 — FastAPI 后端配置
+"""
+import os
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+SRC_DIR = PROJECT_ROOT / "src"
+REPORTS_DIR = PROJECT_ROOT / "reports"
+LOGS_DIR = PROJECT_ROOT / "logs"
+
+DATABASE_URL = os.getenv("AONI_DATABASE_URL", f"sqlite+aiosqlite:///{PROJECT_ROOT}/data/aoni_platform.db")
+DATABASE_URL_SYNC = os.getenv("AONI_DATABASE_SYNC", f"sqlite:///{PROJECT_ROOT}/data/aoni_platform.db")
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", "redis://localhost:6379/0")
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", "redis://localhost:6379/0")
+
+# vLLM 默认端口
+VLLM_DEFAULT_PORT = 8300
+VLLM_STARTUP_TIMEOUT = 7200
+
+# 测试默认参数
+DEFAULT_NUM_PROMPTS = 300
+DEFAULT_INPUT_LEN = 512
+DEFAULT_OUTPUT_SHORT = 128
+DEFAULT_OUTPUT_LONG = 512
+
+# 准确率评测默认参数
+DEFAULT_ACC_LIMIT = 200
+DEFAULT_DATASETS = ["mmlu", "ceval", "gsm8k", "arc", "humaneval"]
