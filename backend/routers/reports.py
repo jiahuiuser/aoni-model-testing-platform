@@ -3,7 +3,7 @@
 """
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse
-from sqlalchemy import select, desc
+from sqlalchemy import select, desc, asc
 from sqlalchemy.orm import Session
 
 from backend.database import get_db
@@ -13,25 +13,30 @@ router = APIRouter(prefix="/api/reports", tags=["reports"])
 
 
 @router.get("")
-def api_list_reports(device_id: int = None, db: Session = Depends(get_db)):
-    query = select(ModelRun).order_by(desc(ModelRun.id))
+def api_list_reports(device_id: int = None, task_id: int = None, db: Session = Depends(get_db)):
+    query = select(ModelRun).order_by(desc(ModelRun.completed_at), desc(ModelRun.id))
     if device_id:
         query = query.where(ModelRun.device_id == device_id)
+    if task_id:
+        query = query.where(ModelRun.task_id == task_id)
     query = query.limit(500)
     runs = db.execute(query).scalars().all()
     data = []
     for mr in runs:
         data.append({
-            "id": mr.id, "task_id": mr.task_id,
-            "model_idx": mr.model_idx, "model_name": mr.model_name,
+            "id": mr.id,
+            "task_id": mr.task_id,
+            "task_name": mr.task.name if mr.task else f"任务 #{mr.task_id}",
+            "model_idx": mr.model_idx,
+            "model_name": mr.model_name,
             "model_slug": mr.model_slug,
             "device_id": mr.device_id,
-            "device_name": mr.device_name,
+            "device_name": mr.device_name or "本机",
             "status": mr.status.value if mr.status else "unknown",
             "perf_results_count": len(mr.perf_results or []),
             "acc_results_count": len(mr.acc_results or []),
-            "started_at": mr.started_at.isoformat() if mr.started_at else None,
-            "completed_at": mr.completed_at.isoformat() if mr.completed_at else None,
+            "started_at": (mr.started_at.isoformat() + "Z") if mr.started_at else None,
+            "completed_at": (mr.completed_at.isoformat() + "Z") if mr.completed_at else None,
         })
     return data
 

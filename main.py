@@ -31,6 +31,11 @@ def run_sync_action(args):
 
     env_path = PROJECT_ROOT / "config" / ".env"
     csv_path = PROJECT_ROOT / "data" / "aoni_models_thor128g.csv"
+    os.makedirs(csv_path.parent, exist_ok=True)
+    if not csv_path.exists() and Path("/home/sd1/Desktop/aoni_models_thor128g.csv").exists():
+        import shutil
+        shutil.copy("/home/sd1/Desktop/aoni_models_thor128g.csv", csv_path)
+
     log_dir = PROJECT_ROOT / "logs"
     os.makedirs(log_dir, exist_ok=True)
 

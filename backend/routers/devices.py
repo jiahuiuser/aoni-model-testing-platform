@@ -143,6 +143,14 @@ def api_list_devices(db: Session = Depends(get_db)):
     return [_device_to_dict(d) for d in devices]
 
 
+@router.get("/devices/{device_id}")
+def api_get_device(device_id: int, db: Session = Depends(get_db)):
+    d = db.execute(select(Device).options(joinedload(Device.credential)).where(Device.id == device_id)).unique().scalar_one_or_none()
+    if not d:
+        raise HTTPException(404, "设备不存在")
+    return _device_to_dict(d)
+
+
 @router.post("/devices")
 def api_create_device(data: DeviceCreate, db: Session = Depends(get_db)):
     d = Device(**data.model_dump())
@@ -267,6 +275,7 @@ def api_check_device(device_id: int, db: Session = Depends(get_db)):
 
     # ========== 本机设备 ==========
     if not ssh_info:
+        detail["ssh_ok"] = True  # 本机进程直连访问
         import requests
         try:
             r = requests.get(f"http://{d.host}:{d.port}/api/health", timeout=5)
@@ -274,7 +283,7 @@ def api_check_device(device_id: int, db: Session = Depends(get_db)):
         except Exception as e:
             detail["platform_api"] = str(e)
 
-        res = _local_run("sudo docker ps --format '{{.Names}}' 2>/dev/null | head -10")
+        res = _local_run("docker ps --format '{{.Names}}' 2>/dev/null | head -10")
         if res["ok"]:
             detail["docker_ok"] = True
             detail["docker_containers"] = [x for x in res["stdout"].split("\n") if x.strip()]

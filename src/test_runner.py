@@ -106,6 +106,7 @@ def start_container(original_cmd: str, log_file: Path) -> bool:
     """标准化修改并启动容器，将其标准输出和标准错误输出流记录至 log_file"""
     docker_cmd = build_docker_cmd(original_cmd)
     print(f"  容器启动命令:\n{textwrap.indent(docker_cmd[:350] + '...', '    ')}")
+    os.makedirs(log_file.parent, exist_ok=True)
     with open(log_file, "a") as lf:
         lf.write(f"=== docker cmd ===\n{docker_cmd}\n")
 
@@ -196,15 +197,17 @@ def chat_test(model_name: str, log_file: Path, port: int) -> tuple[bool, str]:
             return False, f"HTTP_{r.status_code}"
 
         data = r.json()
-        content = data["choices"][0]["message"].get("content", "").strip()
-        reasoning = data["choices"][0]["message"].get("reasoning", "")
-        
-        display_content = content[:80]
+        msg = data["choices"][0]["message"]
+        content = (msg.get("content") or "").strip()
+        reasoning = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+        ans = content or reasoning
+
+        display_content = ans[:80]
         if reasoning:
-            print(f"  模型思维链 (reasoning): {reasoning.strip()[:60]}...")
+            print(f"  模型思维链 (reasoning): {reasoning[:60]}...")
             
         print(f"  模型回答: {display_content!r}")
-        return (True, f"PASS: {display_content}") if content else (False, "EMPTY_RESPONSE")
+        return (True, f"PASS: {display_content}") if ans else (False, "EMPTY_RESPONSE")
     except requests.exceptions.Timeout:
         return False, "CHAT_TIMEOUT"
     except Exception as e:

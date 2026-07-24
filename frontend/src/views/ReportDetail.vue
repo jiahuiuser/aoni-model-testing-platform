@@ -103,17 +103,18 @@ const renderPerfChart = () => {
 const renderAccChart = () => {
   if (!accChart.value || !report.value?.acc_results?.length) return
   const chart = echarts.init(accChart.value)
-  const datasets = report.value.acc_results.map(r => r.dataset)
-  const values = report.value.acc_results.map(r => +(r.accuracy || 0) * 100)
+  const datasets = report.value.acc_results.map(r => (r.dataset || '').toUpperCase())
+  const values = report.value.acc_results.map(r => +((r.accuracy || 0) * 100).toFixed(2))
   chart.setOption({
-    title: { text: '准确率评测', left: 'center', textStyle: { fontSize: 14 } },
-    tooltip: {},
+    title: { text: '准确率评测 (Accuracy Score)', left: 'center', textStyle: { fontSize: 14 } },
+    tooltip: { formatter: '{b}: <b>{c}%</b>' },
     xAxis: { type: 'category', data: datasets },
     yAxis: { type: 'value', name: '%', max: 100 },
     series: [{
       type: 'bar',
-      data: values.map(v => ({ value: v, itemStyle: { color: v >= 70 ? '#67c23a' : v >= 50 ? '#e6a23c' : '#f56c6c' } })),
-      label: { show: true, formatter: '{c}%' },
+      barWidth: '40%',
+      data: values.map(v => ({ value: v, itemStyle: { color: v >= 70 ? '#10b981' : v >= 50 ? '#f59e0b' : '#ef4444' } })),
+      label: { show: true, position: 'top', formatter: '{c}%', fontSize: 11, fontWeight: 'bold' },
     }],
   })
 }

@@ -46,9 +46,13 @@
           placeholder="请选择需要测试的模型"
           style="width: 100%"
         >
-          <el-option-group :label="`PASS 模型 (${passModels.length})`">
+          <el-option-group
+            v-for="group in modelsByGroup"
+            :key="group.label"
+            :label="`${group.label} (${group.models.length})`"
+          >
             <el-option
-              v-for="m in passModels"
+              v-for="m in group.models"
               :key="m.slug"
               :label="`#${m.idx} ${m.name}`"
               :value="m.slug"
@@ -94,27 +98,31 @@
                 </el-form-item>
               </el-col>
               <el-col :span="12">
-                <el-form-item label="输出长度" label-width="90px">
+                <el-form-item label="输出场景" label-width="90px">
                   <el-input v-model="round.output_lens_str" size="small" placeholder="逗号分隔, 如: 128,512" />
                 </el-form-item>
               </el-col>
             </el-row>
 
+            <div style="color:#6b7280;font-size:12px;margin:4px 0 10px 90px;line-height:1.4">
+              💡 <b>设定解说</b>：评估标准同时覆盖 <b>128 (短生成)</b> 与 <b>512 (长生成)</b>，用于分别评估首字响应延迟 (TTFT) 与持续生成吞吐 (Tokens/s)。
+            </div>
+
             <el-row :gutter="12">
               <el-col :span="12">
                 <el-form-item label="并发梯度" label-width="90px">
-                  <el-input v-model="round.concurrencies_str" size="small" placeholder="逗号分隔, 留空=默认策略" />
+                  <el-input v-model="round.concurrencies_str" size="small" placeholder="逗号分隔, 留空=阶梯并发 (1,2,4,8...)" />
                 </el-form-item>
               </el-col>
               <el-col :span="12">
-                <el-form-item label="请求数量" label-width="90px">
-                  <el-input v-model.number="round.num_prompts" size="small" placeholder="300" />
+                <el-form-item label="单轮请求数" label-width="90px">
+                  <el-input v-model.number="round.num_prompts" size="small" placeholder="100" />
                 </el-form-item>
               </el-col>
             </el-row>
 
             <div style="color:#909399;font-size:12px">
-              预计用例: {{ calcRoundTests(round) }} 条 ({{ parseOutputLens(round).length }} 输出类型 × {{ parseConcurrencies(round).length }} 并发)
+              预计用例: {{ calcRoundTests(round) }} 条 ({{ parseOutputLens(round).length }} 输出场景 × {{ parseConcurrencies(round).length }} 并发梯度)
             </div>
           </el-card>
         </div>
@@ -153,16 +161,19 @@
         </el-form-item>
       </template>
 
-      <el-divider content-position="left">容器配置 (可选)</el-divider>
-      <el-form-item label="容器端口">
-        <el-input v-model.number="form.config.container_port" placeholder="8300" />
+      <el-divider content-position="left">高级参数 (可选)</el-divider>
+      <el-form-item label="服务部署端口">
+        <el-input v-model.number="form.config.container_port" placeholder="8300 (支持 8080/8300 等)" />
+      </el-form-item>
+      <el-form-item label="显存占用比例上限">
+        <el-input v-model="form.config.gpu_memory_utilization" placeholder="0.8 (例如 0.8 表示使用 80% 显存)" />
       </el-form-item>
       <el-form-item label="自定义 Docker 命令">
         <el-input
           v-model="form.config.docker_command"
           type="textarea"
           :rows="4"
-          placeholder="保留为空则使用 CSV 中配置的命令"
+          placeholder="保留为空则使用该模型配置的独立命令"
         />
       </el-form-item>
 
@@ -191,7 +202,7 @@ function makeDefaultRound() {
     input_len: 512,
     output_lens_str: '128,512',
     concurrencies_str: '',
-    num_prompts: 300,
+    num_prompts: 100,
   }
 }
 
@@ -220,6 +231,24 @@ const onlineDevices = computed(() =>
 const passModels = computed(() =>
   models.value.filter(m => m.status === 'PASS')
 )
+
+const modelsByGroup = computed(() => {
+  const groupsMap = {
+    'NVIDIA_jetson_AGX_Thor': { label: '🚀 NVIDIA Jetson AGX Thor', models: [] },
+    '沐曦C500/N260': { label: '⚡ 沐曦 C500 / N260', models: [] },
+    '英伟达服务器': { label: '🖥️ 英伟达服务器', models: [] },
+  }
+  
+  passModels.value.forEach(m => {
+    const g = m.group_name || 'NVIDIA_jetson_AGX_Thor'
+    if (!groupsMap[g]) {
+      groupsMap[g] = { label: `📦 ${g}`, models: [] }
+    }
+    groupsMap[g].models.push(m)
+  })
+
+  return Object.values(groupsMap).filter(g => g.models.length > 0)
+})
 
 function parseOutputLens(round) {
   return (round.output_lens_str || '').split(',').map(Number).filter(v => v > 0)

@@ -2,6 +2,7 @@
 任务 API 路由 + WebSocket (同步版)
 """
 from typing import Optional
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
 from sqlalchemy import select, func, desc
 from sqlalchemy.orm import Session, selectinload
@@ -27,9 +28,11 @@ def api_create_task(data: TaskCreate, db: Session = Depends(get_db)):
     return _task_to_out(task)
 
 
+from sqlalchemy import select, func, desc, asc
+
 @router.get("", response_model=list[TaskOut])
 def api_list_tasks(db: Session = Depends(get_db)):
-    tasks = db.execute(select(Task).order_by(desc(Task.created_at)).limit(50)).scalars().all()
+    tasks = db.execute(select(Task).order_by(asc(Task.id)).limit(100)).scalars().all()
     return [_task_to_out(t) for t in tasks]
 
 
@@ -64,6 +67,11 @@ def api_delete_task(task_id: int, db: Session = Depends(get_db)):
     task = db.get(Task, task_id)
     if not task:
         raise HTTPException(404, "任务不存在")
+    
+    # 删除任务时，强行停止并删除该任务关联的所有 Docker 测试容器，彻底释放显存与内存空间
+    from backend.services.executor import stop_task_containers
+    stop_task_containers(task)
+
     if task.status in (TaskStatus.RUNNING, TaskStatus.PAUSED):
         cancel_task(db, task_id)
     db.delete(task)
@@ -83,12 +91,31 @@ def api_get_logs(task_id: int, model_slug: Optional[str] = None, limit: int = 20
 # ---------- 辅助函数 ----------
 
 def _task_to_out(t: Task) -> TaskOut:
-    completed = sum(1 for m in (t.model_runs or []) if m.status and m.status.value == "done")
+    model_runs = t.model_runs or []
+    completed = sum(1 for m in model_runs if m.status and m.status.value == "done")
+    
+    # 【自愈状态校准】：如果所有 ModelRun 均已 DONE/100%，但父 Task 状态仍停留在 RUNNING/PAUSED，自动校准为 COMPLETED
+    if len(model_runs) > 0 and completed == len(model_runs) and t.status in (TaskStatus.RUNNING, TaskStatus.PAUSED):
+        t.status = TaskStatus.COMPLETED
+        if not t.completed_at:
+            t.completed_at = datetime.utcnow()
+        try:
+            from backend.database import session_factory
+            with session_factory() as s:
+                db_t = s.get(Task, t.id)
+                if db_t:
+                    db_t.status = TaskStatus.COMPLETED
+                    if not db_t.completed_at:
+                        db_t.completed_at = datetime.utcnow()
+                    s.commit()
+        except Exception:
+            pass
+
     return TaskOut(
         id=t.id, name=t.name, status=t.status.value, profile=t.profile,
         device_id=t.device_id, device_name=t.device.name if t.device else None,
         config=t.config, created_at=t.created_at, started_at=t.started_at,
-        completed_at=t.completed_at, model_count=len(t.model_runs or []),
+        completed_at=t.completed_at, model_count=len(model_runs),
         completed_count=completed,
     )
 

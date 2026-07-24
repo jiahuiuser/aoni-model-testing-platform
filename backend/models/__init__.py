@@ -11,6 +11,10 @@ class Base(DeclarativeBase):
     pass
 
 
+# 导入所有模型，确保 metadata 已注册
+from backend.models.user import User  # noqa: F401, E402
+
+
 # ---------- 模型注册表 ----------
 
 class ModelInfo(Base):
@@ -22,6 +26,7 @@ class ModelInfo(Base):
     slug = Column(String(255), unique=True, nullable=False, index=True)
     docker_command = Column(Text, nullable=True, comment="默认 docker 命令（无设备配置时使用）")
     tos_path = Column(String(500), nullable=True)
+    group_name = Column(String(100), default="NVIDIA_jetson_AGX_Thor", nullable=True, comment="所属硬件组/模块")
     size_category = Column(String(50), nullable=True)
     status = Column(String(20), default="NEW", comment="默认测试状态")
     result_detail = Column(String(500), nullable=True)

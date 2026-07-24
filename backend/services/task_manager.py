@@ -105,12 +105,13 @@ def start_task(task_id: int):
 
 
 def pause_task(db: Session, task_id: int):
+    """暂停任务：挂起测试基准脚本调度，不停止与下线 Docker 容器"""
     _pause_flags[task_id] = True
     task = db.get(Task, task_id)
     if task:
         task.status = TaskStatus.PAUSED
         db.commit()
-        _add_log(db, task_id, "INFO", None, "任务已暂停")
+        _add_log(db, task_id, "INFO", None, "任务已暂停 (基准测试挂起，推理服务容器保持运行中)", "system")
 
 
 def resume_task(task_id: int):
@@ -119,13 +120,16 @@ def resume_task(task_id: int):
 
 
 def cancel_task(db: Session, task_id: int):
+    """取消任务：挂起测试脚本并强行停止与删除 Docker 容器，释放 GPU 显存与内存"""
+    from backend.services.executor import stop_task_containers
     _pause_flags.pop(task_id, None)
     task = db.get(Task, task_id)
     if task:
         task.status = TaskStatus.CANCELLED
         task.completed_at = datetime.utcnow()
         db.commit()
-        _add_log(db, task_id, "INFO", None, "任务已取消")
+        stop_task_containers(task)
+        _add_log(db, task_id, "INFO", None, "任务已取消，测试容器与显存资源已成功释放", "system")
 
 
 def _add_log(db: Session, task_id: int, level: str, model_slug: Optional[str], message: str, module: str = "system"):

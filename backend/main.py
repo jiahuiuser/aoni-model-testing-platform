@@ -12,8 +12,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import logging
 
-from backend.database import init_db
+from backend.database import init_db, session_factory
 from backend.routers import tasks, models, reports, devices
+from backend.routers.auth import router as auth_router, ensure_admin
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("aoni-backend")
@@ -23,6 +24,11 @@ log = logging.getLogger("aoni-backend")
 async def lifespan(app: FastAPI):
     init_db()
     log.info("数据库初始化完成")
+    # 确保默认 admin 账号存在
+    with session_factory() as db:
+        created = ensure_admin(db)
+        if created:
+            log.info("已自动创建默认管理员账号: admin / jiahui123")
     yield
 
 
@@ -40,6 +46,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
 app.include_router(tasks.router)
 app.include_router(models.router)
 app.include_router(reports.router)

@@ -5,6 +5,43 @@ const api = axios.create({
   timeout: 30000,
 })
 
+// 请求拦截器：自动注入 JWT token
+api.interceptors.request.use((config) => {
+  const token = localStorage.getItem('aoni_token')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
+import { ElMessage } from 'element-plus'
+
+// 响应拦截器：401 自动清理与单设备强退提醒
+let isRedirecting = false
+api.interceptors.response.use(
+  res => res,
+  err => {
+    if (err.response?.status === 401 && !isRedirecting) {
+      isRedirecting = true
+      localStorage.removeItem('aoni_token')
+      localStorage.removeItem('aoni_user')
+
+      const detail = err.response?.data?.detail || ''
+      if (detail.includes('SINGLE_DEVICE_KICKED')) {
+        ElMessage.error('您的账号已在另一台设备登录，当前会话已被强制下线！')
+      } else if (!window.location.hash.includes('/login')) {
+        ElMessage.warning('会话失效或已超时，请重新登录')
+      }
+
+      setTimeout(() => {
+        isRedirecting = false
+        window.location.href = '#/login'
+      }, 1000)
+    }
+    return Promise.reject(err)
+  }
+)
+
 // 健康检查
 export const apiHealth = () => api.get('/health').then(r => r.data)
 
@@ -36,3 +73,5 @@ export function wsUrl(path) {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
   return `${proto}//${window.location.host}${path}`
 }
+
+export default api

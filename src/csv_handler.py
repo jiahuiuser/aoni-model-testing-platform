@@ -39,27 +39,30 @@ def read_model_csv(csv_path: Path) -> tuple[list[dict], list[str]]:
     return rows, headers
 
 def update_csv_result(csv_path: Path, row_idx: str, result: str):
-    """更新 CSV 文件中指定编号模型测试结果"""
-    if not csv_path.exists():
-        log.error(f"无法写入：CSV 数据文件不存在: {csv_path}")
-        return
+    """更新 CSV 文件中指定编号模型测试结果 (同时同步 Desktop 与 data/ 目录下的 CSV)"""
+    target_paths = [Path(csv_path), Path("/home/sd1/Desktop/aoni_models_thor128g.csv")]
+    
+    for p in target_paths:
+        if not p.exists():
+            log.warning(f"CSV 数据文件不存在，跳过: {p}")
+            continue
 
-    with open(csv_path, encoding="utf-8-sig", newline="") as f:
-        all_rows = list(csv.reader(f))
+        with open(p, encoding="utf-8-sig", newline="") as f:
+            all_rows = list(csv.reader(f))
 
-    updated = False
-    for i, row in enumerate(all_rows):
-        if i > 0 and row[0].strip() == str(row_idx):
-            while len(row) < 6:
-                row.append("")
-            row[COL_RESULT] = result
-            all_rows[i] = row
-            updated = True
-            break
+        updated = False
+        for i, row in enumerate(all_rows):
+            if i > 0 and row[0].strip() == str(row_idx):
+                while len(row) < 6:
+                    row.append("")
+                row[COL_RESULT] = result
+                all_rows[i] = row
+                updated = True
+                break
 
-    if updated:
-        with open(csv_path, "w", encoding="utf-8-sig", newline="") as f:
-            csv.writer(f).writerows(all_rows)
-        log.info(f"  ✓ 结果写入 CSV 成功: #{row_idx} -> {result!r}")
-    else:
-        log.warning(f"  ✗ 未在 CSV 中找到序号为 #{row_idx} 的模型行，写入跳过")
+        if updated:
+            with open(p, "w", encoding="utf-8-sig", newline="") as f:
+                csv.writer(f).writerows(all_rows)
+            log.info(f"  ✓ 结果写入 CSV 成功: #{row_idx} -> {result!r} ({p.name})")
+        else:
+            log.warning(f"  ✗ 未在 CSV 中找到序号为 #{row_idx} 的模型行 ({p.name})")
