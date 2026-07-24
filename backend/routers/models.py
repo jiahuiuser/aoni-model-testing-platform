@@ -269,6 +269,111 @@ def api_delete_device_config(slug: str, config_id: int, db: Session = Depends(ge
 
 
 # ============================================================
+#  TOS 云端模型自动化扫描与导入
+# ============================================================
+
+class ScanTOSRequest(BaseModel):
+    group_name: str = "NVIDIA_jetson_AGX_Thor"
+    prefix: str = "models/"
+    bucket_name: str = "ai-hub"
+
+
+@router.post("/scan-tos")
+def api_scan_tos_models(data: ScanTOSRequest, db: Session = Depends(get_db)):
+    """扫描 TOS 桶中的模型文件，自动导入为平台模型信息并填充默认 Docker 指令"""
+    import tos
+    ak = "AKLT_REDACTED"
+    sk = "TOS_SECRET_REDACTED"
+    endpoint = "tos-cn-guangzhou.volces.com"
+    region = "cn-guangzhou"
+    bucket = data.bucket_name or "ai-hub"
+    group_name = data.group_name or "NVIDIA_jetson_AGX_Thor"
+    prefix = data.prefix or "models/"
+
+    try:
+        client = tos.TosClientV2(ak, sk, endpoint, region)
+        out = client.list_objects_type2(bucket, prefix=prefix)
+    except Exception as e:
+        raise HTTPException(500, f"连接 TOS 云端扫描失败: {str(e)}")
+
+    existing_models = db.execute(select(ModelInfo)).scalars().all()
+    existing_slugs = {m.slug: m for m in existing_models}
+
+    new_added = 0
+    updated_count = 0
+    scanned_items = []
+
+    for obj in out.contents:
+        key = obj.key
+        if key.endswith("/") or not (key.endswith(".tar.gz") or key.endswith(".gguf") or key.endswith(".tar")):
+            continue
+
+        rel_path = key[len(prefix):] if key.startswith(prefix) else key
+        rel_path = rel_path.lstrip("/")
+
+        clean_name = rel_path
+        for ext in (".tar.gz", ".gguf", ".tar"):
+            if clean_name.endswith(ext):
+                clean_name = clean_name[:-len(ext)]
+                break
+
+        model_name = clean_name
+        slug = clean_name.lower().replace("/", "-").replace("_", "-").replace(".", "-")
+        tos_uri = f"tos://{bucket}/{key}"
+
+        # 构造默认 Docker 指令
+        if key.endswith(".gguf"):
+            default_docker_cmd = (
+                f"sudo docker run -it --rm --runtime=nvidia --network host "
+                f"-e MODEL_OSS=True -e MODEL_ROOT=/models -e ENGINE_URI={tos_uri} "
+                f"-e MODEL_NAME={model_name} -v ~/models:/models "
+                f"ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor llama-server "
+                f"-m /models/{clean_name} --port 8300 -ngl 999 -c 4096"
+            )
+        else:
+            default_docker_cmd = (
+                f"sudo docker run -it --rm --runtime=nvidia --network host "
+                f"-e MODEL_OSS=True -e MODEL_ROOT=/models -e ENGINE_URI={tos_uri} "
+                f"-e MODEL_NAME={model_name} -v ~/models:/models "
+                f"aoni/nvidia-ai-iot/vllm:latest-jetson-thor vllm serve {model_name} "
+                f"--port 8300 --max-model-len 4096 --gpu-memory-utilization 0.8"
+            )
+
+        scanned_items.append({"name": model_name, "slug": slug, "tos_path": tos_uri, "size": obj.size})
+
+        if slug not in existing_slugs:
+            max_idx = max([m.idx for m in existing_models if m.idx is not None] + [0])
+            new_idx = max_idx + 1
+            new_model = ModelInfo(
+                idx=new_idx,
+                name=clean_name.split("/")[-1],
+                slug=slug,
+                group_name=group_name,
+                docker_command=default_docker_cmd,
+                tos_path=tos_uri,
+                status="NEW",
+            )
+            db.add(new_model)
+            existing_models.append(new_model)
+            existing_slugs[slug] = new_model
+            new_added += 1
+        else:
+            m = existing_slugs[slug]
+            if not m.tos_path:
+                m.tos_path = tos_uri
+                updated_count += 1
+
+    db.commit()
+    return {
+        "message": f"TOS 云端扫描完成，共探测到 {len(scanned_items)} 个模型文件，新增 {new_added} 个模型，更新 {updated_count} 个模型",
+        "scanned_count": len(scanned_items),
+        "new_added": new_added,
+        "updated_count": updated_count,
+        "items": scanned_items,
+    }
+
+
+# ============================================================
 #  一键测试 (支持设备维度) & 容器清理保障
 # ============================================================
 

@@ -6,6 +6,9 @@
         <el-button type="primary" @click="showAddDialog">
           <el-icon><Plus /></el-icon> 新增模型
         </el-button>
+        <el-button type="success" plain @click="handleScanTOS" :loading="scanningTOS">
+          <el-icon><Cloudy /></el-icon> 扫描 TOS 仓库导入
+        </el-button>
         <el-button type="success" plain :disabled="selectedModels.length !== 1" @click="openRunTestDialog">
           <el-icon><VideoPlay /></el-icon> 模型验证
         </el-button>
@@ -434,6 +437,26 @@ const copyCmd = (cmd) => {
   if (!cmd) return
   navigator.clipboard.writeText(cmd)
   ElMessage.success('运行指令已成功复制到剪贴板')
+}
+
+const scanningTOS = ref(false)
+
+const handleScanTOS = async () => {
+  scanningTOS.value = true
+  try {
+    const targetGrp = activeGroup.value === 'ALL' ? 'NVIDIA_jetson_AGX_Thor' : activeGroup.value
+    const resp = await axios.post('/api/models/scan-tos', {
+      group_name: targetGrp,
+      prefix: 'models/',
+      bucket_name: 'ai-hub'
+    })
+    ElMessage.success(resp.data.message || 'TOS 云端模型扫描完成')
+    await loadModels()
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '扫描 TOS 仓库失败')
+  } finally {
+    scanningTOS.value = false
+  }
 }
 
 const loadModels = async () => {
