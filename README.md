@@ -1,31 +1,31 @@
 # AONI 智能体模型平台
 
-NVIDIA Jetson AGX Thor (T5000) 多设备模型运维与测试平台。支持 43 款 LLM/VLM 的自动化部署、性能测试、准确率评测，并提供 Web 管理界面进行多设备调度管理。
+NVIDIA Jetson AGX Thor (T5000) 多设备模型运维与测试平台。支持 43 款 LLM/VLM 的自动化部署、vLLM 矩阵性能测试、EvalScope 准确率评测，并提供高颜值 Vue 3 Web 管理界面与多设备远程 SSH 调度管理。
 
 ---
 
-## 架构概览
+## 🚀 核心特性
+
+- **多设备 SSH 远程调度**：支持本机与远程 Jetson Thor 节点调度，集成基于 SSH (sshpass/密钥) 的远程 Docker 部署与健康度深度检测（GPU/CPU/内存/磁盘/vLLM）。
+- **TOS 云端模型扫描与勾选导入**：集成火山引擎 TOS 存储，支持一键目录前缀扫描、模型文件预览与批量增量导入。
+- **高阶性能矩阵与测试看板**：基于 vLLM Bench，支持不同并发梯度（1~64）、输入/输出 Token 长度等级（短/中/长）的吞吐量 (tok/s)、TTFT、TPOT、ITL 均值及 P99 折线图联动对比。
+- **用户权限与酷炫交互**：支持 JWT 身份认证、用户管理 (Admin/User)、多套动态科技主题皮肤（Cyber Nebula, Neon Aurora, Sunset Gold, Glacier Crystal）及 Aoni 矢量青蛙 Mascot 交互动画。
+- **并发稳定与自愈机制**：后端升级 SQLite WAL 模式、自动展开 `~` 绝对路径、无死锁非交互 Shell 调度及任务自愈检测。
+
+---
+
+## 🏗️ 架构概览
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    Vue3 Web 管理界面                         │
-│               http://192.168.1.40:5173                      │
-│  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌───────┐ │
-│  │ 任务管理 │ │ 模型管理 │ │ 设备管理 │ │ 凭证管理 │ │ 报告  │ │
-│  └─────────┘ └─────────┘ └─────────┘ └─────────┘ └───────┘ │
+│             Vue3 Web 管理界面 (端口 5173 / Pinia / ECharts)  │
+│ 任务管理 │ 模型管理 │ 设备管理 │ 凭证管理 │ 测试报告 │ 用户管理 │
 └──────────────────────────┬──────────────────────────────────┘
-                           │ REST API
+                           │ REST API / SSE 流式日志
 ┌──────────────────────────┴──────────────────────────────────┐
 │                  FastAPI 后端 (端口 8800)                    │
-│  ┌────────────┐ ┌──────────────┐ ┌───────────────────────┐  │
-│  │ Task CRUD  │ │ Model + 设备 │ │ 报告生成 (JSON/MD)     │  │
-│  │ 后台线程   │ │ 专属配置     │ │ 性能/准确率对比        │  │
-│  └────────────┘ └──────────────┘ └───────────────────────┘  │
-│                            │                                 │
-│  ┌─────────────────────────┴─────────────────────────────┐  │
-│  │                 RemoteRunner                           │  │
-│  │   本地 sudo docker  ←→  SSH 远程执行 (sshpass/ssh-key) │  │
-│  └───────────────────────────────────────────────────────┘  │
+│  Task CRUD │ Model + TOS 扫描 │ JWT Auth │ 报告生成 (JSON/MD) │
+│  RemoteRunner (本机免 sudo Docker / SSH 远程节点调度)          │
 └──────────────────────────┬──────────────────────────────────┘
                            │
 ┌──────────────────────────┴──────────────────────────────────┐
@@ -37,236 +37,139 @@ NVIDIA Jetson AGX Thor (T5000) 多设备模型运维与测试平台。支持 43 
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## 目录结构
+---
+
+## 📂 目录结构
 
 ```
-aoni-model-platform/
+Aoni_Model_Testing_Platform/
 ├── backend/                        # FastAPI 后端
 │   ├── main.py                     # 入口 (端口 8800)
-│   ├── config.py                   # 配置 (SQLite/Redis/vLLM 参数)
-│   ├── database.py                 # SQLAlchemy 连接管理
+│   ├── config.py                   # 全局配置 (自动加载 config/.env)
+│   ├── database.py                 # SQLAlchemy WAL 模式连接管理
+│   ├── auth.py                     # JWT 认证与密码 Hash
 │   ├── requirements.txt            # Python 依赖
 │   ├── models/
-│   │   └── __init__.py             # ORM: ModelInfo/Device/Credential/Task/PerfResult...
+│   │   ├── __init__.py             # ORM: ModelInfo/Device/Credential/Task/PerfResult...
+│   │   └── user.py                 # ORM: User 用户表
 │   ├── schemas/
 │   │   └── __init__.py             # Pydantic 请求/响应模型
 │   ├── routers/
-│   │   ├── tasks.py                # 任务 CRUD + WebSocket 日志推送
-│   │   ├── models.py               # 模型 CRUD + 设备配置 + 一键测试
-│   │   ├── devices.py              # 设备 CRUD + 凭证管理 + 健康检查(SSH)
-│   │   └── reports.py              # 报告列表/详情/下载/对比图表
+│   │   ├── auth.py                 # 登录/登出/当前用户信息
+│   │   ├── tasks.py                # 任务 CRUD + 实时日志推送
+│   │   ├── models.py               # 模型 CRUD + TOS 动态扫描 + 设备配置 + 一键测试
+│   │   ├── devices.py              # 设备 CRUD + 凭证管理 + SSH 健康检测
+│   │   └── reports.py              # 报告列表/详情/对比图表/Markdown 下载
 │   └── services/
-│       ├── executor.py             # 主执行器 (本地/SSH RemoteRunner)
-│       ├── task_manager.py         # 任务生命周期 (创建/暂停/恢复/取消)
+│       ├── executor.py             # 主执行器 (本地/SSH RemoteRunner + raw logs)
+│       ├── task_manager.py         # 任务生命周期 (创建/暂停/恢复/取消/自愈)
 │       ├── pipeline.py             # 模型分类 & 并发梯度策略
 │       └── scheduler.py            # 执行排序 (小模型优先)
 ├── frontend/                       # Vue3 前端
 │   ├── vite.config.js              # Vite 配置 (端口 5173, API 代理)
-│   ├── package.json                # 依赖: Vue3/Element-Plus/ECharts/Axios
+│   ├── package.json                # 依赖: Vue3/Element-Plus/ECharts/Pinia/Axios
 │   └── src/
-│       ├── App.vue                 # 主布局 (侧边栏 + 路由)
-│       ├── router/index.js         # 7 个页面路由
-│       ├── api/index.js            # Axios API 封装
+│       ├── App.vue                 # 主布局 (侧边栏 + 状态同步 + 探针Modal)
+│       ├── router/index.js         # 8 个页面路由 (带路由守卫)
+│       ├── api/index.js            # Axios 封装 (带 JWT 拦截)
+│       ├── stores/                 # Pinia 状态库 (authStore, testStore)
 │       └── views/
-│           ├── TaskList.vue        # 任务列表
-│           ├── TaskCreate.vue      # 创建任务 (选设备→选模型→配置)
-│           ├── TaskDetail.vue      # 任务详情 (分模块日志)
-│           ├── ModelManagement.vue # 模型管理 + 设备配置
+│           ├── Login.vue           # 炫酷登录页 (4套主题 + 青蛙 Mascot + 粒子)
+│           ├── TaskList.vue        # 任务列表 (分视角展示)
+│           ├── TaskCreate.vue      # 创建任务 (选设备→选模型→梯度参数配置)
+│           ├── TaskDetail.vue      # 任务详情 (分模块 SSE 日志)
+│           ├── ModelManagement.vue # 模型管理 + TOS 扫描导入 + 设备配置
 │           ├── DeviceManagement.vue# 设备管理 + 凭证管理
-│           ├── Reports.vue         # 报告列表 (按设备筛选)
-│           └── ReportDetail.vue    # 报告详情 (性能/准确率图表)
-├── src/                            # 遗留 CLI 工具 (离线模型下载/测试)
-│   ├── downloader.py               # ModelScope 16线程下载 + pigz 打包
-│   ├── uploader.py                 # 火山引擎 TOS 分片上传
-│   ├── test_runner.py              # Docker 自动化测试
-│   ├── benchmark/
-│   │   ├── perf_runner.py          # vLLM bench 性能基准
-│   │   ├── accuracy_runner.py      # EvalScope 准确率评测
-│   │   └── report_generator.py     # Markdown 报告生成
-│   └── csv_handler.py              # CSV 读写
+│           ├── Reports.vue         # 报告列表 + 多模型对比看板
+│           ├── ReportDetail.vue    # 报告详情 (矩阵图表联动/折线对比)
+│           └── UserManagement.vue  # 用户权限管理 (仅管理员)
+├── config/
+│   └── .env                        # 本地敏感配置 (TOS AK/SK, HF Token, 代理)
 ├── data/
-│   ├── aoni_platform.db            # SQLite 数据库 (运行时)
-│   ├── aoni_models_thor128g.csv    # 43 款模型 CSV (已迁移到 DB)
+│   ├── aoni_platform.db            # SQLite 数据库 (WAL 模式)
 │   └── benchmark_strategies.csv    # 性能测试策略矩阵
-├── migrate_csv_to_db.py            # CSV → SQLite 一次性迁移脚本
-├── main.py                         # CLI 总控 (sync/test/perf/accuracy/report)
-└── config/.env                     # 敏感凭证 (TOS/HF/代理)
+├── scripts/
+│   ├── seed_demo_reports.py        # 评测报告演示数据播种脚本
+│   └── migrate_add_model_group.py  # 数据库迁移脚本
+└── README.md
 ```
 
-## 数据库设计
+---
 
-9 张核心表：
+## 🗄️ 数据库设计
 
-| 表 | 说明 |
-|----|------|
-| `models` | 模型注册 (name/slug/docker_command/tos_path/size/status) |
-| `model_device_configs` | 模型-设备多对多配置 (每设备专属 docker 命令+测试状态) |
-| `credentials` | SSH 凭证 (支持密钥路径 ssh_key 或密码 password 两种) |
-| `devices` | 设备注册 (IP/类型/GPU/CPU/内存 + credential_id) |
-| `tasks` | 测试任务 (queued→running→completed/failed/cancelled) |
-| `model_runs` | 单模型执行记录 (deploying→validating→perf_testing→acc_testing→done) |
-| `perf_results` | 性能明细 (吞吐/ TTFT/TPOT/ITL 均值及 P99) |
-| `acc_results` | 准确率 (按数据集 mmlu/ceval/gsm8k/arc) |
+基于 SQLite (WAL 模式)，包含 10 张核心表：
+
+| 表名 | 说明 |
+|------|------|
+| `users` | 用户账号表 (username/password_hash/role: admin/user) |
+| `models` | 模型注册 (name/slug/group_name/docker_command/tos_path/size/status) |
+| `model_device_configs` | 模型-设备专属配置 (设备专属 docker 命令 + PASS/FAIL 状态) |
+| `credentials` | SSH 凭证 (密钥路径 `ssh_key` 或密码 `password`) |
+| `devices` | 设备注册 (IP/GPU/CPU/内存/ credential_id) |
+| `tasks` | 测试任务生命周期 (queued → running → completed/failed/cancelled) |
+| `model_runs` | 单模型执行记录 (deploying → validating → perf_testing → acc_testing → done) |
+| `perf_results` | 性能评测明细 (输入输出长度/并发/吞吐 tok/s/ TTFT/TPOT/ITL P99) |
+| `acc_results` | 准确率明细 (mmlu/ceval/gsm8k/arc) |
 | `task_logs` | 模块化日志 (container/vllm/perf/accuracy/system) |
 
-### 设备管理架构
+---
 
-```
-Device ──credential_id──> Credential
-  │                         ├── type: ssh_key → ssh_key_path
-  │                         └── type: password → password
-  │
-  └── ModelDeviceConfig (每个设备专属的 docker 命令和测试状态)
-```
+## ⚡ 快速启动
 
-- **本机设备**: credential_id = null，所有命令本地执行
-- **远程设备**: 通过 SSH (sshpass 密码 或 ssh -i 密钥) 连接并执行 docker 命令
-- 设备健康检查会探测: SSH/Docker/GPU/内存/磁盘/CPU/vLLM
-
-### 模型-设备配置
-
-每个模型可以有多个设备配置，不同设备可以有不同的 docker 命令：
-
-```
-ModelInfo ──< ModelDeviceConfig >── Device
-              ├── docker_command (该设备专属)
-              └── status (NEW/PASS/FAIL)
-```
-
-任务创建时选择设备后，只显示**该设备上有配置且 PASS** 的模型。
-
-## API 接口
-
-| 方法 | 路径 | 说明 |
-|------|------|------|
-| GET | `/api/health` | 健康检查 |
-| GET/POST | `/api/models` | 模型列表/创建，支持 `?device_id=` 按设备筛选 |
-| PUT/DELETE | `/api/models/{slug}` | 模型编辑/删除 |
-| GET/POST | `/api/models/{slug}/device-configs` | 设备配置列表/添加 |
-| PUT/DELETE | `/api/models/{slug}/device-configs/{id}` | 设备配置编辑/删除 |
-| POST | `/api/models/{slug}/test?device_id=` | 一键测试 (启动容器→等待vLLM→对话验证) |
-| GET/POST | `/api/devices` | 设备列表/添加 |
-| PUT/DELETE | `/api/devices/{id}` | 设备编辑/删除 |
-| POST | `/api/devices/{id}/check` | 健康检测 (SSH/Docker/GPU/Mem/Disk/CPU/vLLM) |
-| GET/POST | `/api/credentials` | 凭证列表/创建 |
-| PUT/DELETE | `/api/credentials/{id}` | 凭证编辑/删除 |
-| GET/POST | `/api/tasks` | 任务列表/创建 |
-| GET | `/api/tasks/{id}` | 任务详情 |
-| POST | `/api/tasks/{id}/start` | 启动任务 |
-| POST | `/api/tasks/{id}/pause` | 暂停任务 |
-| POST | `/api/tasks/{id}/resume` | 恢复任务 |
-| POST | `/api/tasks/{id}/cancel` | 取消任务 |
-| GET | `/api/tasks/{id}/logs` | 任务日志 |
-| GET | `/api/reports` | 报告列表，支持 `?device_id=` 筛选 |
-| GET | `/api/reports/{id}` | 报告详情 |
-| GET | `/api/reports/{id}/download` | 下载 Markdown 报告 |
-| GET | `/api/reports/throughput-compare` | 吞吐量对比数据 |
-| GET | `/api/reports/accuracy-compare` | 准确率对比数据 |
-
-## 快速启动
-
-### 环境要求
-
+### 1. 环境要求
 - Python 3.10+
 - Node.js 18+
-- Docker + nvidia-container-toolkit
-- sshpass (远程设备管理需要)
-- pigz, pigz (CLI 工具需要)
+- Docker + `nvidia-container-toolkit`
+- `sshpass` (远程节点调度需要)
 
-### 1. 安装后端依赖
+### 2. 配置文件说明
+复制或编辑 `config/.env`（已加 `.gitignore` 保护）：
+```env
+# TOS 凭证
+TOS_ACCESS_KEY=your_access_key
+TOS_SECRET_KEY=your_secret_key
+TOS_ENDPOINT=https://tos-cn-guangzhou.volces.com
+TOS_BUCKET=ai-hub
+
+# HuggingFace Token
+HF_TOKEN=your_hf_token
+
+# 代理配置 (可选)
+HTTP_PROXY=http://127.0.0.1:7897
+HTTPS_PROXY=http://127.0.0.1:7897
+```
+
+### 3. 安装依赖与启动服务
 
 ```bash
-cd aoni-model-platform
+# 启动后端 (端口 8800)
 pip install -r backend/requirements.txt
-```
-
-### 2. 安装前端依赖
-
-```bash
-cd frontend
-npm install
-```
-
-### 3. 初始化数据库 & 迁移数据
-
-```bash
-# 创建表结构并导入 CSV 中的 43 个模型
-python3 migrate_csv_to_db.py
-```
-
-### 4. 启动后端
-
-```bash
 python3 -m uvicorn backend.main:app --host 0.0.0.0 --port 8800
 ```
 
-### 5. 启动前端开发服务器
+在另一个终端启动前端：
 
 ```bash
+# 启动前端开发服务 (端口 5173)
 cd frontend
+npm install
 npm run dev -- --host 0.0.0.0
 ```
 
-前端: `http://<IP>:5173`  
-后端: `http://<IP>:8800`
+访问链接：
+- **前端 Web 界面**: `http://<服务器IP>:5173`
+- **后端 API 文档**: `http://<服务器IP>:8800/docs`
 
-## 使用流程
+---
 
-### 添加远程设备
+## 🛠️ 技术栈
 
-1. 打开 **设备管理** → "凭证管理" → 添加 SSH 凭证 (密钥路径或密码)
-2. "添加设备" → 填写 IP → 选择凭证 → 保存
-3. 点击 "检测" 验证设备连通性 (SSH/Docker/GPU/内存)
-
-### 模型设备配置
-
-1. 打开 **模块管理** → 点击模型的 "设备配置" 按钮
-2. 选择设备 → 填写该设备专属的 docker 命令
-3. 在目标设备上测试通过后，status 变为 PASS
-
-### 创建任务
-
-1. 打开 **任务管理** → "创建任务"
-2. 选择执行设备 → 系统自动显示该设备上 PASS 的模型
-3. 勾选要测试的模型 → 配置测试参数 → 创建
-4. 启动任务，实时查看分模块日志
-
-### 查看报告
-
-1. 打开 **测试报告** → 可按设备筛选
-2. 点击报告查看性能/准确率详细图表
-3. 可下载 Markdown 格式报告
-
-## CLI 工具 (遗留)
-
-```bash
-# 同步模型到 TOS
-python3 main.py sync --task gemma
-
-# 批量测试
-python3 main.py test --start 1 --end 43
-
-# 断点续测
-python3 main.py test --resume
-
-# 性能测试
-python3 main.py perf --model functiongemma
-
-# 准确率评测
-python3 main.py accuracy --model qwen2.5-7b --datasets mmlu,ceval --limit 200
-
-# 生成报告
-python3 main.py report
-```
-
-## 技术栈
-
-| 层级 | 技术 |
+| 层级 | 技术栈 |
 |------|------|
-| 前端 | Vue 3 + Vite + Element Plus + ECharts + Axios |
-| 后端 | FastAPI + SQLAlchemy + SQLite + subprocess |
-| 远程执行 | sshpass / OpenSSH (密码或密钥认证) |
-| 容器 | Docker + nvidia-container-toolkit |
-| 推理 | vLLM (vllm bench serve) |
-| 评测 | EvalScope + ModelScope 数据集 |
-| 存储 | 火山引擎 TOS (模型权重) |
+| **前端** | Vue 3 + Vite + Element Plus + ECharts + Pinia + Canvas Particle FX |
+| **后端** | FastAPI + SQLAlchemy (WAL Mode) + Uvicorn + Server-Sent Events (SSE) |
+| **安全认证** | JWT Token + Passlib (Bcrypt Password Hashing) |
+| **远程执行** | SSH RemoteRunner (sshpass / OpenSSH) + 本地免 sudo Docker 进程 |
+| **推理与评测** | vLLM (vllm bench serve) + EvalScope |
+| **云端存储** | 火山引擎 TOS (Model Weight Sync) |
