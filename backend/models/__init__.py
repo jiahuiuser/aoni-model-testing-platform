@@ -30,6 +30,10 @@ class ModelInfo(Base):
     size_category = Column(String(50), nullable=True)
     status = Column(String(20), default="NEW", comment="默认测试状态")
     result_detail = Column(String(500), nullable=True)
+    is_external = Column(Integer, default=0, comment="是否为已部署外部 API 接入模式 (0: 否, 1: 是)")
+    api_base = Column(String(500), nullable=True, comment="外部 API Base URL，如 http://192.168.1.40:8000/v1")
+    api_key = Column(String(255), nullable=True, default="EMPTY", comment="API Key")
+    model_endpoint_name = Column(String(255), nullable=True, comment="远程 API 服务模型标识名")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     device_configs = relationship("ModelDeviceConfig", back_populates="model", cascade="all, delete-orphan")
@@ -87,6 +91,7 @@ class Device(Base):
     name = Column(String(255), nullable=False, comment="设备名称")
     host = Column(String(255), nullable=False, comment="IP 地址或主机名")
     device_type = Column(String(50), default="jetson", comment="设备类型: jetson / server / cloud")
+    chip_type = Column(String(50), default="nvidia_thor", comment="芯片类型: nvidia_thor / metax_c500_n260 / nvidia_rtx5090 / mthreads_musa")
     port = Column(Integer, default=8800, comment="vLLM 默认端口")
 
     # SSH 凭证 (nullable = 本机设备无需凭证)
@@ -105,10 +110,13 @@ class Device(Base):
     last_check_detail = Column(JSON, nullable=True, comment="最近一次检测详情")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    bound_image_id = Column(Integer, ForeignKey("docker_images.id", ondelete="SET NULL"), nullable=True)
+
     # 关联
     credential = relationship("Credential")
     tasks = relationship("Task", back_populates="device")
     model_runs = relationship("ModelRun", back_populates="device")
+    bound_image = relationship("DockerImage")
 
 
 # ---------- 任务状态枚举 ----------
@@ -133,10 +141,12 @@ class StageStatus(str, enum.Enum):
 class ModelStage(str, enum.Enum):
     DEPLOYING = "deploying"
     VALIDATING = "validating"
+    GATEWAY_TESTING = "gateway_testing"
     PERF_TESTING = "perf_testing"
     ACC_TESTING = "acc_testing"
     REPORTING = "reporting"
     DONE = "done"
+    FAILED = "failed"
 
 
 # ---------- 任务 ----------
@@ -146,7 +156,7 @@ class Task(Base):
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(255), nullable=False)
-    status = Column(SAEnum(TaskStatus), default=TaskStatus.QUEUED)
+    status = Column(String(50), default="queued", comment="任务状态: queued/running/paused/completed/failed/cancelled")
     profile = Column(String(50), default="full")  # quick / perf / accuracy / full / custom
 
     user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
@@ -185,7 +195,7 @@ class ModelRun(Base):
     device_id = Column(Integer, ForeignKey("devices.id", ondelete="SET NULL"), nullable=True)
     device_name = Column(String(255), nullable=True)
 
-    status = Column(SAEnum(ModelStage), default=ModelStage.DEPLOYING)
+    status = Column(String(50), default="deploying", comment="模型测试阶段: deploying/validating/gateway_testing/perf_testing/acc_testing/reporting/done/failed")
     stage_status = Column(JSON, default=dict)
 
     # 容器信息
@@ -202,6 +212,7 @@ class ModelRun(Base):
 
     task = relationship("Task", back_populates="model_runs")
     device = relationship("Device", back_populates="model_runs")
+    gateway_results = relationship("GatewayResult", back_populates="model_run", cascade="all, delete-orphan")
     perf_results = relationship("PerfResult", back_populates="model_run", cascade="all, delete-orphan")
     acc_results = relationship("AccResult", back_populates="model_run", cascade="all, delete-orphan")
 
@@ -260,6 +271,86 @@ class AccResult(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     model_run = relationship("ModelRun", back_populates="acc_results")
+
+
+# ---------- 网关协议与工具测试结果 ----------
+
+class GatewayResult(Base):
+    __tablename__ = "gateway_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_run_id = Column(Integer, ForeignKey("model_runs.id", ondelete="CASCADE"))
+
+    category = Column(String(50), nullable=False)  # reachability / protocol / feature
+    test_item = Column(String(255), nullable=False)  # 测试项名称
+    protocol = Column(String(50), default="system")  # openai / anthropic / responses / system
+    status = Column(String(20), default="SKIP")  # PASS / FAIL / SKIP
+    latency_ms = Column(Float, nullable=True)
+    message = Column(Text, nullable=True)
+    raw_details = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    model_run = relationship("ModelRun", back_populates="gateway_results")
+
+
+# ---------- 硬件组管理 ----------
+
+class HardwareGroup(Base):
+    __tablename__ = "hardware_groups"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), unique=True, nullable=False, comment="硬件组名称")
+    description = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ---------- 测试用例模板 ----------
+
+class TestTemplate(Base):
+    __tablename__ = "test_templates"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, comment="模板名称")
+    description = Column(String(500), nullable=True)
+    num_prompts = Column(Integer, default=300)
+    input_lens = Column(JSON, default=list, comment="输入 Token 长度数组，如 [128, 512, 1024]")
+    output_lens = Column(JSON, default=list, comment="输出 Token 长度数组，如 [128, 512]")
+    concurrencies = Column(JSON, default=list, comment="并发数梯度数组，如 [1, 4, 8, 16, 32]")
+    datasets = Column(JSON, default=list, comment="测试数据集，如 ['mmlu', 'ceval']")
+    acc_limit = Column(Integer, default=200)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ---------- 数据集明细管理 ----------
+
+class DatasetInfo(Base):
+    __tablename__ = "dataset_infos"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(100), unique=True, nullable=False, comment="数据集名称: mmlu/ceval/gsm8k等")
+    source = Column(String(100), default="ModelScope/EvalScope", comment="来源库或仓库ID")
+    status = Column(String(20), default="ready", comment="ready / downloading / failed")
+    download_progress = Column(Float, default=100.0)
+    sample_count = Column(Integer, default=0, comment="样本总量")
+    description = Column(String(500), nullable=True)
+    file_path = Column(String(500), nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+# ---------- Docker 镜像管理 ----------
+
+class DockerImage(Base):
+    __tablename__ = "docker_images"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, comment="镜像显示名称")
+    image_tag = Column(String(255), nullable=False, comment="Docker 镜像标签，如 nvcr.io/nvidia/vllm:v0.6.3-thor")
+    download_url = Column(String(500), nullable=True, comment="镜像文件/仓库下载 URL")
+    hardware_group = Column(String(100), default="NVIDIA_jetson_AGX_Thor", nullable=True)
+    status = Column(String(20), default="ready", comment="ready / downloading / failed / deployed")
+    description = Column(String(500), nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
 # ---------- 日志 ----------

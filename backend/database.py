@@ -35,6 +35,24 @@ def init_db():
             conn.commit()
         except Exception:
             pass
+        try:
+            from sqlalchemy import text
+            conn.execute(text("ALTER TABLE devices ADD COLUMN bound_image_id INTEGER"))
+            conn.commit()
+        except Exception:
+            pass
+        for col_def in [
+            "is_external INTEGER DEFAULT 0",
+            "api_base VARCHAR(500)",
+            "api_key VARCHAR(255) DEFAULT 'EMPTY'",
+            "model_endpoint_name VARCHAR(255)",
+        ]:
+            try:
+                from sqlalchemy import text
+                conn.execute(text(f"ALTER TABLE models ADD COLUMN {col_def}"))
+                conn.commit()
+            except Exception:
+                pass
 
 
 def get_db() -> Session:

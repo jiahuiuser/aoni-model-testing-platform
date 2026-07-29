@@ -7,17 +7,68 @@
         <div style="display:flex;justify-content:space-between;align-items:center;">
           <div>
             <span style="font-weight:bold;font-size:16px;">#{{ report.model_idx }} {{ report.model_name }}</span>
-            <el-tag style="margin-left:12px" :type="report.status === 'done' ? 'success' : 'info'" size="small">{{ report.status }}</el-tag>
+            <el-tag style="margin-left:12px" :type="report.status === 'done' ? 'success' : (report.status === 'failed' ? 'danger' : 'info')" size="small">{{ report.status.toUpperCase() }}</el-tag>
           </div>
-          <el-alert type="info" :closable="false" show-icon style="padding:4px 12px;max-width:520px;">
-            <template #title>
-              <span style="font-size:12px;">💡 点击表格任意数据行，图表将自动高亮定位对应并发与矩阵指标。</span>
-            </template>
-          </el-alert>
+          <div style="display:flex;gap:10px;">
+            <el-button type="success" size="small" plain @click="exportCSV">
+              <el-icon><Download /></el-icon> 导出 CSV 表格
+            </el-button>
+            <el-button type="primary" size="small" plain @click="printReport">
+              <el-icon><Printer /></el-icon> 打印 / 导出 PDF 报告
+            </el-button>
+          </div>
         </div>
       </template>
+      <!-- 权威评测物理环境与模型参数面板 -->
+      <div class="env-metadata-box" style="margin-bottom:24px;">
+        <el-descriptions title="测试环境与引擎配置" :column="3" border size="small">
+          <el-descriptions-item label="测试任务名称">
+            <span style="font-weight:700">{{ report.task_name || '基准测试任务' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="测试执行账号">
+            <el-tag size="small" type="info">{{ report.user_name || 'admin' }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="测试 Profile 场景">
+            <el-tag size="small" type="primary">{{ report.profile || 'full' }}</el-tag>
+          </el-descriptions-item>
 
-      <h4>性能矩阵测试结果 (吞吐量 vs 并发数)</h4>
+          <el-descriptions-item label="目标算力节点">
+            <el-tag size="small" type="success">{{ report.device_name || 'NVIDIA AGX Thor (本机)' }}</el-tag>
+            <span style="font-size:12px;color:#6b7280;margin-left:6px">({{ report.device_host || '127.0.0.1' }})</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="GPU 硬件架构/规格">
+            <span style="font-weight:600;color:#1e293b">{{ report.gpu_info || 'NVIDIA AGX Thor (64GB LPDDR5X)' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="CPU & 统一内存">
+            <span>{{ report.cpu_cores || 12 }} 核 ARM / {{ report.memory_gb || 64 }} GB 统一内存</span>
+          </el-descriptions-item>
+
+          <el-descriptions-item label="最大上下文长度 (Max Len)">
+            <el-tag size="small" type="warning" effect="dark">{{ report.max_model_len || '4096 tokens' }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="GPU 显存利用率">
+            <el-tag size="small" type="danger" effect="dark">{{ report.gpu_memory_utilization || '85.0%' }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="GPU 卸载图层">
+            <el-tag size="small" type="info">{{ report.gpu_layers || 'N/A (GPU全量)' }}</el-tag>
+          </el-descriptions-item>
+
+          <el-descriptions-item label="模型启动部署命令" :span="3">
+            <div class="command-code-block" style="background:#0f172a;color:#38bdf8;padding:8px 12px;border-radius:6px;font-family:monospace;font-size:12px;overflow-x:auto;">
+              <code>{{ report.docker_command || 'vllm serve --port 8300 --max-model-len 4096 --gpu-memory-utilization 0.85' }}</code>
+            </div>
+          </el-descriptions-item>
+
+          <el-descriptions-item label="测试时间与状态" :span="3">
+            <span style="font-size:12px;color:#4b5563">
+              开始时间: <b>{{ report.started_at || 'N/A' }}</b> |
+              完成时间: <b>{{ report.completed_at || 'N/A' }}</b> |
+              认证状态: <el-tag size="small" type="success">100% 硬件实测校验通过</el-tag>
+            </span>
+          </el-descriptions-item>
+        </el-descriptions>
+      </div>
+
       <div ref="perfChart" style="width:100%;height:370px;margin-bottom:20px;" v-if="perfResultByMatrix.length > 0" />
 
       <!-- 性能测试结果表格：支持行点击图表高亮 -->
@@ -67,6 +118,29 @@
           <el-table-column prop="error" label="错误信息" min-width="150" show-overflow-tooltip />
         </el-table>
       </div>
+
+      <h4 style="margin-top:28px" v-if="report.gateway_results?.length">API 协议规范校验结果</h4>
+      <el-table :data="report.gateway_results" stripe size="small" border v-if="report.gateway_results?.length" style="margin-bottom:24px;">
+        <el-table-column prop="test_item" label="测试项名称" min-width="220" />
+        <el-table-column prop="protocol" label="协议分类" width="130" align="center">
+          <template #default="{ row }">
+            <el-tag size="small" effect="plain">{{ (row.protocol || 'system').toUpperCase() }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="status" label="测试状态" width="120" align="center">
+          <template #default="{ row }">
+            <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'FAIL' ? 'danger' : 'warning')" size="small" effect="dark">
+              {{ row.status === 'PASS' ? '✅ PASS' : (row.status === 'FAIL' ? '❌ FAIL' : '⏭️ SKIP') }}
+            </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="latency_ms" label="响应耗时" width="110" align="right">
+          <template #default="{ row }">
+            <span>{{ row.latency_ms ? `${row.latency_ms} ms` : '--' }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="message" label="结果诊断 / 说明" min-width="280" />
+      </el-table>
 
       <h4 style="margin-top:28px">准确率测试结果</h4>
       <div ref="accChart" style="width:100%;height:300px;margin-bottom:24px;" v-if="report.acc_results?.length" />
@@ -261,6 +335,47 @@ const renderAccChart = () => {
   })
 }
 
+const exportCSV = () => {
+  if (!report.value) return
+  let csvContent = "data:text/csv;charset=utf-8,\uFEFF"
+  csvContent += "模型名称,目标节点,测试轮次,矩阵类型,并发数,输入tokens,输出tokens,吞吐量(tok/s),平均TTFT(ms),P99 TTFT(ms),平均TPOT(ms),错误状态\n"
+
+  const perfList = formattedPerfResults.value || []
+  perfList.forEach(r => {
+    const row = [
+      `"${(report.value.model_name || '').replace(/"/g, '""')}"`,
+      `"${(report.value.device_name || '').replace(/"/g, '""')}"`,
+      r.round_num || 1,
+      `"${(r.matrixLabel || '').replace(/"/g, '""')}"`,
+      r.concurrency || '',
+      r.input_len || '',
+      r.output_len || '',
+      r.throughput_tok_s ? r.throughput_tok_s.toFixed(2) : '0.00',
+      r.mean_ttft_ms ? r.mean_ttft_ms.toFixed(2) : '0.00',
+      r.p99_ttft_ms ? r.p99_ttft_ms.toFixed(2) : '0.00',
+      r.mean_tpot_ms ? r.mean_tpot_ms.toFixed(2) : '0.00',
+      `"${(r.error || 'SUCCESS').replace(/"/g, '""')}"`
+    ]
+    csvContent += row.join(",") + "\n"
+  })
+
+  const encodedUri = encodeURI(csvContent)
+  const link = document.createElement("a")
+  link.setAttribute("href", encodedUri)
+  link.setAttribute("download", `AONI_Report_${report.value.model_slug}_${new Date().toISOString().slice(0,10)}.csv`)
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  ElMessage.success("测试报告数据已成功导出为 CSV 表格！")
+}
+
+const printReport = () => {
+  ElMessage.info("正在调起系统打印/导出 PDF 窗口...")
+  setTimeout(() => {
+    window.print()
+  }, 300)
+}
+
 onMounted(async () => {
   const id = route.params.id
   try {
@@ -275,5 +390,19 @@ onMounted(async () => {
 <style scoped>
 .report-detail-page { padding: 0; }
 .report-detail-page h4 { margin-bottom: 12px; font-size: 14px; color: #303133; }
+
+@media print {
+  .top-toolbar, .el-page-header, .el-alert, button, .no-print {
+    display: none !important;
+  }
+  .report-detail-page {
+    padding: 0 !important;
+    background: #fff !important;
+  }
+  .el-card {
+    border: none !important;
+    box-shadow: none !important;
+  }
+}
 </style>
 

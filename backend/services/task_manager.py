@@ -46,9 +46,13 @@ def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) ->
         ).scalars().all()
         device_config_map = {dc.model_id: dc for dc in configs}
 
-    # 仅保留在该设备上有配置且 PASS 的模型
+    # 保留 PASS 的模型或外部 API 接入模型
     pass_models = []
     for m in models:
+        # 外部 API 端点模型 (is_external == 1 或存在 api_base) 无需依赖目标设备及设备部署 PASS 验证
+        if bool(m.is_external) or m.api_base:
+            pass_models.append(m)
+            continue
         dc = device_config_map.get(m.id)
         if not dc or dc.status != "PASS":
             continue
@@ -69,7 +73,7 @@ def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) ->
     db.flush()
 
     # 获取设备名
-    device_name = task.device.name if task.device else None
+    device_name = task.device.name if task.device else ("外部 API 端点" if any(bool(m.is_external) or m.api_base for m in pass_models) else "独立/云端环境")
 
     for m in pass_models:
         dc = device_config_map.get(m.id)
@@ -134,6 +138,51 @@ def cancel_task(db: Session, task_id: int):
         db.commit()
         stop_task_containers(task)
         _add_log(db, task_id, "INFO", None, "任务已取消，测试容器与显存资源已成功释放", "system")
+
+
+def restart_task(db: Session, task_id: int):
+    """一键重新运行 / 重试指定测试任务"""
+    from backend.models import PerfResult, AccResult, GatewayResult
+    from backend.services.executor import stop_task_containers
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise ValueError("任务不存在")
+
+    # 1. 强行清理已存在的残留容器
+    stop_task_containers(task)
+
+    # 2. 重置主任务状态
+    task.status = TaskStatus.RUNNING
+    task.started_at = datetime.utcnow()
+    task.completed_at = None
+    db.commit()
+
+    # 3. 重置关联的所有 ModelRun 并擦除旧的废弃测试结果
+    for mr in task.model_runs:
+        mr.status = ModelStage.DEPLOYING
+        mr.progress = 0
+        mr.progress_detail = "重新下发测试任务，正在启动容器..."
+        mr.stage_status = {
+            "deploying": StageStatus.RUNNING.value,
+            "validating": StageStatus.PENDING.value,
+            "gateway_testing": StageStatus.PENDING.value,
+            "perf_testing": StageStatus.PENDING.value,
+            "acc_testing": StageStatus.PENDING.value,
+            "reporting": StageStatus.PENDING.value
+        }
+        mr.started_at = datetime.utcnow()
+        mr.completed_at = None
+        db.query(GatewayResult).filter_by(model_run_id=mr.id).delete()
+        db.query(PerfResult).filter_by(model_run_id=mr.id).delete()
+        db.query(AccResult).filter_by(model_run_id=mr.id).delete()
+
+    db.commit()
+
+    # 4. 重新拉起后台评测线程
+    _add_log(db, task_id, "INFO", None, f"========== 任务 #{task_id} 已重置并重新下发测试评测 ==========", "system")
+    start_task(task_id)
+    return task
 
 
 def _add_log(db: Session, task_id: int, level: str, model_slug: Optional[str], message: str, module: str = "system"):

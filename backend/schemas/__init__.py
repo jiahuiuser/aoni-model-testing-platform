@@ -31,6 +31,9 @@ class PerfRoundConfig(BaseModel):
 
 class TaskConfig(BaseModel):
     model_slugs: List[str] = Field(default_factory=list)
+    gateway_enabled: bool = True
+    gateway_protocols: List[str] = Field(default_factory=lambda: ["openai", "anthropic", "responses"])
+    test_longctx: bool = False
     perf_enabled: bool = True
     perf_rounds_config: List[PerfRoundConfig] = Field(default_factory=lambda: [
         PerfRoundConfig()
@@ -47,7 +50,40 @@ class TaskCreate(BaseModel):
     name: str
     profile: str = "custom"
     device_id: Optional[int] = None
+    device_ids: Optional[List[int]] = None  # 支持选择多台设备下发测试
+    template_id: Optional[int] = None      # 关联测试模板 ID
     config: TaskConfig = Field(default_factory=TaskConfig)
+
+
+# ========== 硬件组 / 测试模板 / 数据集 / 镜像 Schema ==========
+
+class HardwareGroupCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+
+
+class TestTemplateCreate(BaseModel):
+    name: str
+    description: Optional[str] = None
+    num_prompts: int = 300
+    input_lens: List[int] = Field(default_factory=lambda: [128, 512])
+    output_lens: List[int] = Field(default_factory=lambda: [128, 512])
+    concurrencies: List[int] = Field(default_factory=lambda: [1, 4, 8, 16, 32])
+    datasets: List[str] = Field(default_factory=lambda: ["mmlu", "ceval"])
+    acc_limit: int = 200
+
+
+class DockerImageCreate(BaseModel):
+    name: str
+    image_tag: str
+    download_url: Optional[str] = None
+    hardware_group: str = "NVIDIA_jetson_AGX_Thor"
+    description: Optional[str] = None
+
+
+class DatasetDownloadRequest(BaseModel):
+    name: str
+    source: str = "ModelScope/EvalScope"
 
 
 class TaskOut(BaseModel):
@@ -65,6 +101,20 @@ class TaskOut(BaseModel):
     completed_at: Optional[datetime] = None
     model_count: int = 0
     completed_count: int = 0
+
+    class Config:
+        from_attributes = True
+
+
+class GatewayResultOut(BaseModel):
+    id: int
+    category: str = "protocol"
+    test_item: str = ""
+    protocol: str = "system"
+    status: str = "SKIP"
+    latency_ms: Optional[float] = None
+    message: Optional[str] = None
+    raw_details: Optional[dict] = None
 
     class Config:
         from_attributes = True
@@ -112,6 +162,7 @@ class ModelRunOut(BaseModel):
     progress_detail: Optional[str] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
+    gateway_results: List[GatewayResultOut] = []
     perf_results: List[PerfResultOut] = []
     acc_results: List[AccResultOut] = []
 

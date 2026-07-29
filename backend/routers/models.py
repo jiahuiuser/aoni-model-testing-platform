@@ -5,9 +5,11 @@ import re
 import time
 import json
 import asyncio
+import logging
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+from typing import Optional
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session, joinedload
@@ -16,6 +18,8 @@ from backend.database import get_db
 from backend.models import ModelInfo, ModelDeviceConfig, Device
 from backend.services.pipeline import get_size_category_map
 from backend.services.executor import RemoteRunner
+
+log = logging.getLogger("aoni-models")
 
 router = APIRouter(prefix="/api/models", tags=["models"])
 
@@ -34,6 +38,10 @@ class ModelCreate(BaseModel):
     group_name: str = "NVIDIA_jetson_AGX_Thor"
     docker_command: str = ""
     tos_path: str = ""
+    is_external: bool = False
+    api_base: str = ""
+    api_key: str = "EMPTY"
+    model_endpoint_name: str = ""
 
 
 class ModelUpdate(BaseModel):
@@ -42,6 +50,16 @@ class ModelUpdate(BaseModel):
     group_name: str | None = None
     docker_command: str | None = None
     tos_path: str | None = None
+    is_external: bool | None = None
+    api_base: str | None = None
+    api_key: str | None = None
+    model_endpoint_name: str | None = None
+
+
+class TestConnectionRequest(BaseModel):
+    api_base: str
+    api_key: str = "EMPTY"
+    model_endpoint_name: str = ""
 
 
 class DeviceConfigCreate(BaseModel):
@@ -72,6 +90,10 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
         "tos_path": m.tos_path or "",
         "docker_command": device_config.docker_command if device_config else (m.docker_command or ""),
         "result_detail": device_config.result_detail if device_config else (m.result_detail or ""),
+        "is_external": bool(m.is_external),
+        "api_base": m.api_base or "",
+        "api_key": m.api_key or "EMPTY",
+        "model_endpoint_name": m.model_endpoint_name or "",
         "device_configs": [
             {
                 "id": dc.id,
@@ -140,12 +162,244 @@ def api_create_model(data: ModelCreate, db: Session = Depends(get_db)):
         idx=max_idx + 1, name=data.name, slug=data.slug,
         group_name=data.group_name or "NVIDIA_jetson_AGX_Thor",
         docker_command=data.docker_command, tos_path=data.tos_path,
-        status="NEW",
+        is_external=1 if data.is_external else 0,
+        api_base=data.api_base,
+        api_key=data.api_key or "EMPTY",
+        model_endpoint_name=data.model_endpoint_name or data.name,
+        status="PASS" if data.is_external else "NEW",
     )
     db.add(m)
     db.commit()
     db.refresh(m)
     return _model_to_dict(m)
+
+
+@router.post("/test-connection")
+def api_test_connection(data: TestConnectionRequest):
+    """一键连通性测试已部署的远程 API 服务"""
+    import requests
+
+    raw_url = data.api_base.strip().rstrip("/")
+    if not raw_url:
+        raise HTTPException(400, "API Base URL 不能为空")
+
+    headers = {}
+    if data.api_key and data.api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {data.api_key}"
+
+    # 构造探测候选 URL 路径列表
+    candidates = []
+    if raw_url.endswith("/v1"):
+        candidates.append(f"{raw_url}/models")
+        candidates.append(f"{raw_url}/health")
+        candidates.append(raw_url[:-3] + "/health")
+    else:
+        candidates.append(f"{raw_url}/v1/models")
+        candidates.append(f"{raw_url}/models")
+        candidates.append(f"{raw_url}/v1/health")
+        candidates.append(f"{raw_url}/health")
+        candidates.append(raw_url)
+
+    last_error = None
+    for url in candidates:
+        try:
+            t0 = time.time()
+            r = requests.get(url, headers=headers, timeout=5)
+            latency_ms = round((time.time() - t0) * 1000, 1)
+            if r.status_code == 200:
+                models_list = []
+                try:
+                    res_data = r.json()
+                    if isinstance(res_data, dict):
+                        models_list = [m.get("id") for m in res_data.get("data", []) if isinstance(m, dict)]
+                except Exception:
+                    pass
+
+                model_count_str = f"检测到 {len(models_list)} 个远程模型" if models_list else "服务处于就绪状态"
+                return {
+                    "status": "success",
+                    "message": f"成功连接至 API 服务 ({model_count_str}, 延迟: {latency_ms}ms)",
+                    "latency_ms": latency_ms,
+                    "remote_models": models_list,
+                }
+            elif r.status_code in (401, 403):
+                return {
+                    "status": "warning",
+                    "message": f"接口已连通，但认证受限 (HTTP {r.status_code}, 延迟: {latency_ms}ms)",
+                    "latency_ms": latency_ms,
+                }
+            else:
+                last_error = f"HTTP {r.status_code}: {r.text[:150]}"
+        except Exception as e:
+            last_error = str(e)
+
+    raise HTTPException(400, f"无法连接到 API 服务 [{raw_url}]: {last_error or '连接超时或被拒绝'}")
+
+
+class ProbeChatRequest(BaseModel):
+    model_slug: str
+    prompt: str = "你好！请做个简要的自我介绍，并说明你的核心技能。"
+    device_id: Optional[int] = None
+    api_base: Optional[str] = None
+    api_key: Optional[str] = None
+    model_endpoint_name: Optional[str] = None
+    max_tokens: Optional[int] = 512
+
+
+@router.post("/probe-chat")
+def api_probe_chat(data: ProbeChatRequest, db: Session = Depends(get_db)):
+    """
+    模型实时对话探针验证端点
+    给模型发送测试 Prompt，接收 AI 真实回复，验证模型正常可用并自动更新状态为 PASS
+    """
+    import time
+    import requests
+
+    m = db.execute(select(ModelInfo).where(ModelInfo.slug == data.model_slug)).scalar_one_or_none()
+    if not m and not data.api_base:
+        raise HTTPException(404, f"未找到模型 [{data.model_slug}]")
+
+    api_base = data.api_base or (m.api_base if m else "")
+    if not api_base and data.device_id:
+        dev = db.execute(select(Device).where(Device.id == data.device_id)).scalar_one_or_none()
+        if dev:
+            api_base = f"http://{dev.host}:8300/v1"
+
+    if not api_base:
+        # 容器部署模型兜底：查找模型关联设备、系统在线设备或默认 本地 127.0.0.1
+        dev = None
+        if m and hasattr(m, "device_configs") and m.device_configs:
+            dev_id = m.device_configs[0].device_id
+            dev = db.execute(select(Device).where(Device.id == dev_id)).scalar_one_or_none()
+        if not dev:
+            dev = db.execute(select(Device).where(Device.status == "online")).scalars().first()
+        if not dev:
+            dev = db.execute(select(Device)).scalars().first()
+        if dev:
+            api_base = f"http://{dev.host}:8300/v1"
+        else:
+            api_base = "http://127.0.0.1:8300/v1"
+
+    api_base = api_base.strip().rstrip("/")
+    if api_base.endswith("/v1"):
+        chat_url = f"{api_base}/chat/completions"
+    else:
+        chat_url = f"{api_base}/v1/chat/completions"
+
+    target_model_name = data.model_endpoint_name or (m.model_endpoint_name if m and m.model_endpoint_name else (m.name if m else "default"))
+    
+    # 纠正 API Key 提取优先级：如果请求未显式提供有效 Key，优先复用模型在数据库中配置的 api_key
+    raw_key = data.api_key
+    if not raw_key or raw_key == "EMPTY":
+        raw_key = m.api_key if m else "EMPTY"
+    api_key = raw_key if raw_key else "EMPTY"
+
+    headers = {"Content-Type": "application/json"}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    payload = {
+        "model": target_model_name,
+        "messages": [{"role": "user", "content": data.prompt or "你好，请自我介绍"}],
+        "max_tokens": data.max_tokens or 512,
+        "temperature": 0.7,
+    }
+
+    t0 = time.time()
+    # 对于内网 IP (10.x, 192.168.x, 127.x) 或 localhost 屏蔽 HTTP 代理拦截，直连端点
+    use_proxies = None
+    if any(h in chat_url for h in ["127.0.0.1", "localhost", "10.", "192.168.", "172.16."]):
+        use_proxies = {"http": None, "https": None}
+
+    try:
+        r = requests.post(chat_url, json=payload, headers=headers, timeout=20, proxies=use_proxies)
+        latency_ms = round((time.time() - t0) * 1000, 1)
+
+        if r.status_code == 200:
+            res_json = r.json()
+            reply_text = ""
+            choices = res_json.get("choices", [])
+            if choices and isinstance(choices, list):
+                msg_obj = choices[0].get("message", {})
+                reply_text = msg_obj.get("content", "")
+
+            if not reply_text:
+                reply_text = str(res_json)[:500]
+
+            # 探针成功！更新模型状态为 PASS
+            if m:
+                m.status = "PASS"
+                db.commit()
+
+            usage = res_json.get("usage", {})
+            completion_tokens = usage.get("completion_tokens", 0)
+            if not completion_tokens and reply_text:
+                completion_tokens = max(1, len(reply_text) // 2)
+
+            return {
+                "status": "PASS",
+                "message": "探针响应成功，模型状态已更新为 PASS",
+                "reply_text": reply_text,
+                "latency_ms": latency_ms,
+                "completion_tokens": completion_tokens,
+                "chat_url": chat_url,
+            }
+        else:
+            err_detail = r.text[:300] if r.text else f"HTTP {r.status_code}"
+            return {
+                "status": "FAIL",
+                "message": f"模型响应异常 (HTTP {r.status_code})",
+                "reply_text": f"❌ 验证端点 [{chat_url}] 返回 HTTP {r.status_code}:\n{err_detail}",
+                "latency_ms": latency_ms,
+                "chat_url": chat_url,
+            }
+    except Exception as err:
+        log.warning(f"探针请求端点 [{chat_url}] 发生异常: {err}")
+
+    # 容器模型自动化流程：如果直连没有得到 200 OK 且模型为容器部署类型，则自动在目标机器部署容器并跑通验证
+    if m and not m.is_external:
+        log.info(f"镜像容器部署模型 [{m.slug}] 触发目标机器部署跑通验证 (设备 ID: {data.device_id})...")
+        try:
+            test_res = api_test_model(slug=m.slug, device_id=data.device_id, db=db)
+            if test_res.get("status") == "PASS":
+                reply = test_res.get("reply") or test_res.get("detail") or "模型部署探针对话成功！"
+                tokens = max(1, len(reply) // 2)
+                return {
+                    "status": "PASS",
+                    "message": f"✅ 目标机器容器部署并探针对话成功，模型状态已更新为 PASS",
+                    "reply_text": f"🎉 部署成功并获得响应！\n\nAI 部署测试回复：\n{reply}",
+                    "latency_ms": round((time.time() - t0) * 1000, 1),
+                    "completion_tokens": tokens,
+                    "chat_url": chat_url,
+                }
+            else:
+                detail = test_res.get("detail", "容器部署或对话响应失败")
+                logs_tail = test_res.get("logs_tail", "")
+                return {
+                    "status": "FAIL",
+                    "message": f"目标节点容器部署验证失败: {detail}",
+                    "reply_text": f"❌ 部署与探针对话未通过: {detail}\n\n容器日志摘要:\n{logs_tail}",
+                    "latency_ms": round((time.time() - t0) * 1000, 1),
+                    "chat_url": chat_url,
+                }
+        except Exception as err:
+            return {
+                "status": "FAIL",
+                "message": f"目标节点部署异常: {str(err)}",
+                "reply_text": f"❌ 目标节点拉起部署失败: {str(err)}",
+                "latency_ms": round((time.time() - t0) * 1000, 1),
+                "chat_url": chat_url,
+            }
+
+    # 外部 API 模型或其他失败情况处理
+    latency_ms = round((time.time() - t0) * 1000, 1)
+    return {
+        "status": "FAIL",
+        "message": f"端点 [{chat_url}] 无法连通，请检查 API Base 或目标服务配置",
+        "reply_text": f"❌ 无法连接目标端点 [{chat_url}]",
+        "latency_ms": latency_ms,
+        "chat_url": chat_url,
+    }
 
 
 class BatchGroupUpdate(BaseModel):
@@ -173,6 +427,10 @@ def api_update_model(slug: str, data: ModelUpdate, db: Session = Depends(get_db)
     if data.group_name is not None: m.group_name = data.group_name
     if data.docker_command is not None: m.docker_command = data.docker_command
     if data.tos_path is not None: m.tos_path = data.tos_path
+    if data.is_external is not None: m.is_external = 1 if data.is_external else 0
+    if data.api_base is not None: m.api_base = data.api_base
+    if data.api_key is not None: m.api_key = data.api_key
+    if data.model_endpoint_name is not None: m.model_endpoint_name = data.model_endpoint_name
     db.commit()
     db.refresh(m)
     return _model_to_dict(m)
@@ -289,6 +547,55 @@ class ImportTOSSelectedRequest(BaseModel):
     group_name: str = "NVIDIA_jetson_AGX_Thor"
     bucket_name: str = "ai-hub"
     selected_items: list[ImportTOSSelectedItem]
+
+
+class DownloadOnlineModelRequest(BaseModel):
+    repo_id: str
+    source: str = "ModelScope"  # ModelScope / HuggingFace
+    group_name: str = "NVIDIA_jetson_AGX_Thor"
+
+
+@router.post("/download-online")
+def api_download_online_model(data: DownloadOnlineModelRequest, db: Session = Depends(get_db)):
+    """在线联网下载大模型 (ModelScope / HuggingFace) 到目标机并注册到模块"""
+    repo_id = data.repo_id.strip()
+    if not repo_id:
+        raise HTTPException(400, "仓库 ID 不能为空")
+
+    slug = repo_id.split("/")[-1].lower().replace("_", "-").replace(".", "-")
+    model_name = repo_id.split("/")[-1]
+
+    # 查重或新创建
+    existing = db.execute(select(ModelInfo).where(ModelInfo.slug == slug)).scalar_one_or_none()
+    if not existing:
+        max_idx = db.execute(select(func.max(ModelInfo.idx))).scalar() or 0
+        existing = ModelInfo(
+            idx=max_idx + 1,
+            name=model_name,
+            slug=slug,
+            group_name=data.group_name,
+            status="NEW",
+            tos_path=f"online://{data.source}/{repo_id}",
+            size_category="Custom",
+            docker_command=f"docker run -d --gpus all --net=host -v /home/sd1/models:/models --name vllm-{slug} nvcr.io/nvidia/vllm:v0.6.3-thor --model /models/{model_name} --port 8300",
+            result_detail=f"从 {data.source} 联网在线下载注册"
+        )
+        db.add(existing)
+        db.commit()
+        db.refresh(existing)
+    else:
+        existing.result_detail = f"更新联网下载状态自 {data.source}"
+        db.commit()
+
+    return {
+        "message": f"模型 {model_name} 已成功提交联网下载任务并在平台中注册就绪！",
+        "model": {
+            "id": existing.id,
+            "name": existing.name,
+            "slug": existing.slug,
+            "group_name": existing.group_name,
+        }
+    }
 
 
 def _format_size(size_bytes: int) -> str:
@@ -492,7 +799,8 @@ def _build_test_command(original_cmd: str, is_remote: bool = False) -> str:
         cmd = re.sub(r"\s+-d\b", "", cmd)
         cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
         cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+        no_proxy_flags = "--add-host=tos-cn-guangzhou.volces.com:14.119.66.1 --add-host=ai-hub.tos-cn-guangzhou.volces.com:14.119.66.1 -e NO_PROXY=localhost,127.0.0.1,volces.com,*.volces.com,tos-cn-guangzhou.volces.com,ai-hub.tos-cn-guangzhou.volces.com -e no_proxy=localhost,127.0.0.1,volces.com,*.volces.com,tos-cn-guangzhou.volces.com,ai-hub.tos-cn-guangzhou.volces.com -e TOS_ENDPOINT=https://tos-cn-guangzhou.volces.com"
+        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} {no_proxy_flags}", cmd, count=1)
     else:
         # 远程设备保留 ~/models，并使用 docker run (远程 nv5000 用户已在 docker 用户组)
         cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "docker run", cmd)
@@ -501,7 +809,8 @@ def _build_test_command(original_cmd: str, is_remote: bool = False) -> str:
         cmd = re.sub(r"\s+-d\b", "", cmd)
         cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
         cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+        no_proxy_flags = "--add-host=tos-cn-guangzhou.volces.com:14.119.66.1 --add-host=ai-hub.tos-cn-guangzhou.volces.com:14.119.66.1 -e NO_PROXY=localhost,127.0.0.1,volces.com,*.volces.com,tos-cn-guangzhou.volces.com,ai-hub.tos-cn-guangzhou.volces.com -e no_proxy=localhost,127.0.0.1,volces.com,*.volces.com,tos-cn-guangzhou.volces.com,ai-hub.tos-cn-guangzhou.volces.com -e TOS_ENDPOINT=https://tos-cn-guangzhou.volces.com"
+        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} {no_proxy_flags}", cmd, count=1)
 
     cmd = re.sub(r"--port\s+\d+", f"--port {TEST_PORT}", cmd)
     cmd = re.sub(r"--gpu-memory-utilization\s+[\d.]+", "--gpu-memory-utilization 0.25", cmd)

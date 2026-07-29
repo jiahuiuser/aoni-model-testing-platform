@@ -6,7 +6,7 @@
     <!-- 主应用布局 -->
     <el-container v-else style="height:100vh">
       <!-- 左侧科技感侧边栏 -->
-      <el-aside width="220px" class="app-sidebar">
+      <el-aside width="235px" class="app-sidebar">
         <div class="sidebar-brand">
           <div class="logo-icon-wrapper">
             <svg class="chip-svg" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
@@ -31,7 +31,6 @@
           </div>
           <div class="brand-text">
             <h2 class="title">AONI 模型测试平台</h2>
-            <span class="subtitle">Jetson Thor 运维评测</span>
           </div>
         </div>
 
@@ -54,6 +53,14 @@
           <el-menu-item index="/devices">
             <el-icon><Monitor /></el-icon>
             <span>设备管理</span>
+          </el-menu-item>
+          <el-menu-item index="/data">
+            <el-icon><DataLine /></el-icon>
+            <span>数据管理</span>
+          </el-menu-item>
+          <el-menu-item index="/images">
+            <el-icon><Files /></el-icon>
+            <span>镜像管理</span>
           </el-menu-item>
           <el-menu-item index="/reports">
             <el-icon><DataAnalysis /></el-icon>
@@ -113,6 +120,28 @@
                 <span class="kpi-value">{{ reportCount }}</span>
                 <span class="kpi-label">已生成评测报告</span>
               </div>
+            </div>
+
+            <!-- 全局皮肤主题切换器 -->
+            <div class="header-theme-switcher">
+              <el-dropdown trigger="click" @command="themeStore.setTheme">
+                <el-button size="small" class="theme-switch-btn">
+                  🎨 {{ currentSkinName }} <el-icon class="el-icon--right"><ArrowDown /></el-icon>
+                </el-button>
+                <template #dropdown>
+                  <el-dropdown-menu>
+                    <el-dropdown-item
+                      v-for="s in themeStore.skins"
+                      :key="s.id"
+                      :command="s.id"
+                      :class="{ 'is-active-theme': themeStore.currentTheme === s.id }"
+                    >
+                      <span class="skin-color-dot" :style="{ background: s.dotColor }"></span>
+                      {{ s.label }}
+                    </el-dropdown-item>
+                  </el-dropdown-menu>
+                </template>
+              </el-dropdown>
             </div>
           </div>
         </el-header>
@@ -235,6 +264,7 @@ import { ref, computed, onMounted, watch, nextTick } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useTestStore } from './stores/testStore'
 import { useAuthStore } from './stores/authStore'
+import { useThemeStore } from './stores/themeStore'
 import { apiHealth } from './api/index.js'
 import axios from 'axios'
 
@@ -242,6 +272,13 @@ const route = useRoute()
 const router = useRouter()
 const testStore = useTestStore()
 const authStore = useAuthStore()
+const themeStore = useThemeStore()
+
+const currentSkinName = computed(() => {
+  const active = themeStore.skins.find(s => s.id === themeStore.currentTheme)
+  return active ? active.name : '赛博深空'
+})
+
 const backendStatus = ref('unknown')
 const terminalBoxRef = ref(null)
 
@@ -307,9 +344,12 @@ watch(() => testStore.logs.length, () => {
 })
 
 const loadStats = async () => {
+  // 健康检查用原生 fetch 直接调用，绕过 axios JWT 拦截器
+  // 避免 token 过期时误报"连接异常"
   try {
-    const res = await apiHealth()
-    backendStatus.value = res.status
+    const res = await fetch('/api/health')
+    const data = await res.json()
+    backendStatus.value = (res.ok && data.status === 'ok') ? 'ok' : 'error'
   } catch {
     backendStatus.value = 'error'
   }
@@ -347,22 +387,88 @@ onMounted(() => {
 <style>
 * { margin: 0; padding: 0; box-sizing: border-box; }
 body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+
+/* ==================== 4 大皮肤主题动态 Token ==================== */
+:root {
+  --sidebar-bg: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+  --sidebar-border: #334155;
+  --sidebar-text: #94a3b8;
+  --sidebar-item-active: linear-gradient(135deg, #2563eb, #1d4ed8);
+  --header-bg: #ffffff;
+}
+
+html[data-theme="cyber"] {
+  --sidebar-bg: linear-gradient(180deg, #1e293b 0%, #0f172a 100%);
+  --sidebar-border: #334155;
+  --sidebar-text: #94a3b8;
+  --sidebar-item-active: linear-gradient(135deg, #2563eb, #1d4ed8);
+}
+
+html[data-theme="aurora"] {
+  --sidebar-bg: linear-gradient(180deg, #2e1065 0%, #1e1b4b 100%);
+  --sidebar-border: #4c1d95;
+  --sidebar-text: #c084fc;
+  --sidebar-item-active: linear-gradient(135deg, #7c3aed, #db2777);
+}
+
+html[data-theme="sunset"] {
+  --sidebar-bg: linear-gradient(180deg, #451a03 0%, #1c1917 100%);
+  --sidebar-border: #78350f;
+  --sidebar-text: #fcd34d;
+  --sidebar-item-active: linear-gradient(135deg, #ea580c, #dc2626);
+}
+
+html[data-theme="glacier"] {
+  --sidebar-bg: linear-gradient(180deg, #0f172a 0%, #0369a1 100%);
+  --sidebar-border: #0284c7;
+  --sidebar-text: #bae6fd;
+  --sidebar-item-active: linear-gradient(135deg, #0284c7, #2563eb);
+}
+
 #app-container { min-height: 100vh; background: #f3f4f6; position: relative; }
 
-/* 侧边栏样式 */
+/* 侧边栏整体美化 */
 .app-sidebar {
-  background: #111827; color: #fff; display: flex; flex-direction: column;
-  box-shadow: 2px 0 10px rgba(0,0,0,0.15); z-index: 10; overflow: hidden;
+  background: var(--sidebar-bg);
+  color: #fff;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 4px 0 20px rgba(0, 0, 0, 0.12);
+  z-index: 10;
+  overflow: hidden;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.sidebar-brand { padding: 20px 16px; display: flex; align-items: center; gap: 12px; border-bottom: 1px solid #1f2937; }
-.logo-icon-wrapper { width: 38px; height: 38px; background: rgba(59, 130, 246, 0.15); border: 1px solid rgba(59, 130, 246, 0.3); border-radius: 8px; display: flex; align-items: center; justify-content: center; }
-.chip-svg { width: 26px; height: 26px; }
-.brand-text .title { font-size: 15px; font-weight: 700; color: #f9fafb; letter-spacing: 0.5px; }
-.brand-text .subtitle { font-size: 11px; color: #9ca3af; }
 
-.status-box { padding: 10px 16px; background: #1f2937; margin: 12px 12px 6px; border-radius: 6px; }
+.sidebar-brand {
+  padding: 22px 18px;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  border-bottom: 1px solid var(--sidebar-border);
+}
+.logo-icon-wrapper {
+  width: 40px;
+  height: 40px;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  border-radius: 10px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+.chip-svg { width: 26px; height: 26px; }
+.brand-text .title { font-size: 15px; font-weight: 700; color: #f8fafc; letter-spacing: 0.5px; white-space: nowrap; }
+
+.status-box {
+  padding: 10px 14px;
+  background: rgba(255, 255, 255, 0.06);
+  margin: 14px 12px 6px;
+  border-radius: 8px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
 .status-item { display: flex; align-items: center; gap: 8px; }
-.status-label { font-size: 12px; color: #d1d5db; }
+.status-label { font-size: 12px; color: #e2e8f0; font-weight: 500; }
 
 .pulse-dot { width: 8px; height: 8px; border-radius: 50%; position: relative; }
 .pulse-dot.online { background: #10b981; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); animation: pulse-green 2s infinite; }
@@ -375,61 +481,100 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Robo
   100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
 }
 
-.sidebar-menu { background: transparent !important; border-right: none !important; padding: 8px; flex: 1; }
-.sidebar-menu .el-menu-item { color: #9ca3af !important; border-radius: 6px; margin-bottom: 4px; height: 44px; line-height: 44px; }
-.sidebar-menu .el-menu-item:hover { color: #f3f4f6 !important; background: #1f2937 !important; }
-.sidebar-menu .el-menu-item.is-active { color: #ffffff !important; background: #2563eb !important; font-weight: 600; }
+.sidebar-menu { background: transparent !important; border-right: none !important; padding: 10px 8px; flex: 1; }
+.sidebar-menu .el-menu-item {
+  color: var(--sidebar-text) !important;
+  border-radius: 8px;
+  margin-bottom: 6px;
+  height: 46px;
+  line-height: 46px;
+  font-size: 14px;
+  font-weight: 500;
+  transition: all 0.2s ease;
+}
+.sidebar-menu .el-menu-item:hover {
+  color: #ffffff !important;
+  background: rgba(255, 255, 255, 0.1) !important;
+  transform: translateX(4px);
+}
+.sidebar-menu .el-menu-item.is-active {
+  color: #ffffff !important;
+  background: var(--sidebar-item-active) !important;
+  font-weight: 700;
+  box-shadow: 0 6px 16px rgba(37, 99, 235, 0.35);
+}
 
 /* 侧边栏底部用户信息条 */
 .sidebar-user-bar {
-  padding: 12px 14px;
-  border-top: 1px solid #1f2937;
+  padding: 14px 16px;
+  border-top: 1px solid var(--sidebar-border);
   display: flex;
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+  background: rgba(0, 0, 0, 0.15);
 }
 .user-avatar-mini {
-  width: 32px; height: 32px; border-radius: 50%;
-  background: linear-gradient(135deg, #2563eb, #7c3aed);
+  width: 34px; height: 34px; border-radius: 50%;
+  background: linear-gradient(135deg, #3b82f6, #8b5cf6);
   display: flex; align-items: center; justify-content: center;
   font-size: 13px; font-weight: 700; color: #fff; flex-shrink: 0;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.2);
 }
 .user-meta { flex: 1; min-width: 0; }
-.user-name { font-size: 13px; font-weight: 600; color: #f3f4f6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.user-role { font-size: 10px; color: #6b7280; margin-top: 1px; }
+.user-name { font-size: 13px; font-weight: 600; color: #f8fafc; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.user-role { font-size: 11px; color: var(--sidebar-text); opacity: 0.8; margin-top: 1px; }
 .logout-btn {
   background: transparent !important;
-  border: 1px solid #374151 !important;
-  color: #9ca3af !important;
+  border: 1px solid rgba(255, 255, 255, 0.2) !important;
+  color: var(--sidebar-text) !important;
   flex-shrink: 0;
 }
 .logout-btn:hover { border-color: #ef4444 !important; color: #ef4444 !important; }
 
-.sidebar-footer { padding: 16px; border-top: 1px solid #1f2937; }
-.footer-badge { background: #1f2937; padding: 10px 12px; border-radius: 6px; display: flex; flex-direction: column; }
-.badge-title { font-size: 12px; font-weight: 600; color: #60a5fa; }
-.badge-desc { font-size: 10px; color: #9ca3af; }
-
+/* 头部样式 */
 .app-header { background: #ffffff; border-bottom: 1px solid #e5e7eb; padding: 0 24px; display: flex; align-items: center; }
-.kpi-bar { display: flex; align-items: center; gap: 24px; width: 100%; }
-.kpi-card { display: flex; align-items: center; gap: 12px; background: #f9fafb; padding: 8px 16px; border-radius: 8px; border: 1px solid #f3f4f6; min-width: 180px; }
+.kpi-bar { display: flex; align-items: center; gap: 20px; width: 100%; }
+.kpi-card { display: flex; align-items: center; gap: 12px; background: #f8fafc; padding: 8px 16px; border-radius: 10px; border: 1px solid #e2e8f0; min-width: 175px; }
 .kpi-icon-box { width: 36px; height: 36px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 18px; }
 .kpi-icon-box.blue { background: #eff6ff; color: #2563eb; }
 .kpi-icon-box.purple { background: #f5f3ff; color: #7c3aed; }
 .kpi-icon-box.green { background: #ecfdf5; color: #059669; }
 .kpi-icon-box.orange { background: #fff7ed; color: #ea580c; }
 .kpi-info { display: flex; flex-direction: column; }
-.kpi-value { font-size: 16px; font-weight: 700; color: #111827; }
-.kpi-label { font-size: 11px; color: #6b7280; }
+.kpi-value { font-size: 16px; font-weight: 700; color: #0f172a; }
+.kpi-label { font-size: 11px; color: #64748b; }
+
+.header-theme-switcher { margin-left: auto; }
+.theme-switch-btn {
+  border-radius: 20px !important;
+  font-weight: 600 !important;
+  background: #f1f5f9 !important;
+  border: 1px solid #cbd5e1 !important;
+  color: #334155 !important;
+}
+.theme-switch-btn:hover { background: #e2e8f0 !important; color: #0f172a !important; }
+
+.skin-color-dot {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  margin-right: 8px;
+}
+
+.is-active-theme {
+  font-weight: bold;
+  background: #f1f5f9;
+}
 
 .app-main { padding: 20px 24px; overflow-y: auto; }
 
 /* 右下角悬浮跑通测试卡片 Widget */
 .floating-test-widget {
   position: fixed; right: 24px; bottom: 24px; width: 320px;
-  background: #111827; color: #ffffff; border-radius: 10px; padding: 12px 14px;
-  box-shadow: 0 10px 25px rgba(0,0,0,0.3); border: 1px solid #374151;
+  background: #0f172a; color: #ffffff; border-radius: 12px; padding: 14px 16px;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.3); border: 1px solid #334155;
   cursor: pointer; z-index: 9999; transition: all 0.3s ease;
 }
 .floating-test-widget:hover { transform: translateY(-4px); border-color: #3b82f6; }
@@ -479,21 +624,117 @@ body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Robo
 
 .err-content { background: #fff; padding: 10px 14px; border-radius: 4px; border: 1px solid #ffccc7; font-size: 13px; color: #c45656; }
 
-/* 全局删除确认框美化 */
-.el-popconfirm__main {
-  padding: 6px 0 12px;
+/* ==================== 屏幕居中大型危险删除确认弹窗 (ElMessageBox) 美化 ==================== */
+.el-message-box {
+  border-radius: 16px !important;
+  padding: 24px 28px !important;
+  width: 480px !important;
+  max-width: 90vw !important;
+  box-shadow: 0 25px 60px -15px rgba(15, 23, 42, 0.3) !important;
+  border: 1px solid #cbd5e1 !important;
 }
-.el-popconfirm .el-popconfirm__action {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
+
+.el-message-box__header {
+  padding-bottom: 12px !important;
 }
-.el-popper.is-light.el-popconfirm__popper {
+
+.el-message-box__title {
+  font-size: 17px !important;
+  font-weight: 700 !important;
+  color: #0f172a !important;
+}
+
+.el-message-box__content {
+  font-size: 14px !important;
+  color: #475569 !important;
+  line-height: 1.6 !important;
+  padding: 12px 0 20px !important;
+}
+
+.el-message-box__btns {
+  display: flex !important;
+  justify-content: flex-end !important;
+  gap: 12px !important;
+}
+
+.el-message-box__btns .el-button {
+  padding: 10px 20px !important;
   border-radius: 10px !important;
-  box-shadow: 0 8px 24px rgba(0,0,0,0.12) !important;
-  border: 1px solid #e5e7eb !important;
-  padding: 14px 16px !important;
-  min-width: 220px !important;
+  font-weight: 600 !important;
+  font-size: 13px !important;
+}
+
+.el-message-box__btns .el-button--primary {
+  background: #ef4444 !important;
+  border-color: #ef4444 !important;
+}
+
+.el-message-box__btns .el-button--primary:hover {
+  background: #dc2626 !important;
+  border-color: #dc2626 !important;
+}
+
+/* ==================== 彻底重构与美化全局 Popconfirm 删除确认气泡弹窗 ==================== */
+.el-popper.is-light.el-popconfirm__popper {
+  border-radius: 14px !important;
+  box-shadow: 0 20px 45px -10px rgba(15, 23, 42, 0.25), 0 8px 20px -4px rgba(15, 23, 42, 0.12) !important;
+  border: 1px solid #cbd5e1 !important;
+  padding: 16px 20px !important;
+  min-width: 260px !important;
+  background: #ffffff !important;
+}
+
+.el-popconfirm__main {
+  font-size: 14px !important;
+  font-weight: 600 !important;
+  color: #0f172a !important;
+  padding: 4px 0 14px !important;
+  display: flex !important;
+  align-items: center !important;
+  gap: 10px !important;
+}
+
+.el-popconfirm__action {
+  display: flex !important;
+  justify-content: flex-end !important;
+  gap: 10px !important;
+}
+
+.el-popconfirm__action .el-button {
+  border-radius: 8px !important;
+  font-weight: 600 !important;
+  padding: 8px 16px !important;
+}
+
+/* ==================== 彻底重构与美化全局 el-dialog 模态框 ==================== */
+.el-dialog {
+  border-radius: 16px !important;
+  overflow: hidden !important;
+  box-shadow: 0 25px 50px -12px rgba(15, 23, 42, 0.25) !important;
+  border: 1px solid #e2e8f0 !important;
+}
+
+.el-dialog__header {
+  background: linear-gradient(135deg, #f8fafc 0%, #f1f5f9 100%) !important;
+  padding: 16px 22px !important;
+  margin: 0 !important;
+  border-bottom: 1px solid #e2e8f0 !important;
+}
+
+.el-dialog__title {
+  font-size: 15px !important;
+  font-weight: 700 !important;
+  color: #0f172a !important;
+}
+
+.el-dialog__body {
+  padding: 22px !important;
+}
+
+.el-dialog__footer {
+  padding: 14px 22px !important;
+  border-top: 1px solid #f1f5f9 !important;
+  background: #f8fafc !important;
 }
 
 /* 全局表格长按拖拽划选/框选样式 */

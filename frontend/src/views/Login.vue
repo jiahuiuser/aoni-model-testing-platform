@@ -218,9 +218,10 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onBeforeUnmount } from 'vue'
+import { ref, reactive, computed, onMounted, onBeforeUnmount } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '../stores/authStore'
+import { useThemeStore } from '../stores/themeStore'
 
 const router = useRouter()
 const authStore = useAuthStore()
@@ -287,19 +288,12 @@ const onInputBlur = () => {
   isPasswordFocused.value = false
 }
 
-// 4 大色彩丰富的皮肤主题定义
-const skins = [
-  { id: 'cyber', name: '赛博深空', label: '赛博深空 🌌', dotColor: 'linear-gradient(135deg, #6366f1, #3b82f6)' },
-  { id: 'aurora', name: '缤纷极光', label: '缤纷极光 🌈', dotColor: 'linear-gradient(135deg, #10b981, #ec4899)' },
-  { id: 'sunset', name: '暮光暖阳', label: '暮光暖阳 🌅', dotColor: 'linear-gradient(135deg, #f59e0b, #ef4444)' },
-  { id: 'glacier', name: '极地水晶', label: '极地水晶 🧊', dotColor: 'linear-gradient(135deg, #38bdf8, #818cf8)' },
-]
-
-const currentSkin = ref('cyber')
+const themeStore = useThemeStore()
+const skins = computed(() => themeStore.skins)
+const currentSkin = computed(() => themeStore.currentTheme)
 
 const setSkin = (skinId) => {
-  currentSkin.value = skinId
-  localStorage.setItem('aoni_login_skin', skinId)
+  themeStore.setTheme(skinId)
 }
 
 // HTML5 Canvas 交互神经网络粒子动画逻辑
@@ -387,9 +381,9 @@ const initCanvas = () => {
 }
 
 onMounted(() => {
-  const savedSkin = localStorage.getItem('aoni_login_skin')
-  if (savedSkin && skins.some(s => s.id === savedSkin)) {
-    currentSkin.value = savedSkin
+  const savedSkin = localStorage.getItem('aoni_login_skin') || localStorage.getItem('aoni_theme')
+  if (savedSkin && themeStore.skins.some(s => s.id === savedSkin)) {
+    themeStore.setTheme(savedSkin)
   }
   initCanvas()
   triggerSpeech('欢迎来到奥尼模型测试平台！🐸', 4000)

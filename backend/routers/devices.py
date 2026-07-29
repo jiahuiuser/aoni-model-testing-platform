@@ -97,6 +97,7 @@ class DeviceCreate(BaseModel):
     name: str
     host: str
     device_type: str = "jetson"
+    chip_type: str = "nvidia_thor"
     port: int = 8800
     credential_id: int | None = None
     cpu_cores: int | None = None
@@ -110,6 +111,7 @@ class DeviceUpdate(BaseModel):
     name: str | None = None
     host: str | None = None
     device_type: str | None = None
+    chip_type: str | None = None
     port: int | None = None
     credential_id: int | None = None
     cpu_cores: int | None = None
@@ -122,7 +124,9 @@ class DeviceUpdate(BaseModel):
 def _device_to_dict(d: Device) -> dict:
     return {
         "id": d.id, "name": d.name, "host": d.host,
-        "device_type": d.device_type, "port": d.port,
+        "device_type": d.device_type,
+        "chip_type": getattr(d, "chip_type", "nvidia_thor") or "nvidia_thor",
+        "port": d.port,
         "credential_id": d.credential_id,
         "credential_name": d.credential.name if d.credential else "",
         "credential_type": d.credential.type if d.credential else "",
@@ -395,3 +399,116 @@ def _update_device_info(d: Device, detail: dict, db: Session):
         except (ValueError, AttributeError):
             pass
     db.commit()
+
+
+@router.post("/devices/{device_id}/doctor")
+def api_doctor_device(device_id: int, db: Session = Depends(get_db)):
+    """一键诊断设备环境健康度 (Device Doctor)"""
+    from backend.services.executor import RemoteRunner
+    from backend.services.hardware import get_hardware_driver
+
+    d = db.execute(
+        select(Device).options(joinedload(Device.credential)).where(Device.id == device_id)
+    ).unique().scalar()
+    if not d:
+        raise HTTPException(404, "设备不存在")
+
+    runner = RemoteRunner(d)
+    chip_type = getattr(d, "chip_type", "nvidia_thor") or "nvidia_thor"
+    driver = get_hardware_driver(chip_type)
+
+    items = []
+
+    # 1. SSH 远程连通性与凭证
+    if runner.is_remote:
+        ssh_res = runner.run_shell("echo SSH_OK", timeout=8)
+        if ssh_res.returncode == 0 and "SSH_OK" in ssh_res.stdout:
+            items.append({
+                "id": "ssh", "title": "SSH 远程网络连通性", "ok": True,
+                "detail": f"凭证 [{d.credential.name}] 验证通过，已建立连通 ({d.host}:{d.credential.ssh_port or 22})",
+                "remediation": None
+            })
+        else:
+            items.append({
+                "id": "ssh", "title": "SSH 远程网络连通性", "ok": False,
+                "detail": f"无法建立 SSH 连接: {ssh_res.stderr or '连接超时/拒绝'}",
+                "remediation": f"请排查目标 IP ({d.host})、端口 ({d.credential.ssh_port or 22})、密码/密钥及 sshpass 依赖:\nsudo apt-get install -y sshpass && ssh-keyscan -H {d.host} >> ~/.ssh/known_hosts"
+            })
+    else:
+        items.append({
+            "id": "ssh", "title": "节点访问模式", "ok": True,
+            "detail": "本机直接访问模式", "remediation": None
+        })
+
+    # 2. Docker 服务与权限
+    dock_res = runner.run_docker(["ps", "--format", "{{.Names}}"], timeout=8)
+    if dock_res.returncode == 0:
+        items.append({
+            "id": "docker", "title": "Docker 守护进程与免 sudo 权限", "ok": True,
+            "detail": "Docker 守护进程运行正常，已具备容器调度权限",
+            "remediation": None
+        })
+    else:
+        err_msg = dock_res.stderr or dock_res.stdout
+        items.append({
+            "id": "docker", "title": "Docker 守护进程与免 sudo 权限", "ok": False,
+            "detail": f"Docker 指令无法正常运行: {err_msg[:120]}",
+            "remediation": "请确保目标节点已启动 Docker 守护进程，并将 SSH 登录账号加进 docker 用户组:\nsudo usermod -aG docker $USER && sudo systemctl restart docker"
+        })
+
+    # 3. 芯片驱动与算力硬件识别
+    chip_check = driver.run_doctor_check(runner)
+    items.append({
+        "id": "chip", "title": f"算力芯片与驱动 ({driver.chip_name})",
+        "ok": chip_check["ok"],
+        "detail": chip_check["detail"],
+        "remediation": chip_check.get("remediation")
+    })
+
+    # 4. 磁盘挂载点空间
+    avail_gb = runner.get_available_disk_gb()
+    if avail_gb >= 30.0:
+        items.append({
+            "id": "disk", "title": "模型挂载点磁盘剩余空间", "ok": True,
+            "detail": f"宿主机可用磁盘空间充裕 ({avail_gb:.1f} GB ≥ 30 GB)",
+            "remediation": None
+        })
+    elif avail_gb >= 15.0:
+        items.append({
+            "id": "disk", "title": "模型挂载点磁盘剩余空间", "ok": True,
+            "detail": f"宿主机可用磁盘空间预警 ({avail_gb:.1f} GB < 30 GB)，可能影响大模型加载",
+            "remediation": "建议清理宿主机 /models 或 /tmp 下无用的权重镜像压缩文件:\nsudo rm -rf /tmp/vllm_* /models/*.tar.gz"
+        })
+    else:
+        items.append({
+            "id": "disk", "title": "模型挂载点磁盘剩余空间", "ok": False,
+            "detail": f"磁盘空间极度匮乏 (仅剩余 {avail_gb:.1f} GB < 15 GB)，任务将无法正常解压模型",
+            "remediation": "请清理宿主机磁盘以释放至少 30 GB 空间:\nsudo docker system prune -af && sudo rm -rf ~/.cache/huggingface"
+        })
+
+    # 5. 默认压测端口 8300
+    port_res = runner.run_shell("netstat -tuln 2>/dev/null || ss -tuln 2>/dev/null", timeout=5)
+    if ":8300 " in port_res.stdout:
+        items.append({
+            "id": "port", "title": "测试端口 (8300) 状态", "ok": True,
+            "detail": "端口 8300 当前被占用（有正在运行的推理引擎容器）",
+            "remediation": None
+        })
+    else:
+        items.append({
+            "id": "port", "title": "测试端口 (8300) 状态", "ok": True,
+            "detail": "端口 8300 空闲就绪",
+            "remediation": None
+        })
+
+    passed_count = sum(1 for it in items if it["ok"])
+    score = int(passed_count / len(items) * 100)
+
+    return {
+        "device_id": d.id,
+        "device_name": d.name,
+        "chip_name": driver.chip_name,
+        "chip_type": chip_type,
+        "score": score,
+        "items": items
+    }

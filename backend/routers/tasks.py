@@ -12,7 +12,7 @@ from backend.database import get_db
 from backend.models import Task, ModelRun, TaskLog, TaskStatus
 from backend.schemas import (
     TaskCreate, TaskOut, TaskDetailOut, TaskLogOut, TaskAction, ModelRunOut,
-    PerfResultOut, AccResultOut,
+    PerfResultOut, AccResultOut, GatewayResultOut,
 )
 from backend.services.task_manager import create_task, start_task, pause_task, resume_task, cancel_task
 
@@ -33,16 +33,30 @@ def api_create_task(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    try:
-        task = create_task(db, data, user_id=current_user.id)
-    except ValueError as e:
-        raise HTTPException(400, detail=str(e))
-
-    # 后台启动
     import threading
-    t = threading.Thread(target=start_task, args=(task.id,), daemon=True)
-    t.start()
-    return _task_to_out(task)
+
+    device_list = data.device_ids if data.device_ids else ([data.device_id] if data.device_id else [None])
+    created_tasks = []
+
+    for dev_id in device_list:
+        sub_data = TaskCreate(
+            name=f"{data.name}" + (f" (Device #{dev_id})" if len(device_list) > 1 else ""),
+            profile=data.profile,
+            device_id=dev_id,
+            template_id=data.template_id,
+            config=data.config
+        )
+        try:
+            task = create_task(db, sub_data, user_id=current_user.id)
+            created_tasks.append(task)
+            # 后台异步启动
+            t = threading.Thread(target=start_task, args=(task.id,), daemon=True)
+            t.start()
+        except ValueError as e:
+            if not created_tasks:
+                raise HTTPException(400, detail=str(e))
+
+    return _task_to_out(created_tasks[0])
 
 
 from sqlalchemy import select, func, desc, asc
@@ -52,8 +66,8 @@ def api_list_tasks(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    query = select(Task).order_by(asc(Task.id)).limit(200)
-    # 多用户数据隔离：普通用户只能查看自己的任务；管理员可全览
+    query = select(Task).order_by(desc(Task.id)).limit(200)
+    # 多用户数据隔离：普通用户只能查看自己的测试任务；管理员 (admin) 可查阅全量数据
     if current_user.role != "admin":
         query = query.where(Task.user_id == current_user.id)
     tasks = db.execute(query).scalars().all()
@@ -91,6 +105,9 @@ def api_task_action(
         resume_task(task_id)
     elif action.action == "cancel":
         cancel_task(db, task_id)
+    elif action.action in ("rerun", "restart"):
+        from backend.services.task_manager import restart_task
+        restart_task(db, task_id)
     else:
         raise HTTPException(400, f"未知操作: {action.action}")
 
@@ -164,13 +181,21 @@ def api_get_logs(task_id: int, model_slug: Optional[str] = None, limit: int = 20
 
 # ---------- 辅助函数 ----------
 
+def _get_status_str(val):
+    if not val:
+        return "unknown"
+    return val.value if hasattr(val, "value") else str(val)
+
+
 def _task_to_out(t: Task) -> TaskOut:
     model_runs = t.model_runs or []
-    completed = sum(1 for m in model_runs if m.status and m.status.value == "done")
-    
+    completed = sum(1 for m in model_runs if _get_status_str(m.status) in ("done", "completed"))
+    status_str = _get_status_str(t.status)
+
     # 【自愈状态校准】：如果所有 ModelRun 均已 DONE/100%，但父 Task 状态仍停留在 RUNNING/PAUSED，自动校准为 COMPLETED
-    if len(model_runs) > 0 and completed == len(model_runs) and t.status in (TaskStatus.RUNNING, TaskStatus.PAUSED):
-        t.status = TaskStatus.COMPLETED
+    if len(model_runs) > 0 and completed == len(model_runs) and status_str in ("running", "paused"):
+        t.status = "completed"
+        status_str = "completed"
         if not t.completed_at:
             t.completed_at = datetime.utcnow()
         try:
@@ -178,7 +203,7 @@ def _task_to_out(t: Task) -> TaskOut:
             with session_factory() as s:
                 db_t = s.get(Task, t.id)
                 if db_t:
-                    db_t.status = TaskStatus.COMPLETED
+                    db_t.status = "completed"
                     if not db_t.completed_at:
                         db_t.completed_at = datetime.utcnow()
                     s.commit()
@@ -186,7 +211,7 @@ def _task_to_out(t: Task) -> TaskOut:
             pass
 
     return TaskOut(
-        id=t.id, name=t.name, status=t.status.value, profile=t.profile,
+        id=t.id, name=t.name, status=status_str, profile=t.profile,
         user_id=t.user_id, username=t.user.username if t.user else None,
         device_id=t.device_id, device_name=t.device.name if t.device else None,
         config=t.config, created_at=t.created_at, started_at=t.started_at,
@@ -199,6 +224,13 @@ def _task_to_detail(t: Task) -> TaskDetailOut:
     basic = _task_to_out(t)
     runs = []
     for mr in (t.model_runs or []):
+        gw_out = []
+        for gr in (mr.gateway_results or []):
+            gw_out.append(GatewayResultOut(
+                id=gr.id, category=gr.category or "protocol", test_item=gr.test_item or "",
+                protocol=gr.protocol or "system", status=gr.status or "SKIP",
+                latency_ms=gr.latency_ms, message=gr.message, raw_details=gr.raw_details,
+            ))
         perf_out = []
         for pr in (mr.perf_results or []):
             perf_out.append(PerfResultOut(
@@ -216,11 +248,11 @@ def _task_to_detail(t: Task) -> TaskDetailOut:
             ))
         runs.append(ModelRunOut(
             id=mr.id, model_idx=mr.model_idx, model_name=mr.model_name,
-            model_slug=mr.model_slug, status=mr.status.value if mr.status else "unknown",
+            model_slug=mr.model_slug, status=_get_status_str(mr.status),
             device_id=mr.device_id, device_name=mr.device_name,
             progress=mr.progress, progress_detail=mr.progress_detail,
             started_at=mr.started_at, completed_at=mr.completed_at,
-            perf_results=perf_out, acc_results=acc_out,
+            gateway_results=gw_out, perf_results=perf_out, acc_results=acc_out,
         ))
     return TaskDetailOut(
         id=basic.id, name=basic.name, status=basic.status, profile=basic.profile,

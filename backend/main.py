@@ -13,7 +13,7 @@ from fastapi.responses import JSONResponse
 import logging
 
 from backend.database import init_db, session_factory
-from backend.routers import tasks, models, reports, devices
+from backend.routers import tasks, models, reports, devices, data_mgmt, images, hardware_groups
 from backend.routers.auth import router as auth_router, ensure_admin
 
 logging.basicConfig(level=logging.INFO)
@@ -51,6 +51,9 @@ app.include_router(tasks.router)
 app.include_router(models.router)
 app.include_router(reports.router)
 app.include_router(devices.router)
+app.include_router(data_mgmt.router)
+app.include_router(images.router)
+app.include_router(hardware_groups.router)
 
 
 @app.exception_handler(Exception)

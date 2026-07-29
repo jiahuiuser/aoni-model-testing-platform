@@ -9,19 +9,18 @@
         <el-button type="success" plain :disabled="!selectedDevice" :loading="checking === selectedDevice?.id" @click="handleCheckSelected">
           <el-icon><Refresh /></el-icon> 节点健康检查
         </el-button>
-        <el-button type="warning" plain :disabled="!selectedDevice" @click="openEditSelected">
+        <el-button type="warning" plain :disabled="!selectedDevice" :loading="doctorLoading" @click="handleRunDoctor">
+          <el-icon><FirstAidKit /></el-icon> 🩺 一键诊断 (Doctor)
+        </el-button>
+        <el-button type="info" plain :disabled="!selectedDevice" @click="openEditSelected">
           <el-icon><Edit /></el-icon> 编辑设备
         </el-button>
         <el-button @click="showCredDialog = true">
           <el-icon><Key /></el-icon> 凭证管理
         </el-button>
-        <el-popconfirm v-if="selectedDevice" title="确定删除选中设备？" @confirm="handleDeleteSelected">
-          <template #reference>
-            <el-button type="danger" plain>
-              <el-icon><Delete /></el-icon> 删除设备
-            </el-button>
-          </template>
-        </el-popconfirm>
+        <el-button v-if="selectedDevice" type="danger" plain @click="confirmDeleteSelectedDevice">
+          <el-icon><Delete /></el-icon> 删除设备
+        </el-button>
       </div>
 
       <div class="toolbar-right">
@@ -202,6 +201,14 @@
             <el-option label="Cloud" value="cloud" />
           </el-select>
         </el-form-item>
+        <el-form-item label="算力芯片架构">
+          <el-select v-model="form.chip_type" placeholder="选择硬件算力芯片架构" style="width:100%">
+            <el-option label="NVIDIA Jetson AGX Thor (T5000)" value="nvidia_thor" />
+            <el-option label="沐曦 MetaX (C500 / N260 - mx-smi)" value="metax_c500_n260" />
+            <el-option label="服务器 NVIDIA RTX 5090 (CUDA 13)" value="nvidia_rtx5090" />
+            <el-option label="摩尔线程 MUSA (musa-smi)" value="mthreads_musa" />
+          </el-select>
+        </el-form-item>
         <el-form-item label="vLLM 端口">
           <el-input v-model.number="form.port" placeholder="8800" />
         </el-form-item>
@@ -210,10 +217,51 @@
             <el-option v-for="c in credentials" :key="c.id" :label="`${c.name} (${c.type === 'ssh_key' ? '密钥' : '密码'})`" :value="c.id" />
           </el-select>
         </el-form-item>
+        <el-form-item label="部署/绑定镜像">
+          <el-select v-model="form.bound_image_id" placeholder="可选: 绑定平台内置/部署镜像版本" clearable style="width:100%">
+            <el-option v-for="img in dockerImages" :key="img.id" :label="`${img.name} (${img.image_tag})`" :value="img.id" />
+          </el-select>
+        </el-form-item>
       </el-form>
       <template #footer>
         <el-button @click="dialogVisible = false">取消</el-button>
         <el-button type="primary" @click="handleSave">{{ editing ? '保存' : '添加' }}</el-button>
+      </template>
+    </el-dialog>
+
+    <!-- 🩺 Device Doctor 诊断结果弹窗 -->
+    <el-dialog v-model="showDoctorDialog" title="🩺 节点环境健康诊断向导 (Device Doctor)" width="700px">
+      <div v-if="doctorReport" style="padding: 4px;">
+        <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 16px; background: #F3F4F6; padding: 12px 16px; border-radius: 8px;">
+          <div>
+            <div style="font-weight: 700; font-size: 16px; color: #1F2937;">{{ doctorReport.device_name }}</div>
+            <div style="color: #4B5563; font-size: 13px; margin-top: 4px;">底层算力架构: <b>{{ doctorReport.chip_name }}</b></div>
+          </div>
+          <div style="text-align: right;">
+            <div style="font-size: 26px; font-weight: 800;" :style="{ color: doctorReport.score >= 80 ? '#10B981' : (doctorReport.score >= 60 ? '#F59E0B' : '#EF4444') }">
+              {{ doctorReport.score }}分
+            </div>
+            <div style="font-size: 12px; color: #6B7280;">环境健康度得分</div>
+          </div>
+        </div>
+
+        <div v-for="item in doctorReport.items" :key="item.id" style="border: 1px solid #E5E7EB; border-radius: 6px; padding: 12px; margin-bottom: 12px; background: #FFF;">
+          <div style="display: flex; justify-content: space-between; align-items: center;">
+            <span style="font-weight: 600; font-size: 14px; color: #1F2937;">
+              {{ item.ok ? '✅' : '❌' }} {{ item.title }}
+            </span>
+            <el-tag :type="item.ok ? 'success' : 'danger'" size="small">{{ item.ok ? '正常' : '异常 / 阻断' }}</el-tag>
+          </div>
+          <div style="color: #4B5563; font-size: 13px; margin-top: 6px; line-height: 1.4;">{{ item.detail }}</div>
+          <div v-if="!item.ok && item.remediation" style="margin-top: 10px; background: #FEF2F2; border: 1px solid #FCA5A5; padding: 10px; border-radius: 6px;">
+            <div style="font-weight: 600; color: #991B1B; font-size: 12px; margin-bottom: 4px;">🛠️ 自救排障指引与解决方案:</div>
+            <pre style="background: #1F2937; color: #10B981; padding: 8px 12px; border-radius: 4px; font-size: 12px; margin: 6px 0; white-space: pre-wrap; word-break: break-all;">{{ item.remediation }}</pre>
+            <el-button size="small" type="danger" plain @click="copyCommand(item.remediation)">📋 一键复制排障命令</el-button>
+          </div>
+        </div>
+      </div>
+      <template #footer>
+        <el-button type="primary" @click="showDoctorDialog = false">关闭</el-button>
       </template>
     </el-dialog>
 
@@ -283,8 +331,9 @@
 
 <script setup>
 import { ref, onMounted } from 'vue'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import axios from 'axios'
+import { apiDoctorDevice } from '../api'
 import { useDragSelect } from '../utils/dragSelect'
 
 const tableRef = ref(null)
@@ -391,6 +440,22 @@ const handleSave = async () => {
   } catch (e) { ElMessage.error('保存设备信息失败') }
 }
 
+const confirmDeleteSelectedDevice = () => {
+  if (!selectedDevice.value) return
+  ElMessageBox.confirm(
+    `确定要永久删除设备节点 [${selectedDevice.value.name}] 吗？关联的数据及配置将被清除，此操作不可撤销！`,
+    '危险删除确认',
+    {
+      confirmButtonText: '确认永久删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+      center: true,
+    }
+  ).then(() => {
+    handleDeleteSelected()
+  }).catch(() => {})
+}
+
 const handleDeleteSelected = async () => {
   if (!selectedDevice.value) return
   try {
@@ -399,6 +464,34 @@ const handleDeleteSelected = async () => {
     await loadDevices()
     ElMessage.success('设备节点已成功删除')
   } catch (e) { ElMessage.error('删除设备失败') }
+}
+
+const showDoctorDialog = ref(false)
+const doctorLoading = ref(false)
+const doctorReport = ref(null)
+
+const handleRunDoctor = async () => {
+  if (!selectedDevice.value) return
+  doctorLoading.value = true
+  try {
+    const res = await apiDoctorDevice(selectedDevice.value.id)
+    doctorReport.value = res
+    showDoctorDialog.value = true
+    ElMessage.success(`[${selectedDevice.value.name}] 一键健康诊断完成！得分: ${res.score}分`)
+  } catch (e) {
+    ElMessage.error(`设备诊断执行异常: ${e.response?.data?.detail || e.message}`)
+  } finally {
+    doctorLoading.value = false
+  }
+}
+
+const copyCommand = (cmdText) => {
+  if (!cmdText) return
+  navigator.clipboard.writeText(cmdText).then(() => {
+    ElMessage.success('排障修复命令行已成功复制到剪贴板！')
+  }).catch(() => {
+    ElMessage.error('复制失败，请手动选择复制')
+  })
 }
 
 const handleCheckSelected = async () => {
@@ -445,7 +538,18 @@ const deleteCred = async (id) => {
   try { await axios.delete(`/api/credentials/${id}`); await loadCredentials(); ElMessage.success('凭证已成功删除') } catch (e) { ElMessage.error('删除凭证失败') }
 }
 
-onMounted(() => { loadDevices(); loadCredentials() })
+const dockerImages = ref([])
+
+const loadDockerImages = async () => {
+  try {
+    const res = await axios.get('/api/images')
+    dockerImages.value = res.data
+  } catch (e) {
+    console.error(e)
+  }
+}
+
+onMounted(() => { loadDevices(); loadCredentials(); loadDockerImages() })
 </script>
 
 <style scoped>

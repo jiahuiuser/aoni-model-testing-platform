@@ -6,28 +6,20 @@
         <el-button type="primary" :disabled="selectedReports.length !== 1" @click="viewReportSelected(selectedReports[0])">
           <el-icon><View /></el-icon> 查看报告
         </el-button>
-        <el-button type="success" plain :disabled="selectedReports.length !== 1" @click="downloadReportSelected(selectedReports[0])">
-          <el-icon><Download /></el-icon> 下载报告
+        <el-button type="success" plain @click="exportSummaryCSV">
+          <el-icon><Download /></el-icon> 导出汇总 CSV
         </el-button>
-        <el-button type="success" plain :disabled="selectedReports.length < 2" @click="compareSelectedReportsInTable">
-          <el-icon><DataAnalysis /></el-icon> ⚡ 对比选中的报告 ({{ selectedReports.length }})
+        <el-button type="warning" plain :disabled="selectedReports.length < 2" @click="compareSelectedReportsInTable">
+          <el-icon><DataAnalysis /></el-icon> 对比选中报告 ({{ selectedReports.length }})
         </el-button>
-        <el-popconfirm
+        <el-button
           v-if="selectedReports.length > 0"
-          :title="`确定删除选中的 ${selectedReports.length} 份测试报告？`"
-          confirm-button-text="确认删除"
-          cancel-button-text="取消"
-          confirm-button-type="danger"
-          placement="bottom"
-          :teleported="true"
-          @confirm="handleBatchDelete"
+          type="danger"
+          plain
+          @click="confirmDeleteSelectedReports"
         >
-          <template #reference>
-            <el-button type="danger" plain>
-              <el-icon><Delete /></el-icon> 批量删除 ({{ selectedReports.length }})
-            </el-button>
-          </template>
-        </el-popconfirm>
+          <el-icon><Delete /></el-icon> 批量删除 ({{ selectedReports.length }})
+        </el-button>
       </div>
 
       <div class="toolbar-right">
@@ -38,26 +30,12 @@
       </div>
     </div>
 
-    <!-- 管理员视角全览 Alert 提示 -->
-    <el-alert
-      v-if="authStore.isAdmin"
-      type="success"
-      show-icon
-      :closable="false"
-      style="margin-bottom: 14px;"
-    >
-      <template #title>
-        <span style="font-size:13px;font-weight:600;">
-          👑 管理员视角全览模式：您当前正查看全平台所有账号下生成的测试报告。
-        </span>
-      </template>
-    </el-alert>
 
-    <!-- 顶部多模型深度基准对比控制台 (问题 4 / 自选模型对比) -->
+    <!-- 顶部多模型深度基准对比控制台 -->
     <div class="charts-section">
       <div class="compare-control-bar">
         <div class="control-group">
-          <span class="control-label">🎯 自选对比模型:</span>
+          <span class="control-label">自选对比模型:</span>
           <el-select
             v-model="compareModelSlugs"
             multiple
@@ -72,7 +50,7 @@
         </div>
 
         <div class="control-group">
-          <span class="control-label">⚡ 测试并发:</span>
+          <span class="control-label">测试并发:</span>
           <el-radio-group v-model="compareConcurrency" size="small">
             <el-radio-button :label="1">并发 1</el-radio-button>
             <el-radio-button :label="4">并发 4</el-radio-button>
@@ -82,7 +60,7 @@
         </div>
 
         <div class="control-group">
-          <span class="control-label">📝 生成场景:</span>
+          <span class="control-label">生成场景:</span>
           <el-radio-group v-model="compareOutputType" size="small">
             <el-radio-button label="short">128 (短生成)</el-radio-button>
             <el-radio-button label="long">512 (长生成)</el-radio-button>
@@ -91,7 +69,7 @@
 
         <div class="control-actions">
           <el-button type="primary" size="small" @click="triggerCompareChart">
-            <el-icon><DataAnalysis /></el-icon> ⚡ 生成对比看板
+            <el-icon><DataAnalysis /></el-icon> 生成对比看板
           </el-button>
           <el-button size="small" plain @click="resetCompare">
             <el-icon><RefreshRight /></el-icon> 重置
@@ -104,7 +82,7 @@
         <el-col :span="9">
           <div class="chart-card">
             <div class="chart-header">
-              <span class="chart-title">⚡ 模型 Token 吞吐量对比 (Output Tokens / sec)</span>
+              <span class="chart-title">模型 Token 吞吐量对比 (Tokens/s)</span>
             </div>
             <v-chart class="chart-box" :option="throughputChartOption" :autoresize="true" />
           </div>
@@ -114,7 +92,7 @@
         <el-col :span="8">
           <div class="chart-card">
             <div class="chart-header">
-              <span class="chart-title">⏱️ 首字响应延迟 (Mean TTFT vs P99 TTFT ms)</span>
+              <span class="chart-title">首字响应延迟 (TTFT ms)</span>
             </div>
             <v-chart class="chart-box" :option="ttftChartOption" :autoresize="true" />
           </div>
@@ -241,7 +219,7 @@ import { CanvasRenderer } from 'echarts/renderers'
 import { BarChart, LineChart } from 'echarts/charts'
 import { TitleComponent, TooltipComponent, LegendComponent, GridComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import axios from 'axios'
 import { useAuthStore } from '../stores/authStore'
 import { useDragSelect } from '../utils/dragSelect'
@@ -281,6 +259,40 @@ const viewReportSelected = (target) => {
   }
 }
 
+const exportSummaryCSV = () => {
+  const targetList = selectedReports.value.length > 0 ? selectedReports.value : reports.value
+  if (!targetList || targetList.length === 0) return ElMessage.warning("暂无可用测试报告数据导出")
+
+  let csvContent = "data:text/csv;charset=utf-8,\uFEFF"
+  csvContent += "报告ID,所属任务ID,任务名称,测试模型,执行节点,测试账号,状态,性能用例数,准确率用例数,开始时间,完成时间\n"
+
+  targetList.forEach(r => {
+    const row = [
+      r.id,
+      r.task_id,
+      `"${(r.task_name || '').replace(/"/g, '""')}"`,
+      `"${(r.model_name || '').replace(/"/g, '""')}"`,
+      `"${(r.device_name || 'Jetson Thor').replace(/"/g, '""')}"`,
+      `"${(r.username || 'admin').replace(/"/g, '""')}"`,
+      r.status,
+      r.perf_results_count || 0,
+      r.acc_results_count || 0,
+      `"${r.started_at || ''}"`,
+      `"${r.completed_at || ''}"`
+    ]
+    csvContent += row.join(",") + "\n"
+  })
+
+  const encodedUri = encodeURI(csvContent)
+  const link = document.createElement("a")
+  link.setAttribute("href", encodedUri)
+  link.setAttribute("download", `AONI_Reports_Summary_${new Date().toISOString().slice(0,10)}.csv`)
+  document.body.appendChild(link)
+  link.click()
+  document.body.removeChild(link)
+  ElMessage.success(`已导出 ${targetList.length} 份测试报告的汇总 CSV 数据！`)
+}
+
 const downloadReportSelected = (target) => {
   const item = target || (selectedReports.value.length === 1 ? selectedReports.value[0] : null)
   if (!item) return
@@ -300,6 +312,22 @@ const handleSingleDelete = async (report) => {
   } catch (e) {
     ElMessage.error('删除失败: ' + (e.response?.data?.detail || e.message))
   }
+}
+
+const confirmDeleteSelectedReports = () => {
+  if (selectedReports.value.length === 0) return
+  ElMessageBox.confirm(
+    `确定要永久删除选中的 ${selectedReports.value.length} 份测试报告吗？此操作不可撤销！`,
+    '危险删除确认',
+    {
+      confirmButtonText: '确认永久删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+      center: true,
+    }
+  ).then(() => {
+    handleBatchDelete()
+  }).catch(() => {})
 }
 
 const handleBatchDelete = async () => {
@@ -452,10 +480,10 @@ const loadReports = async () => {
   try {
     const params = filterDeviceId.value ? { device_id: filterDeviceId.value } : {}
     reports.value = await apiListReports(params)
-    if (selectedReport.value) {
-      selectedReport.value = reports.value.find(r => r.id === selectedReport.value.id) || null
-    }
-  } catch (e) { console.error(e) }
+  } catch (e) {
+    console.error(e)
+    ElMessage.error('加载测试报告列表失败: ' + (e.response?.data?.detail || e.message))
+  }
   loading.value = false
 }
 

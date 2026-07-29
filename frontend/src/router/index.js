@@ -11,6 +11,8 @@ const routes = [
   { path: '/task/:id',  name: 'TaskDetail',        component: () => import('../views/TaskDetail.vue') },
   { path: '/models',    name: 'ModelManagement',   component: () => import('../views/ModelManagement.vue') },
   { path: '/devices',   name: 'DeviceManagement',  component: () => import('../views/DeviceManagement.vue') },
+  { path: '/data',      name: 'DataManagement',    component: () => import('../views/DataManagement.vue') },
+  { path: '/images',    name: 'ImageManagement',   component: () => import('../views/ImageManagement.vue') },
   { path: '/reports',   name: 'Reports',            component: () => import('../views/Reports.vue') },
   { path: '/reports/:id', name: 'ReportDetail',    component: () => import('../views/ReportDetail.vue') },
 

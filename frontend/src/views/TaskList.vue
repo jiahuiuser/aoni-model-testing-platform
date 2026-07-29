@@ -4,16 +4,16 @@
     <div class="top-toolbar">
       <div class="toolbar-left">
         <el-button type="primary" @click="$router.push('/create')">
-          <el-icon><Plus /></el-icon> 新建任务
+          <el-icon><Plus /></el-icon> 创建测试任务
         </el-button>
         <el-button type="info" plain :disabled="selectedTasks.length !== 1" @click="viewDetail(selectedTasks[0])">
-          <el-icon><View /></el-icon> 查看详情与日志
+          <el-icon><View /></el-icon> 详情与日志
         </el-button>
         <el-button type="warning" plain :disabled="selectedTasks.length !== 1 || singleSelected?.status === 'running'" @click="handleEditTask">
           <el-icon><Edit /></el-icon> 编辑任务
         </el-button>
         <el-button type="success" plain :disabled="selectedTasks.length !== 1" @click="showConfigDialog(selectedTasks[0])">
-          <el-icon><Setting /></el-icon> 任务参数配置
+          <el-icon><Setting /></el-icon> 任务参数
         </el-button>
         <el-button v-if="singleSelected?.status === 'running'" type="warning" plain @click="handleAction('pause')">
           <el-icon><VideoPause /></el-icon> 暂停任务
@@ -21,22 +21,17 @@
         <el-button v-if="singleSelected?.status === 'paused'" type="success" plain @click="handleAction('resume')">
           <el-icon><VideoPlay /></el-icon> 继续任务
         </el-button>
-        <el-popconfirm
+        <el-button v-if="singleSelected && ['failed', 'completed', 'cancelled', 'paused'].includes(singleSelected?.status)" type="primary" plain @click="handleAction('rerun')">
+          <el-icon><RefreshRight /></el-icon> 🔁 重新运行任务
+        </el-button>
+        <el-button
           v-if="selectedTasks.length > 0"
-          :title="`确定删除选中的 ${selectedTasks.length} 个任务？`"
-          confirm-button-text="确认删除"
-          cancel-button-text="取消"
-          confirm-button-type="danger"
-          placement="bottom"
-          :teleported="true"
-          @confirm="handleBatchDelete"
+          type="danger"
+          plain
+          @click="confirmDeleteSelectedTasks"
         >
-          <template #reference>
-            <el-button type="danger" plain>
-              <el-icon><Delete /></el-icon> 批量删除 ({{ selectedTasks.length }})
-            </el-button>
-          </template>
-        </el-popconfirm>
+          <el-icon><Delete /></el-icon> 批量删除 ({{ selectedTasks.length }})
+        </el-button>
       </div>
 
       <div class="toolbar-right">
@@ -64,20 +59,6 @@
       </div>
     </div>
 
-    <!-- 管理员视角全览 Alert 提示 -->
-    <el-alert
-      v-if="authStore.isAdmin"
-      type="success"
-      show-icon
-      :closable="false"
-      style="margin-bottom: 14px;"
-    >
-      <template #title>
-        <span style="font-size:13px;font-weight:600;">
-          👑 管理员视角全览模式：您当前正查看全平台所有账号下创建的测试任务 (包含 admin / tjh / 新建立账号)。
-        </span>
-      </template>
-    </el-alert>
 
     <!-- 多选表格 -->
     <el-table
@@ -96,7 +77,7 @@
       <el-table-column prop="name" label="任务名称" min-width="220" show-overflow-tooltip />
       <el-table-column label="执行设备" width="165">
         <template #default="{ row }">
-          <el-tag size="small" type="info">🖥️ {{ row.device_name || 'Jetson Thor (本机)' }}</el-tag>
+          <el-tag size="small" type="info">{{ row.device_name || 'Jetson Thor' }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="所属账号" width="125" align="center">
@@ -106,7 +87,7 @@
             :type="(row.username === 'admin' || !row.username) ? 'danger' : 'success'"
             effect="dark"
           >
-            {{ (row.username === 'admin' || !row.username) ? '👑 admin' : `👤 ${row.username}` }}
+            {{ row.username || 'admin' }}
           </el-tag>
         </template>
       </el-table-column>
@@ -134,8 +115,8 @@
       </el-table-column>
     </el-table>
 
-    <!-- 任务配置参数详情弹窗 (问题 3) -->
-    <el-dialog v-model="configDialogVisible" title="⚙️ 任务完整参数配置" width="600px" destroy-on-close>
+    <!-- 任务配置参数详情弹窗 -->
+    <el-dialog v-model="configDialogVisible" title="任务配置详情" width="600px" destroy-on-close>
       <div v-if="currentConfigTask" class="config-detail-box">
         <el-descriptions :column="1" border size="small">
           <el-descriptions-item label="任务 ID & 名称">
@@ -194,7 +175,7 @@
 <script setup>
 import { ref, computed, onMounted, onActivated } from 'vue'
 import { useRouter } from 'vue-router'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 import { Edit } from '@element-plus/icons-vue'
 import { useAuthStore } from '../stores/authStore'
 import { apiListTasks, apiTaskAction, apiDeleteTask } from '../api'
@@ -261,7 +242,10 @@ const loadTasks = async () => {
   loading.value = true
   try {
     tasks.value = await apiListTasks()
-  } catch (e) { console.error(e) }
+  } catch (e) {
+    console.error(e)
+    ElMessage.error('加载测试任务列表失败: ' + (e.response?.data?.detail || e.message))
+  }
   loading.value = false
 }
 
@@ -272,6 +256,22 @@ const handleAction = async (action) => {
     await loadTasks()
     ElMessage.success('操作成功')
   } catch (e) { ElMessage.error('操作失败') }
+}
+
+const confirmDeleteSelectedTasks = () => {
+  if (selectedTasks.value.length === 0) return
+  ElMessageBox.confirm(
+    `确定要永久删除选中的 ${selectedTasks.value.length} 个测试任务吗？删除后相关测试数据及日志将被清除，此操作不可撤销！`,
+    '危险删除确认',
+    {
+      confirmButtonText: '确认永久删除',
+      cancelButtonText: '取消',
+      type: 'warning',
+      center: true,
+    }
+  ).then(() => {
+    handleBatchDelete()
+  }).catch(() => {})
 }
 
 const handleBatchDelete = async () => {
