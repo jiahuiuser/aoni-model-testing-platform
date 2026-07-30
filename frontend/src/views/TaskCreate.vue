@@ -539,6 +539,13 @@ function parseConcurrencies(round) {
   return (round.concurrencies_str || '').split(',').map(Number).filter(v => v > 0)
 }
 
+function calcRoundTests(round) {
+  if (!round) return 0
+  const outLens = parseOutputLens(round)
+  const concs = parseConcurrencies(round)
+  return (outLens.length || 1) * (concs.length || 1)
+}
+
 const selectUltraDatasets = () => {
   const ultraKeys = ['aime24', 'arena_hard', 'gpqa']
   form.config.acc_datasets = Array.from(new Set([...(form.config.acc_datasets || []), ...ultraKeys]))
