@@ -156,9 +156,9 @@
         <template v-if="form.config.gateway_enabled">
           <el-form-item label="校验协议规范">
             <el-checkbox-group v-model="form.config.gateway_protocols">
-              <el-checkbox value="openai">OpenAI Chat Completions (/v1/chat/completions)</el-checkbox>
-              <el-checkbox value="responses">OpenAI Responses (/v1/responses)</el-checkbox>
-              <el-checkbox value="anthropic">Anthropic Messages (/v1/messages)</el-checkbox>
+              <el-checkbox label="openai">OpenAI Chat Completions (/v1/chat/completions)</el-checkbox>
+              <el-checkbox label="responses">OpenAI Responses (/v1/responses)</el-checkbox>
+              <el-checkbox label="anthropic">Anthropic Messages (/v1/messages)</el-checkbox>
             </el-checkbox-group>
           </el-form-item>
           <el-form-item label="长上下文测试">
