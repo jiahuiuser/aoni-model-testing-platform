@@ -339,8 +339,7 @@
 import { ref, reactive, computed, watch, onMounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import api, { apiListModels, apiCreateTask, apiUpdateTask, apiGetTask } from '../api'
-import axios from 'axios'
+import api, { apiListModels, apiListDevices, apiCreateTask, apiUpdateTask, apiGetTask } from '../api'
 
 const router = useRouter()
 const route = useRoute()
@@ -364,9 +363,10 @@ const selectedTemplateIds = ref([])
 const loadTemplates = async () => {
   try {
     const res = await api.get('/data/templates')
-    templates.value = res.data
+    templates.value = Array.isArray(res.data) ? res.data : []
   } catch (err) {
     console.error(err)
+    templates.value = []
   }
 }
 
@@ -425,12 +425,12 @@ const form = reactive({
 })
 
 const onlineDevices = computed(() =>
-  devices.value.filter(d => d.status === 'online')
+  (Array.isArray(devices.value) ? devices.value : []).filter(d => d && d.status === 'online')
 )
 
 // 针对所选模型仅展示已绑定且通过验证 (PASS) 的在线设备节点
 const availableTaskDevices = computed(() => {
-  const containerModels = selectedModelObjects.value.filter(m => !m.is_external && !m.api_base)
+  const containerModels = selectedModelObjects.value.filter(m => m && !m.is_external && !m.api_base)
   if (containerModels.length === 0) {
     return onlineDevices.value
   }
@@ -447,15 +447,15 @@ const availableTaskDevices = computed(() => {
 
 // PASS 的容器模型以及所有已接入的外部 API 端点模型均可选择
 const passModels = computed(() =>
-  models.value.filter(m => m.status === 'PASS' || Boolean(m.is_external) || Boolean(m.api_base))
+  (Array.isArray(models.value) ? models.value : []).filter(m => m && (m.status === 'PASS' || Boolean(m.is_external) || Boolean(m.api_base)))
 )
 
 const passContainerModels = computed(() =>
-  models.value.filter(m => m.status === 'PASS' && !m.is_external && !m.api_base)
+  (Array.isArray(models.value) ? models.value : []).filter(m => m && m.status === 'PASS' && !m.is_external && !m.api_base)
 )
 
 const passExternalModels = computed(() =>
-  models.value.filter(m => (m.status === 'PASS' || m.is_external || m.api_base) && (Boolean(m.is_external) || Boolean(m.api_base)))
+  (Array.isArray(models.value) ? models.value : []).filter(m => m && (m.status === 'PASS' || m.is_external || m.api_base) && (Boolean(m.is_external) || Boolean(m.api_base)))
 )
 
 const modelsByGroup = computed(() => {
@@ -482,7 +482,7 @@ const modelsByGroup = computed(() => {
 
 const selectedModelObjects = computed(() => {
   const selectedSlugs = form.config.model_slugs || []
-  return models.value.filter(m => selectedSlugs.includes(m.slug))
+  return (Array.isArray(models.value) ? models.value : []).filter(m => m && selectedSlugs.includes(m.slug))
 })
 
 const selectedExternalModels = computed(() => {
@@ -635,33 +635,35 @@ onMounted(async () => {
   loadTemplates()
   try {
     const resp = await apiListModels()
-    models.value = resp
+    models.value = Array.isArray(resp) ? resp : []
   } catch (e) { console.error('加载模型列表失败', e) }
 
   try {
-    const resp = await axios.get('/api/devices')
-    devices.value = resp.data
+    const resp = await apiListDevices()
+    devices.value = Array.isArray(resp) ? resp : []
   } catch (e) { console.error('加载设备列表失败', e) }
 
   // 编辑模式：加载现有任务数据填充表单
   if (editId.value) {
     try {
       const task = await apiGetTask(editId.value)
-      form.name = task.name || ''
-      form.profile = task.profile || 'full'
-      form.device_id = task.device_id || null
-      const cfg = task.config || {}
-      form.config.model_slugs = cfg.model_slugs || []
-      form.config.perf_enabled = cfg.perf_enabled ?? true
-      form.config.perf_rounds_config = (cfg.perf_rounds_config && cfg.perf_rounds_config.length)
-        ? cfg.perf_rounds_config
-        : [makeDefaultRound()]
-      form.config.acc_enabled = cfg.acc_enabled ?? true
-      form.config.acc_datasets = cfg.acc_datasets || ['mmlu', 'ceval', 'gsm8k', 'arc']
-      form.config.acc_limit = cfg.acc_limit || 200
-      form.config.container_port = cfg.container_port || 8300
-      form.config.gpu_memory_utilization = cfg.gpu_memory_utilization || ''
-      form.config.notify_email = cfg.notify_email || ''
+      if (task) {
+        form.name = task.name || ''
+        form.profile = task.profile || 'full'
+        form.device_id = task.device_id || null
+        const cfg = task.config || {}
+        form.config.model_slugs = cfg.model_slugs || []
+        form.config.perf_enabled = cfg.perf_enabled ?? true
+        form.config.perf_rounds_config = (cfg.perf_rounds_config && cfg.perf_rounds_config.length)
+          ? cfg.perf_rounds_config
+          : [makeDefaultRound()]
+        form.config.acc_enabled = cfg.acc_enabled ?? true
+        form.config.acc_datasets = cfg.acc_datasets || ['mmlu', 'ceval', 'gsm8k', 'arc']
+        form.config.acc_limit = cfg.acc_limit || 200
+        form.config.container_port = cfg.container_port || 8300
+        form.config.gpu_memory_utilization = cfg.gpu_memory_utilization || ''
+        form.config.notify_email = cfg.notify_email || ''
+      }
     } catch (e) {
       ElMessage.error('加载任务数据失败: ' + e.message)
     }
