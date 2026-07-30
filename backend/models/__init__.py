@@ -330,12 +330,15 @@ class DatasetInfo(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     name = Column(String(100), unique=True, nullable=False, comment="数据集名称: mmlu/ceval/gsm8k等")
     source = Column(String(100), default="ModelScope/EvalScope", comment="来源库或仓库ID")
+    difficulty = Column(String(50), default="standard", comment="难度分级: standard/hard/ultra")
+    category_group = Column(String(50), default="通用基准", comment="分类分组: 竞赛数学/真实对战/博士问答/长文本/代码编程/通用基准")
     status = Column(String(20), default="ready", comment="ready / downloading / failed")
     download_progress = Column(Float, default=100.0)
     sample_count = Column(Integer, default=0, comment="样本总量")
     description = Column(String(500), nullable=True)
     file_path = Column(String(500), nullable=True)
     updated_at = Column(DateTime, default=datetime.datetime.utcnow)
+
 
 
 # ---------- Docker 镜像管理 ----------

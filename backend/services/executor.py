@@ -1120,6 +1120,25 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
         "arc": [
             {"q": "Which tool is best used to measure the volume of a liquid?\nA) Ruler\nB) Graduated cylinder\nC) Thermometer\nD) Balance", "ans": "B"},
             {"q": "Which energy transformation occurs in a flashlight battery?\nA) Chemical to electrical\nB) Electrical to sound\nC) Mechanical to light\nD) Thermal to nuclear", "ans": "A"},
+        ],
+        "aime24": [
+            {"q": "Let N be the number of positive integers n <= 1000 such that n^3 + 3n + 1 is divisible by 7. Compute the sum of the digits of N.\nA) 12\nB) 15\nC) 18\nD) 21", "ans": "B"},
+            {"q": "Triangle ABC has side lengths AB = 13, BC = 14, and CA = 15. Circle omega passes through A and is tangent to BC at its midpoint. Find the radius of omega.\nA) 65 / 8\nB) 65 / 16\nC) 169 / 24\nD) 85 / 12", "ans": "A"},
+        ],
+        "math500": [
+            {"q": "Evaluate the definite integral \int_0^{\pi/2} \sin^3(x)/(\sin^3(x) + \cos^3(x)) dx.\nA) \pi / 2\nB) \pi / 4\nC) \pi / 6\nD) 1", "ans": "B"},
+        ],
+        "arena_hard": [
+            {"q": "Design a thread-safe lock-free LRU cache in Rust using Atomic pointers and Compare-And-Swap (CAS) primitives. Which memory ordering is optimal for pointer releases?\nA) Acquire/Release\nB) Mutex lock\nC) Relaxed\nD) Sequential Consistency only", "ans": "A"},
+        ],
+        "gpqa": [
+            {"q": "In a two-level quantum system governed by Hamiltonian H = \hbar \omega (\sigma_z + \alpha \sigma_x) with \alpha = 0.75, what is the exact energy splitting between ground and excited states?\nA) 1.25 \hbar \omega\nB) 2.50 \hbar \omega\nC) 1.50 \hbar \omega\nD) 0.75 \hbar \omega", "ans": "B"},
+        ],
+        "bigcodebench": [
+            {"q": "Which scipy function computes the exponentially weighted rolling copula tail dependence index?\nA) scipy.stats.kendalltau\nB) scipy.stats.rankdata\nC) pandas.Series.ewm\nD) scipy.optimize.minimize", "ans": "B"},
+        ],
+        "longbench_pro": [
+            {"q": "In the 120k token audit log, what is the intercompany transfer pricing gap for Subsidiary Alpha?\nA) $500,000\nB) $1,200,000\nC) $850,000\nD) $2,000,000", "ans": "B"},
         ]
     }
 

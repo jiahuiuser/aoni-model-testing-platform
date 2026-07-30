@@ -79,7 +79,7 @@ class TestTasksExtended(unittest.TestCase):
         """TC-TASK-02: 空模型列表异常容错校验"""
         headers = get_admin_headers()
         invalid_payload = {
-            "name": "非法任务",
+            "name": "边界容错测试任务",
             "device_id": 1,
             "config": { "model_slugs": [] }
         }

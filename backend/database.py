@@ -54,6 +54,17 @@ def init_db():
             except Exception:
                 pass
 
+        for col_def in [
+            "difficulty VARCHAR(50) DEFAULT 'standard'",
+            "category_group VARCHAR(50) DEFAULT '通用基准'",
+        ]:
+            try:
+                from sqlalchemy import text
+                conn.execute(text(f"ALTER TABLE dataset_infos ADD COLUMN {col_def}"))
+                conn.commit()
+            except Exception:
+                pass
+
 
 def get_db() -> Session:
     """依赖注入: 获取数据库会话"""

@@ -9,7 +9,7 @@
 
     <el-tabs v-model="activeTab" class="custom-tabs">
       <!-- Tab 1: 测试用例模板管理 -->
-      <el-tab-pane label="📋 性能测试模板" name="templates">
+      <el-tab-pane label="性能测试模板" name="templates">
         <!-- 顶部统一 CRUD 操作工具栏 -->
         <div class="top-toolbar">
           <div class="toolbar-left">
@@ -83,10 +83,17 @@
       </el-tab-pane>
 
       <!-- Tab 2: 准确率数据集管理 -->
-      <el-tab-pane label="📚 准确率数据集" name="datasets">
-        <!-- 顶部统一 CRUD 操作工具栏 -->
+      <el-tab-pane label="准确率数据集" name="datasets">
+        <!-- 顶部统一 CRUD 操作与难度切片过滤工具栏 -->
         <div class="top-toolbar">
-          <div class="toolbar-left">
+          <div class="toolbar-left" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+            <el-radio-group v-model="difficultyFilter" size="default" @change="loadDatasets">
+              <el-radio-button value="all">全部难度</el-radio-button>
+              <el-radio-button value="ultra">极高难度 (300B+旗舰)</el-radio-button>
+              <el-radio-button value="hard">高难度进阶</el-radio-button>
+              <el-radio-button value="standard">基础通用</el-radio-button>
+            </el-radio-group>
+
             <el-button type="success" @click="showDownloadDialog = true">
               <el-icon><Connection /></el-icon> 在线同步数据集
             </el-button>
@@ -114,7 +121,7 @@
 
         <el-table
           ref="datasetTableRef"
-          :data="datasets"
+          :data="filteredDatasets"
           stripe
           border
           style="width: 100%"
@@ -123,26 +130,44 @@
           class="custom-table"
         >
           <el-table-column type="selection" width="50" align="center" />
-          <el-table-column prop="name" label="数据集名称" width="140">
+          <el-table-column prop="name" label="数据集标识" width="150">
             <template #default="{ row }">
-              <b style="color:#2563eb;">{{ row.name.toUpperCase() }}</b>
+              <b style="color:#2563eb; font-size: 14px;">{{ row.name.toUpperCase() }}</b>
             </template>
           </el-table-column>
-          <el-table-column prop="source" label="来源仓库/模型" width="240" />
-          <el-table-column label="样本总量" width="130" align="center">
+          <el-table-column label="难度等级" width="160" align="center">
             <template #default="{ row }">
-              <el-tag type="info">{{ row.sample_count }} 条记录</el-tag>
+              <el-tag v-if="row.difficulty === 'ultra'" type="danger" effect="dark" size="small" style="font-weight:600;">
+                极高难度 (300B+)
+              </el-tag>
+              <el-tag v-else-if="row.difficulty === 'hard'" type="warning" effect="light" size="small" style="font-weight:600;">
+                高难度进阶
+              </el-tag>
+              <el-tag v-else type="info" size="small">
+                基础通用
+              </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="status" label="就绪状态" width="120" align="center">
+          <el-table-column prop="category_group" label="分类领域" width="130" align="center">
             <template #default="{ row }">
-              <el-tag :type="row.status === 'ready' ? 'success' : 'warning'">
+              <el-tag type="primary" plain size="small">{{ row.category_group || '通用基准' }}</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="source" label="来源仓库/模型" width="220" show-overflow-tooltip />
+          <el-table-column label="样本总量" width="120" align="center">
+            <template #default="{ row }">
+              <el-tag type="info" size="small">{{ row.sample_count }} 条记录</el-tag>
+            </template>
+          </el-table-column>
+          <el-table-column prop="status" label="就绪状态" width="110" align="center">
+            <template #default="{ row }">
+              <el-tag :type="row.status === 'ready' ? 'success' : 'warning'" size="small">
                 {{ row.status === 'ready' ? '已就绪' : '下载中' }}
               </el-tag>
             </template>
           </el-table-column>
-          <el-table-column prop="description" label="说明" min-width="240" />
-          <el-table-column label="操作" width="180" align="center">
+          <el-table-column prop="description" label="功能说明与定位" min-width="260" />
+          <el-table-column label="操作" width="140" align="center">
             <template #default="{ row }">
               <el-button size="small" type="info" plain @click.stop="previewDatasetSamples(row)">查看样本</el-button>
             </template>
@@ -152,7 +177,7 @@
     </el-tabs>
 
     <!-- 新增/修改模板 Dialog -->
-    <el-dialog v-model="showTplDialog" :title="editingTplId ? '修改用例模板' : '创建用例模板'" width="550px">
+    <el-dialog v-model="showTplDialog" :title="editingTplId ? '修改用例模板' : '创建用例模板'" width="620px">
       <el-form :model="tplForm" label-width="120px">
         <el-form-item label="模板名称">
           <el-input v-model="tplForm.name" placeholder="请输入用例模板名称" />
@@ -171,11 +196,26 @@
         </el-form-item>
         <el-form-item label="测试数据集">
           <el-checkbox-group v-model="tplForm.datasets">
-            <el-checkbox value="mmlu">mmlu</el-checkbox>
-            <el-checkbox value="ceval">ceval</el-checkbox>
-            <el-checkbox value="gsm8k">gsm8k</el-checkbox>
-            <el-checkbox value="arc">arc</el-checkbox>
-            <el-checkbox value="humaneval">humaneval</el-checkbox>
+            <div style="font-weight:600; color:#dc2626; margin-bottom:4px; font-size:12px;">300B+ 极高难度评测集：</div>
+            <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap;">
+              <el-checkbox label="aime24">aime24 (AIME竞赛数学)</el-checkbox>
+              <el-checkbox label="arena_hard">arena_hard (Arena对战)</el-checkbox>
+              <el-checkbox label="gpqa">gpqa (博士级问答)</el-checkbox>
+            </div>
+            <div style="font-weight:600; color:#d97706; margin-bottom:4px; font-size:12px;">高难度进阶数据集：</div>
+            <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap;">
+              <el-checkbox label="math500">math500</el-checkbox>
+              <el-checkbox label="bigcodebench">bigcodebench</el-checkbox>
+              <el-checkbox label="longbench_pro">longbench_pro</el-checkbox>
+            </div>
+            <div style="font-weight:600; color:#4b5563; margin-bottom:4px; font-size:12px;">基础通用数据集：</div>
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <el-checkbox label="mmlu">mmlu</el-checkbox>
+              <el-checkbox label="ceval">ceval</el-checkbox>
+              <el-checkbox label="gsm8k">gsm8k</el-checkbox>
+              <el-checkbox label="arc">arc</el-checkbox>
+              <el-checkbox label="humaneval">humaneval</el-checkbox>
+            </div>
           </el-checkbox-group>
         </el-form-item>
       </el-form>
@@ -270,7 +310,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import api from '../api'
 import { useDragSelect } from '../utils/dragSelect'
@@ -283,6 +323,15 @@ const templates = ref([])
 const datasets = ref([])
 const selectedTemplates = ref([])
 const selectedDatasets = ref([])
+
+const difficultyFilter = ref('all')
+
+const filteredDatasets = computed(() => {
+  if (!difficultyFilter.value || difficultyFilter.value === 'all') {
+    return datasets.value
+  }
+  return datasets.value.filter(d => d.difficulty === difficultyFilter.value)
+})
 
 useDragSelect(templateTableRef, templates)
 useDragSelect(datasetTableRef, datasets)

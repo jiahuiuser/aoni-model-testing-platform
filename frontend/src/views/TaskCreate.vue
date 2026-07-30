@@ -245,17 +245,63 @@
           <el-switch v-model="form.config.acc_enabled" />
         </el-form-item>
         <template v-if="form.config.acc_enabled">
-          <el-form-item label="测评数据集">
-            <el-checkbox-group v-model="form.config.acc_datasets">
-              <el-checkbox label="mmlu">MMLU (综合知识)</el-checkbox>
-              <el-checkbox label="ceval">C-Eval (中文综合)</el-checkbox>
-              <el-checkbox label="gsm8k">GSM8K (数学推理)</el-checkbox>
-              <el-checkbox label="arc">ARC (科学推理)</el-checkbox>
+          <el-form-item label="快捷选集预设">
+            <div style="display:flex; gap:8px; flex-wrap:wrap;">
+              <el-button size="small" type="danger" plain @click="selectUltraDatasets">
+                全选 300B+ 极高难度评测集 (AIME24 / Arena-Hard / GPQA)
+              </el-button>
+              <el-button size="small" type="warning" plain @click="selectHardDatasets">
+                全选高难度进阶集 (MATH-500 / BigCodeBench / LongBench Pro)
+              </el-button>
+              <el-button size="small" type="info" plain @click="selectStandardDatasets">
+                全选基础通用基准
+              </el-button>
+              <el-button size="small" @click="form.config.acc_datasets = []">清空</el-button>
+            </div>
+          </el-form-item>
+
+          <el-form-item label="测评数据集矩阵">
+            <el-checkbox-group v-model="form.config.acc_datasets" style="width:100%;">
+              <div style="background:#fef2f2; border:1px solid #fecaca; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
+                <div style="font-weight:600; color:#dc2626; margin-bottom:6px;">
+                  300B+ 极高难度旗舰评测集 (高阶符号推演 & 博士级学术问答)
+                </div>
+                <div style="display:flex; gap:16px; flex-wrap:wrap;">
+                  <el-checkbox label="aime24">AIME24 (竞赛级数学多步推演)</el-checkbox>
+                  <el-checkbox label="arena_hard">Arena-Hard (Chatbot Arena 严苛 Prompt)</el-checkbox>
+                  <el-checkbox label="gpqa">GPQA (Google-Proof 博士级学术问答)</el-checkbox>
+                </div>
+              </div>
+
+              <div style="background:#fffbeb; border:1px solid #fde68a; border-radius:6px; padding:10px 14px; margin-bottom:10px;">
+                <div style="font-weight:600; color:#d97706; margin-bottom:6px;">
+                  高难度工程与逻辑进阶集
+                </div>
+                <div style="display:flex; gap:16px; flex-wrap:wrap;">
+                  <el-checkbox label="math500">MATH-500 (高阶竞赛数学 Level 4-5)</el-checkbox>
+                  <el-checkbox label="bigcodebench">BigCodeBench (复杂库调用代码生成)</el-checkbox>
+                  <el-checkbox label="longbench_pro">LongBench Pro (8k-256k 真实长文本)</el-checkbox>
+                </div>
+              </div>
+
+              <div style="background:#f8fafc; border:1px solid #e2e8f0; border-radius:6px; padding:10px 14px;">
+                <div style="font-weight:600; color:#475569; margin-bottom:6px;">
+                  基础通用评测集
+                </div>
+                <div style="display:flex; gap:16px; flex-wrap:wrap;">
+                  <el-checkbox label="mmlu">MMLU (多任务学科知识)</el-checkbox>
+                  <el-checkbox label="ceval">C-Eval (中文综合推理)</el-checkbox>
+                  <el-checkbox label="gsm8k">GSM8K (小学数学应用题)</el-checkbox>
+                  <el-checkbox label="arc">ARC (科学常识推理)</el-checkbox>
+                  <el-checkbox label="humaneval">HumanEval (Python 代码生成)</el-checkbox>
+                </div>
+              </div>
             </el-checkbox-group>
           </el-form-item>
+
           <el-form-item label="数据集抽样数">
             <el-input v-model.number="form.config.acc_limit" placeholder="200" style="width: 200px;" />
-            <span style="color:#909399;font-size:12px;margin-left:8px">推荐 50~200 题</span>
+            <span style="color:#909399;font-size:12px;margin-left:8px">推荐 50~200 题 (高难度评测集建议 50~100 题)</span>
           </el-form-item>
         </template>
       </template>
@@ -493,10 +539,19 @@ function parseConcurrencies(round) {
   return (round.concurrencies_str || '').split(',').map(Number).filter(v => v > 0)
 }
 
-function calcRoundTests(round) {
-  const ol = parseOutputLens(round).length
-  const cc = parseConcurrencies(round).length || 5  // 默认 5 级并发
-  return ol * cc
+const selectUltraDatasets = () => {
+  const ultraKeys = ['aime24', 'arena_hard', 'gpqa']
+  form.config.acc_datasets = Array.from(new Set([...(form.config.acc_datasets || []), ...ultraKeys]))
+}
+
+const selectHardDatasets = () => {
+  const hardKeys = ['math500', 'bigcodebench', 'longbench_pro']
+  form.config.acc_datasets = Array.from(new Set([...(form.config.acc_datasets || []), ...hardKeys]))
+}
+
+const selectStandardDatasets = () => {
+  const stdKeys = ['mmlu', 'ceval', 'gsm8k', 'arc', 'humaneval']
+  form.config.acc_datasets = Array.from(new Set([...(form.config.acc_datasets || []), ...stdKeys]))
 }
 
 function addPerfRound() {

@@ -4,7 +4,7 @@ AONI 模型测试平台 — 数据管理路由 (测试用例模板 & 数据集�
 import csv
 import io
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
@@ -50,30 +50,76 @@ DEFAULT_TEMPLATES = [
         "datasets": ["mmlu", "ceval", "gsm8k", "arc", "humaneval"],
         "acc_limit": 500,
     },
+    {
+        "name": "300B+ 旗舰模型极高难度推理评测模板 (Ultra Hard 300B)",
+        "description": "专为 300B+ 旗舰模型及 Reasoning 架构设计，包含 AIME24、Arena-Hard、GPQA 极高难度组合评测",
+        "num_prompts": 500,
+        "input_lens": [1024, 4096],
+        "output_lens": [512, 2048],
+        "concurrencies": [1, 4, 16, 32],
+        "datasets": ["aime24", "arena_hard", "gpqa", "math500", "bigcodebench"],
+        "acc_limit": 200,
+    },
 ]
 
 DEFAULT_DATASETS = [
-    {"name": "mmlu", "source": "ModelScope/evalscope_mmlu", "status": "ready", "sample_count": 14042, "description": "Massive Multitask Language Understanding (多任务语言理解能力基准)"},
-    {"name": "ceval", "source": "ModelScope/evalscope_ceval", "status": "ready", "sample_count": 13948, "description": "C-Eval 中文综合性推理能力评测集"},
-    {"name": "gsm8k", "source": "ModelScope/evalscope_gsm8k", "status": "ready", "sample_count": 1319, "description": "Grade School Math 8K 小学数学应用题多步推理"},
-    {"name": "arc", "source": "ModelScope/evalscope_arc", "status": "ready", "sample_count": 2590, "description": "AI2 Reasoning Challenge 科学常识推理问答"},
-    {"name": "humaneval", "source": "ModelScope/evalscope_humaneval", "status": "ready", "sample_count": 164, "description": "HumanEval Python 代码生成能力评测集"},
+    {"name": "mmlu", "source": "ModelScope/evalscope_mmlu", "difficulty": "standard", "category_group": "通用基准", "status": "ready", "sample_count": 14042, "description": "Massive Multitask Language Understanding (多任务语言理解能力基准)"},
+    {"name": "ceval", "source": "ModelScope/evalscope_ceval", "difficulty": "standard", "category_group": "通用基准", "status": "ready", "sample_count": 13948, "description": "C-Eval 中文综合性推理能力评测集"},
+    {"name": "gsm8k", "source": "ModelScope/evalscope_gsm8k", "difficulty": "standard", "category_group": "通用基准", "status": "ready", "sample_count": 1319, "description": "Grade School Math 8K 小学数学应用题多步推理"},
+    {"name": "arc", "source": "ModelScope/evalscope_arc", "difficulty": "standard", "category_group": "通用基准", "status": "ready", "sample_count": 2590, "description": "AI2 Reasoning Challenge 科学常识推理问答"},
+    {"name": "humaneval", "source": "ModelScope/evalscope_humaneval", "difficulty": "standard", "category_group": "代码编程", "status": "ready", "sample_count": 164, "description": "HumanEval Python 代码生成能力评测集"},
+    {"name": "aime24", "source": "ModelScope/AIME_2024", "difficulty": "ultra", "category_group": "竞赛数学", "status": "ready", "sample_count": 30, "description": "AIME 2024 美国数学邀请赛 (极高难度竞赛级多步符号推演，300B+ 旗舰模型专属)"},
+    {"name": "math500", "source": "ModelScope/MATH-500", "difficulty": "hard", "category_group": "竞赛数学", "status": "ready", "sample_count": 500, "description": "MATH-500 高阶逻辑与微积分竞赛数学题库 (Level 4-5 极高难度解题考察)"},
+    {"name": "arena_hard", "source": "ModelScope/Arena-Hard-Auto", "difficulty": "ultra", "category_group": "真实对战", "status": "ready", "sample_count": 500, "description": "Arena-Hard-Auto (Chatbot Arena 严苛真实 User Query 判决，高区分度顶级评测)"},
+    {"name": "gpqa", "source": "ModelScope/GPQA_Diamond", "difficulty": "ultra", "category_group": "博士问答", "status": "ready", "sample_count": 198, "description": "Google-Proof Q&A (生物/物理/化学博士级高难度深度学术问答，具备搜索引擎抗性)"},
+    {"name": "bigcodebench", "source": "ModelScope/BigCodeBench", "difficulty": "hard", "category_group": "代码编程", "status": "ready", "sample_count": 1140, "description": "BigCodeBench 复杂工程应用与第三方库调用代码自动生成基准"},
+    {"name": "longbench_pro", "source": "ModelScope/LongBench_Pro", "difficulty": "hard", "category_group": "长文本", "status": "ready", "sample_count": 1500, "description": "LongBench Pro 真实长文本上下文分析与复杂信息提炼评测 (8k-256k tokens)"},
 ]
 
 
 def _seed_defaults_if_needed(db: Session):
-    """首次访问时初始化内置用例模板与数据集描述"""
+    """首次访问或升级时初始化内置用例模板与数据集描述，支持 SQL 字段自动迁移"""
+    from sqlalchemy import text
+    try:
+        db.execute(text("ALTER TABLE dataset_infos ADD COLUMN difficulty VARCHAR(50) DEFAULT 'standard'"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    try:
+        db.execute(text("ALTER TABLE dataset_infos ADD COLUMN category_group VARCHAR(50) DEFAULT '通用基准'"))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # 1. 模板播种
     if db.query(TestTemplate).count() == 0:
         for item in DEFAULT_TEMPLATES:
             tpl = TestTemplate(**item)
             db.add(tpl)
         db.commit()
+    else:
+        ultra_tpl = db.query(TestTemplate).filter(TestTemplate.name.like("%300B%")).first()
+        if not ultra_tpl:
+            for item in DEFAULT_TEMPLATES:
+                if "300B" in item["name"]:
+                    db.add(TestTemplate(**item))
+            db.commit()
 
-    if db.query(DatasetInfo).count() == 0:
-        for d in DEFAULT_DATASETS:
-            ds = DatasetInfo(**d)
-            db.add(ds)
-        db.commit()
+    # 2. 数据集播种与补全更新
+    existing_map = {ds.name: ds for ds in db.query(DatasetInfo).all()}
+    for d in DEFAULT_DATASETS:
+        name = d["name"]
+        if name not in existing_map:
+            new_ds = DatasetInfo(**d)
+            db.add(new_ds)
+        else:
+            ds = existing_map[name]
+            ds.difficulty = d.get("difficulty", "standard")
+            ds.category_group = d.get("category_group", "通用基准")
+            if ds.sample_count == 0 or ds.sample_count < d.get("sample_count", 0):
+                ds.sample_count = d.get("sample_count", 0)
+    db.commit()
 
 
 # ---------- 测试用例模板 API ----------
@@ -206,138 +252,86 @@ def download_dataset_online(data: DatasetDownloadRequest, db: Session = Depends(
     return {"message": f"数据集 {name} 已联网下载并加载就绪", "dataset": ds}
 
 
-DATASET_SAMPLES_MAP = {
-    "mmlu": [
-        {
-            "id": 1,
-            "category": "STEM / Computer Science",
-            "question": "What is the primary advantage of a B-tree over a binary search tree for disk-based storage engines?",
-            "options": ["A) Lower memory footprint", "B) Fewer disk I/O operations due to high fan-out", "C) O(1) worst-case search complexity", "D) Simple recursive traversal"],
-            "target": "B",
-        },
-        {
-            "id": 2,
-            "category": "Biology / Cell Biology",
-            "question": "Which organelle is primarily responsible for ATP synthesis via oxidative phosphorylation in eukaryotic cells?",
-            "options": ["A) Endoplasmic Reticulum", "B) Mitochondria", "C) Golgi Apparatus", "D) Lysosome"],
-            "target": "B",
-        },
-        {
-            "id": 3,
-            "category": "Machine Learning",
-            "question": "In Transformer architectures, what is the main purpose of multi-head attention over single-head attention?",
-            "options": ["A) Reduces overall memory complexity from O(N^2) to O(N)", "B) Allows the model to jointly attend to information from different representation subspaces", "C) Eliminates the need for residual connections", "D) Guarantees deterministic output generation"],
-            "target": "B",
-        },
-    ],
-    "ceval": [
-        {
-            "id": 1,
-            "category": "计算机科学与技术",
-            "question": "下列关于大语言模型中 Self-Attention（自注意力机制）计算复杂度的说法，正确的是：",
-            "options": ["A) 时间复杂度与输入序列长度 N 呈线性关系 O(N)", "B) 时间复杂度与输入序列长度 N 呈平方关系 O(N^2)", "C) 空间复杂度与特征维度 d 无关", "D) 无法在 GPU 上进行并行化矩阵乘法计算"],
-            "target": "B",
-        },
-        {
-            "id": 2,
-            "category": "中国历史与文化",
-            "question": "中国古代四大发明中，最早被广泛应用于航海指南与远洋开辟的技术是：",
-            "options": ["A) 造纸术", "B) 雕版印刷术", "C) 指南针（司南/罗盘）", "D) 火药"],
-            "target": "C",
-        },
-        {
-            "id": 3,
-            "category": "高等数学与逻辑推理",
-            "question": "函数 f(x) = x^3 - 3x 在区间 [-2, 2] 上的极小值点 x 等于：",
-            "options": ["A) x = -1", "B) x = 0", "C) x = 1", "D) x = 2"],
-            "target": "C",
-        },
-    ],
-    "gsm8k": [
-        {
-            "id": 1,
-            "category": "Grade School Math / Multi-step Reasoning",
-            "question": "Natalia sold cookies to her 3 friends. The first friend bought 4 cookies, the second friend bought half as many as the first, and the third friend bought 5 more than the second. How many cookies did Natalia sell in total?",
-            "options": [],
-            "target": "13 (Calculation: 1st=4, 2nd=2, 3rd=2+5=7; Total=4+2+7=13)",
-        },
-        {
-            "id": 2,
-            "category": "Grade School Math / Word Problem",
-            "question": "Weng earns $12 an hour for babysitting. Yesterday, she babysat for 5 hours. She spent $15 on lunch. How much money does she have left?",
-            "options": [],
-            "target": "$45 (Calculation: Total earned = 12 * 5 = $60. Remaining = 60 - 15 = $45)",
-        },
-    ],
-    "arc": [
-        {
-            "id": 1,
-            "category": "Physics / Kinetic Energy",
-            "question": "Which object has the greatest kinetic energy?",
-            "options": ["A) A 10 kg object moving at 2 m/s", "B) A 2 kg object moving at 10 m/s", "C) A 5 kg object moving at 3 m/s", "D) A 1 kg object moving at 5 m/s"],
-            "target": "B (Ek = 0.5 * m * v^2 = 0.5 * 2 * 100 = 100 J)",
-        },
-    ],
-    "humaneval": [
-        {
-            "id": 1,
-            "category": "Python Programming / Algorithms",
-            "question": "def has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, any two numbers are closer to each other than given threshold. \"\"\"",
-            "options": [],
-            "target": "return any(abs(a - b) < threshold for i, a in enumerate(numbers) for j, b in enumerate(numbers) if i != j)",
-        },
-    ],
-}
-
-
-from fastapi import Query
-
 DATASET_CONFIGS = {
     "mmlu": {
         "total": 14042,
-        "categories": ["STEM / Computer Science", "Biology / Cell Biology", "Machine Learning", "Physics / Mechanics", "Humanities / Philosophy", "Social Sciences / Law", "Chemistry / Organic"],
+        "categories": ["STEM / Computer Science", "Biology / Cell Biology", "Machine Learning", "Physics / Mechanics", "Humanities / Philosophy"],
         "base_samples": [
             {"category": "STEM / Computer Science", "question": "What is the primary advantage of a B-tree over a binary search tree for disk-based storage engines?", "options": ["A) Lower memory footprint", "B) Fewer disk I/O operations due to high fan-out", "C) O(1) worst-case search complexity", "D) Simple recursive traversal"], "target": "B"},
             {"category": "Biology / Cell Biology", "question": "Which organelle is primarily responsible for ATP synthesis via oxidative phosphorylation in eukaryotic cells?", "options": ["A) Endoplasmic Reticulum", "B) Mitochondria", "C) Golgi Apparatus", "D) Lysosome"], "target": "B"},
             {"category": "Machine Learning", "question": "In Transformer architectures, what is the main purpose of multi-head attention over single-head attention?", "options": ["A) Reduces overall memory complexity from O(N^2) to O(N)", "B) Allows the model to jointly attend to information from different representation subspaces", "C) Eliminates the need for residual connections", "D) Guarantees deterministic output generation"], "target": "B"},
-            {"category": "Physics / Mechanics", "question": "An object of mass m moves in a circle of radius r with constant speed v. What is the magnitude of the net force acting on the object?", "options": ["A) Zero", "B) m * v / r", "C) m * v^2 / r", "D) m * v^2 / (2 * r)"], "target": "C"},
-            {"category": "Humanities / Philosophy", "question": "Which philosopher proposed the categorical imperative as the supreme principle of morality?", "options": ["A) John Locke", "B) Immanuel Kant", "C) Friedrich Nietzsche", "D) David Hume"], "target": "B"},
         ]
     },
     "ceval": {
         "total": 13948,
-        "categories": ["计算机科学与技术", "中国历史与文化", "高等数学与逻辑推理", "法律法规", "基础医学", "经济学"],
+        "categories": ["计算机科学与技术", "中国历史与文化", "高等数学与逻辑推理", "法律法规"],
         "base_samples": [
             {"category": "计算机科学与技术", "question": "下列关于大语言模型中 Self-Attention（自注意力机制）计算复杂度的说法，正确的是：", "options": ["A) 时间复杂度与输入序列长度 N 呈线性关系 O(N)", "B) 时间复杂度与输入序列长度 N 呈平方关系 O(N^2)", "C) 空间复杂度与特征维度 d 无关", "D) 无法在 GPU 上进行并行化矩阵乘法计算"], "target": "B"},
-            {"category": "中国历史与文化", "question": "中国古代四大发明中，最早被广泛应用于航海指南与远洋开辟的技术是：", "options": ["A) 造纸术", "B) 雕版印刷术", "C) 指南针（司南/罗盘）", "D) 火药"], "target": "C"},
             {"category": "高等数学与逻辑推理", "question": "函数 f(x) = x^3 - 3x 在区间 [-2, 2] 上的极小值点 x 等于：", "options": ["A) x = -1", "B) x = 0", "C) x = 1", "D) x = 2"], "target": "C"},
-            {"category": "法律法规", "question": "根据我国《民法典》规定，未成年人的监护人首先应当由下列哪类人员担任？", "options": ["A) 祖父母、外祖父母", "B) 父母", "C) 兄、姐", "D) 其他近亲属"], "target": "B"},
         ]
     },
     "gsm8k": {
         "total": 1319,
-        "categories": ["Grade School Math / Multi-step Reasoning", "Grade School Math / Word Problem", "Grade School Math / Algebra"],
+        "categories": ["Grade School Math / Multi-step Reasoning", "Grade School Math / Word Problem"],
         "base_samples": [
             {"category": "Grade School Math / Multi-step Reasoning", "question": "Natalia sold cookies to her 3 friends. The first friend bought 4 cookies, the second friend bought half as many as the first, and the third friend bought 5 more than the second. How many cookies did Natalia sell in total?", "options": [], "target": "13 (Calculation: 1st=4, 2nd=2, 3rd=2+5=7; Total=4+2+7=13)"},
-            {"category": "Grade School Math / Word Problem", "question": "Weng earns $12 an hour for babysitting. Yesterday, she babysat for 5 hours. She spent $15 on lunch. How much money does she have left?", "options": [], "target": "$45 (Calculation: Total earned = 12 * 5 = $60. Remaining = 60 - 15 = $45)"},
-            {"category": "Grade School Math / Algebra", "question": "James buys 5 packs of baseball cards. Each pack contains 12 cards. He gives 15 cards to his younger brother. How many cards does James have now?", "options": [], "target": "45 (Calculation: 5 * 12 = 60 cards. 60 - 15 = 45 cards remaining)"},
         ]
     },
     "arc": {
         "total": 2590,
-        "categories": ["Physical Science", "Earth & Space Science", "Life Science"],
+        "categories": ["Physical Science", "Earth & Space Science"],
         "base_samples": [
             {"category": "Physical Science", "question": "Which object has the greatest kinetic energy?", "options": ["A) A 10 kg object moving at 2 m/s", "B) A 2 kg object moving at 10 m/s", "C) A 5 kg object moving at 3 m/s", "D) A 1 kg object moving at 5 m/s"], "target": "B (Ek = 0.5 * m * v^2 = 0.5 * 2 * 100 = 100 J)"},
-            {"category": "Earth & Space Science", "question": "What is the primary cause of Earth's ocean tides?", "options": ["A) Earth's magnetic field", "B) Gravitational pull of the Moon and Sun", "C) Atmospheric pressure differences", "D) Ocean current circulation"], "target": "B"},
         ]
     },
     "humaneval": {
         "total": 164,
-        "categories": ["Python Algorithms / Data Structures", "Python String Manipulation", "Python Math Functions"],
+        "categories": ["Python Algorithms / Data Structures"],
         "base_samples": [
             {"category": "Python Algorithms / Data Structures", "question": "def has_close_elements(numbers: List[float], threshold: float) -> bool:\n    \"\"\" Check if in given list of numbers, any two numbers are closer to each other than given threshold. \"\"\"", "options": [], "target": "return any(abs(a - b) < threshold for i, a in enumerate(numbers) for j, b in enumerate(numbers) if i != j)"},
-            {"category": "Python String Manipulation", "question": "def truncate_number(number: float) -> float:\n    \"\"\" Given a positive floating point number, it can be decomposed into integer and decimals parts. Return the decimal part. \"\"\"", "options": [], "target": "return number % 1.0"},
-            {"category": "Python Algorithms / Data Structures", "question": "def count_up_to(n: int) -> List[int]:\n    \"\"\" Implement a function that takes an non-negative integer and returns an array of the first n prime numbers. \"\"\"", "options": [], "target": "primes = []\nfor i in range(2, n):\n    if all(i % p != 0 for p in primes):\n        primes.append(i)\nreturn primes"},
+        ]
+    },
+    "aime24": {
+        "total": 30,
+        "categories": ["AIME 2024 / Combinatorics & Number Theory", "AIME 2024 / Algebraic Geometry"],
+        "base_samples": [
+            {"category": "AIME 2024 / Combinatorics & Number Theory", "question": "Let N be the number of positive integers n <= 1000 such that n^3 + 3n + 1 is divisible by 7. Compute the sum of the digits of N.", "options": ["A) 12", "B) 15", "C) 18", "D) 21"], "target": "B (Analytical Proof: Period mod 7 yields 2 solutions per period of 7 => 285 valid integers. Digits sum 2+8+5 = 15)"},
+            {"category": "AIME 2024 / Algebraic Geometry", "question": "Triangle ABC has side lengths AB = 13, BC = 14, and CA = 15. Circle \\omega passes through A and is tangent to BC at its midpoint. Find the radius of \\omega.", "options": ["A) 65 / 8", "B) 65 / 16", "C) 169 / 24", "D) 85 / 12"], "target": "A (Calculated via power of a point and circumradius formula)"},
+        ]
+    },
+    "math500": {
+        "total": 500,
+        "categories": ["Level 5 Calculus", "Level 5 Complex Analysis"],
+        "base_samples": [
+            {"category": "Level 5 Calculus", "question": "Evaluate the definite integral \\int_0^{\\pi/2} \\frac{\\sin^3(x)}{\\sin^3(x) + \\cos^3(x)} dx.", "options": ["A) \\pi / 2", "B) \\pi / 4", "C) \\pi / 6", "D) 1"], "target": "B (King's Integration Property: 2I = \\int_0^{\\pi/2} 1 dx = \\pi/2 => I = \\pi/4)"},
+        ]
+    },
+    "arena_hard": {
+        "total": 500,
+        "categories": ["System Design & Concurrency", "Algorithm Optimization"],
+        "base_samples": [
+            {"category": "System Design & Concurrency", "question": "Design a thread-safe lock-free LRU cache in Rust using Atomic pointers and Compare-And-Swap (CAS) primitives. Analyze memory ordering choices (SeqCst vs Acquire/Release) and handle ABA problem using epoch-based reclamation.", "options": ["A) Implementation using AtomicPtr + Epoch Reclamation + Acquire/Release semantics", "B) Simple Mutex<HashMap> implementation", "C) Single-threaded RefCell wrapper", "D) Raw unsafe pointer array without atomic synchronization"], "target": "A (Judge Score: 9.8/10 for strict correctness and low-overhead memory ordering)"},
+        ]
+    },
+    "gpqa": {
+        "total": 198,
+        "categories": ["Quantum Field Theory", "Organic Chemical Synthesis"],
+        "base_samples": [
+            {"category": "Quantum Field Theory", "question": "In a two-level quantum system governed by Hamiltonian H = \\hbar \\omega (\\sigma_z + \\alpha \\sigma_x), what is the exact energy splitting between the ground and excited eigenstates when \\alpha = 0.75?", "options": ["A) 1.25 \\hbar \\omega", "B) 2.50 \\hbar \\omega", "C) 1.50 \\hbar \\omega", "D) 0.75 \\hbar \\omega"], "target": "B (\\Delta E = 2 \\sqrt{1 + \\alpha^2} \\hbar \\omega = 2 \\sqrt{1 + 0.5625} \\hbar \\omega = 2.50 \\hbar \\omega)"},
+        ]
+    },
+    "bigcodebench": {
+        "total": 1140,
+        "categories": ["Python / Pandas & Scipy"],
+        "base_samples": [
+            {"category": "Python / Pandas & Scipy", "question": "Write a Python function using pandas and scipy.stats to compute rolling 30-day exponentially weighted copula tail dependence coefficients between two high-frequency financial time series df['x'] and df['y'].", "options": [], "target": "def compute_rolling_copula_tail_dep(df: pd.DataFrame, alpha: float = 0.05) -> pd.Series:\n    # Computes EWMA rank transformation and empirical tail index\n    ..."},
+        ]
+    },
+    "longbench_pro": {
+        "total": 1500,
+        "categories": ["128k Long-Context Audit"],
+        "base_samples": [
+            {"category": "128k Long-Context Audit", "question": "Analyze the provided 120,000-token corporate financial audit log. Locate all intercompany transfer pricing anomalies between Subsidiary Alpha and Subsidiary Gamma exceeding $500,000.", "options": [], "target": "Found 3 discrepancies: 1. $1.2M unadjusted royalty fee (Section 4.2); 2. $750k IP licensing gap (Section 9.1); 3. $550k inventory over-invoice (Section 12.4)."},
         ]
     }
 }
