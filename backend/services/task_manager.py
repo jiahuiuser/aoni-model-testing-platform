@@ -122,22 +122,29 @@ def start_task(task_id: int):
 
 
 def schedule_or_start_task(db: Session, task_id: int):
-    """支持定时下发逻辑"""
+    """支持定时下发逻辑 (对齐本地无时区时间进行精确秒级下发)"""
     task = db.get(Task, task_id)
     if not task:
         return
-    now = datetime.utcnow()
+    # 前端传入的 scheduled_at 为本地无时区时间 (Naive Datetime)，此处必须使用 datetime.now() 进行比对计算
+    now = datetime.now()
     if task.scheduled_at and task.scheduled_at > now:
         delay = (task.scheduled_at - now).total_seconds()
+        task.status = TaskStatus.SCHEDULED
+        db.commit()
         log.info(f"任务 #{task_id} 设定定时下发，将在 {delay:.1f} 秒后 ({task.scheduled_at}) 自动下发执行")
-        _add_log(db, task_id, "INFO", None, f"任务已设为定时等待中，预计下发时间: {task.scheduled_at}", "system")
+        _add_log(db, task_id, "INFO", None, f"任务已设为定时等待中，预计下发时间: {task.scheduled_at.strftime('%Y-%m-%d %H:%M:%S')}", "system")
         def _delay_runner():
             import time
             time.sleep(delay)
-            start_task(task_id)
+            with session_factory() as db_inner:
+                t_inner = db_inner.get(Task, task_id)
+                if t_inner and t_inner.status in (TaskStatus.SCHEDULED, TaskStatus.QUEUED):
+                    start_task(task_id)
         t = threading.Thread(target=_delay_runner, daemon=True)
         t.start()
     else:
+        log.info(f"任务 #{task_id} 定时时间已到达或未设定定时，立即启动下发执行")
         start_task(task_id)
 
 
@@ -295,9 +302,19 @@ def _execute_task_pipeline(task_id: int):
 
 
 def recover_running_tasks():
-    """后台服务启动时自愈：扫描 DB 中处于 RUNNING 状态的任务并自动开启运行线程"""
+    """后台服务启动或重启时自愈：扫描 DB 中处于 RUNNING 及 SCHEDULED/QUEUED 定时等待态任务并自动恢复运行线程"""
     with session_factory() as db:
+        # 1. 恢复运行态任务线程
         running_tasks = db.query(Task).filter(Task.status == TaskStatus.RUNNING).all()
         for t in running_tasks:
             if t.id not in _running_tasks:
                 start_task(t.id)
+
+        # 2. 恢复定时等待态/排队态任务线程 (若定时时间已到或即将到期，自动拉起下发)
+        scheduled_tasks = db.query(Task).filter(
+            Task.status.in_([TaskStatus.QUEUED, TaskStatus.SCHEDULED]),
+            Task.scheduled_at.isnot(None)
+        ).all()
+        for t in scheduled_tasks:
+            if t.id not in _running_tasks:
+                schedule_or_start_task(db, t.id)
