@@ -264,7 +264,7 @@ def _wait_for_vllm(runner: RemoteRunner, port: int, timeout: int = 60, log_callb
     """轮询等待 vLLM 服务就绪（带 180s TOS 网络超时快速跳过与实时日志增强）"""
     import requests
     url = f"http://{runner.api_host}:{port}/v1/models"
-    deadline = time.time() + min(timeout, 300)
+    deadline = time.time() + (timeout if timeout and timeout > 0 else 1800)
     start_time = time.time()
     attempt = 0
     tos_error_count = 0
