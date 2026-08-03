@@ -1156,8 +1156,8 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             if val:
                 eval_env[key] = val
 
-    # 为本地/内网模型 API 端点配置 NO_PROXY 直连保护，避免被 HTTP 代理拦截超时
-    no_proxy_defaults = "127.0.0.1,localhost,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,0.0.0.0"
+    # 为本地/内网模型 API 端点及 ModelScope 社区配置 NO_PROXY 直连保护，避免被 HTTP 代理拦截超时/SSL握手错误
+    no_proxy_defaults = "127.0.0.1,localhost,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,0.0.0.0,modelscope.cn,www.modelscope.cn,api.modelscope.cn"
     existing_no_proxy = eval_env.get("NO_PROXY") or eval_env.get("no_proxy") or ""
     eval_env["NO_PROXY"] = f"{no_proxy_defaults},{existing_no_proxy}".rstrip(",")
     eval_env["no_proxy"] = eval_env["NO_PROXY"]
