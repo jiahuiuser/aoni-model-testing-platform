@@ -1142,11 +1142,6 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
            "--ignore-errors",
            "--work-dir", str(work_dir)]
 
-    # 数据源默认走 ModelScope，但其在国内网络环境下经常超时，
-    # 显式指定 HuggingFace 数据源并透传代理环境变量，保证数据集可下载。
-    cmd.append("--dataset-hub")
-    cmd.append("huggingface")
-
     # 从 config/.env 读取代理配置，透传给 evalscope 子进程 (下载 HF 数据集需要)
     eval_env = os.environ.copy()
     local_bin_dir = os.path.expanduser("~/.local/bin")
@@ -1396,13 +1391,14 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             return
         log_callback("INFO", model_run.model_slug, f"evalscope 命令拉起遇到网络问题: {e}，自动启用【真实题库逐题推理评估引擎】", "accuracy")
 
-    # 第二步：如果 evalscope CLI 下载网络超时，启动【真实题库逐题 HTTP 推理与对错校对引擎】（100% 真实推理与对错打分，零假数据）
+    # 第二步：如果 evalscope CLI 下载网络超时且为抽样测试模式，启动【真实题库逐题 HTTP 推理与对错校对引擎】
     if not evalscope_success:
         from backend.services.task_manager import _cancel_flags
-        if _cancel_flags.get(model_run.task_id, False) or (proc and proc.returncode in (-9, -15, 137, 143)):
-            log_callback("INFO", model_run.model_slug, "准确率测试收到终止/重启指令，评测子进程已停止", "accuracy")
+        if _cancel_flags.get(model_run.task_id, False) or (proc and proc.returncode != 0):
+            log_callback("WARNING", model_run.model_slug, f"EvalScope 评测进程已停止 (exit code: {proc.returncode if proc else 'N/A'})", "accuracy")
             return
-        _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, datasets, limit, acc_start_time)
+        if limit > 0:
+            _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, datasets, limit, acc_start_time)
 
 
 def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner, datasets: list, limit: int, acc_start_time: float = None):
