@@ -219,16 +219,14 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
         cmd = re.sub(r"\s+-d\b", "", cmd)
         cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
         cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+        cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
     else:
         cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "docker run", cmd)
         cmd = re.sub(r"\s+-d\b", "", cmd)
         cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
         cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
     cmd = re.sub(r"--port\s+\d+", f"--port {port}", cmd)
-    # 小模型降低 GPU 内存占用
-    cmd = re.sub(r"--gpu-memory-utilization\s+[\d.]+", "--gpu-memory-utilization 0.25", cmd)
     if "nightly-aarch64" in cmd:
         cmd = re.sub(r'(aoni/vllm/vllm-openai:nightly-aarch64\s+)vllm\s+serve\s+\S+(?=\s|\\|$)', r'\1', cmd)
 
@@ -263,33 +261,36 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
 
 
 def _wait_for_vllm(runner: RemoteRunner, port: int, timeout: int = 60, log_callback=None) -> bool:
-    """轮询等待 vLLM 服务就绪（带 60s 快速失败与无缝降级保护）"""
+    """轮询等待 vLLM 服务就绪（带 180s TOS 网络超时快速跳过与实时日志增强）"""
     import requests
     url = f"http://{runner.api_host}:{port}/v1/models"
-    deadline = time.time() + timeout
+    deadline = time.time() + min(timeout, 300)
+    start_time = time.time()
     attempt = 0
+    tos_error_count = 0
+
     while time.time() < deadline:
         attempt += 1
         try:
             r = requests.get(url, timeout=3)
             if r.status_code == 200:
-                elapsed = int(time.time() - (deadline - timeout))
+                elapsed = int(time.time() - start_time)
                 if log_callback:
-                    log_callback("INFO", "", f"  vLLM 服务就绪 (用时 {elapsed}s)", "vllm")
+                    log_callback("INFO", "", f"  vLLM 服务初始化就绪 (用时 {elapsed}s)", "vllm")
                 return True
         except Exception:
             pass
 
-        # 快速检查容器运行状态与拉取 DEBUG/ERROR 容器实时输出
+        # 检查容器运行状态与拉取日志
         if attempt % 2 == 0 and log_callback:
             try:
                 check = runner.run_docker(["inspect", "-f", "{{.State.Status}}", CONTAINER_NAME], timeout=3)
                 status = check.stdout.strip()
-                elapsed = int(time.time() - (deadline - timeout))
+                elapsed = int(time.time() - start_time)
+
                 if status in ("exited", "dead"):
-                    # 容器意外退出，强行拉取并打印其最后日志
                     err_logs = runner.run_docker(["logs", "--tail", "15", CONTAINER_NAME], timeout=5)
-                    log_callback("ERROR", "", f"❌ 测试容器启动后意外退出 (Status: {status})！最后容器输出:", "vllm")
+                    log_callback("ERROR", "", f"❌ 测试容器意外退出 (Status: {status})！最后容器输出:", "vllm")
                     if err_logs.stdout or err_logs.stderr:
                         for line in (err_logs.stderr or err_logs.stdout).strip().split("\n")[-10:]:
                             if line.strip():
@@ -298,21 +299,28 @@ def _wait_for_vllm(runner: RemoteRunner, port: int, timeout: int = 60, log_callb
                 elif status not in ("running", "created"):
                     log_callback("WARNING", "", f"  容器状态: {status}，放弃等待服务初始化", "vllm")
                     return False
-                log_callback("INFO", "", f"  [{elapsed}s] 正在连通容器服务... (状态: {status})", "vllm")
 
-                # 实时拉取最新 5 行容器日志 (DEBUG)
-                clogs = runner.run_docker(["logs", "--tail", "5", CONTAINER_NAME], timeout=3)
-                if clogs.stdout:
-                    for line in clogs.stdout.strip().split("\n"):
-                        if line.strip():
-                            log_callback("DEBUG", "", f"  [vLLM Native Out] {line.strip()[:250]}", "vllm")
+                # 提取容器最新日志判断 TOS 下载状态
+                clogs = runner.run_docker(["logs", "--tail", "10", CONTAINER_NAME], timeout=3)
+                log_text = (clogs.stdout or "") + (clogs.stderr or "")
+
+                if "SSLError" in log_text or "Max retries exceeded" in log_text or "request timeout" in log_text:
+                    tos_error_count += 1
+                    if tos_error_count >= 10 or elapsed >= 120:
+                        log_callback("ERROR", "", f"❌ 远程 TOS 模型权重网络下载超时/连接失败 (已重试 {elapsed}s)，自动跳过该模型", "vllm")
+                        return False
+
+                if attempt % 6 == 0:
+                    log_callback("INFO", "", f"  [{elapsed}s] 正在等待容器服务就绪 (端口 {port}, 状态: {status})...", "vllm")
+                    if "Starting TOS model download" in log_text or "OSSModelLoader" in log_text:
+                        log_callback("INFO", "", f"  [容器下载中] 正在拉取/解压 TOS 模型权重包...", "vllm")
             except Exception:
                 log_callback("INFO", "", "  正在连通推理评估引擎...", "vllm")
         time.sleep(3)
 
     if log_callback:
-        log_callback("INFO", "", "  模型推理服务准备就绪，流水线继续进行", "vllm")
-    return True
+        log_callback("WARNING", "", f"  vLLM 服务在 {int(time.time() - start_time)}s 内未响应就绪端口，自动跳过", "vllm")
+    return False
 
 
 # ============================================================
@@ -375,7 +383,14 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         if not ok:
             log_callback("ERROR", model_slug, "容器启动失败，测试终止", "container")
             model_run.stage_status["deploying"] = StageStatus.FAILED.value
-            model_run.status = ModelStage.DONE
+            model_run.stage_status["validating"] = StageStatus.SKIPPED.value
+            model_run.stage_status["gateway_testing"] = StageStatus.SKIPPED.value
+            model_run.stage_status["perf_testing"] = StageStatus.SKIPPED.value
+            model_run.stage_status["acc_testing"] = StageStatus.SKIPPED.value
+            model_run.stage_status["reporting"] = StageStatus.SKIPPED.value
+            model_run.status = ModelStage.FAILED.value
+            model_run.progress = 100
+            model_run.progress_detail = "容器启动失败，测试终止"
             model_run.completed_at = datetime.utcnow()
             db.commit()
             return
@@ -408,7 +423,13 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         if not _wait_for_vllm(runner, port, config.get("container_startup_timeout", 7200), log_callback):
             log_callback("ERROR", model_slug, "vLLM 启动超时，测试终止", "vllm")
             model_run.stage_status["validating"] = StageStatus.FAILED.value
-            model_run.status = ModelStage.DONE
+            model_run.stage_status["gateway_testing"] = StageStatus.SKIPPED.value
+            model_run.stage_status["perf_testing"] = StageStatus.SKIPPED.value
+            model_run.stage_status["acc_testing"] = StageStatus.SKIPPED.value
+            model_run.stage_status["reporting"] = StageStatus.SKIPPED.value
+            model_run.status = ModelStage.FAILED.value
+            model_run.progress = 100
+            model_run.progress_detail = "缺少本地权重文件/在线拉取超时，已自动安全跳过"
             model_run.completed_at = datetime.utcnow()
             db.commit()
             _stop_container(runner)
@@ -1572,33 +1593,31 @@ def _parse_evalscope_output(stdout: str, work_dir: Path = None, model_name: str 
     """
     metrics = {}
 
-    if work_dir is not None:
-        report_dir = work_dir / "reports"
-        if model_name:
-            report_dir = report_dir / model_name
-        if report_dir.exists():
-            for report_file in sorted(report_dir.glob("*.json")):
+    if work_dir is not None and work_dir.exists():
+        # EvalScope 可能会在 work_dir 下创建时间戳子目录 (如 work_dir/20260803_183017/reports/...)
+        report_files = sorted(work_dir.glob("**/reports/**/*.json"))
+        for report_file in report_files:
+            try:
+                data = json.loads(report_file.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            ds = (data.get("dataset_name") or report_file.stem).lower()
+            score = data.get("score")
+            if score is not None:
                 try:
-                    data = json.loads(report_file.read_text(encoding="utf-8"))
-                except Exception:
-                    continue
-                ds = (data.get("dataset_name") or report_file.stem).lower()
-                score = data.get("score")
-                if score is not None:
-                    try:
-                        metrics[f"{ds}_accuracy"] = float(score)
-                    except (ValueError, TypeError):
-                        pass
-                # 若无顶层 score，从 metrics 中找第一个含 acc 的指标
-                if f"{ds}_accuracy" not in metrics and data.get("metrics"):
-                    for m in data["metrics"]:
-                        mname = str(m.get("name", "")).lower()
-                        if "acc" in mname and m.get("score") is not None:
-                            try:
-                                metrics[f"{ds}_accuracy"] = float(m["score"])
-                            except (ValueError, TypeError):
-                                pass
-                            break
+                    metrics[f"{ds}_accuracy"] = float(score)
+                except (ValueError, TypeError):
+                    pass
+            # 若无顶层 score，从 metrics 中找第一个含 acc 的指标
+            if f"{ds}_accuracy" not in metrics and data.get("metrics"):
+                for m in data["metrics"]:
+                    mname = str(m.get("name", "")).lower()
+                    if "acc" in mname and m.get("score") is not None:
+                        try:
+                            metrics[f"{ds}_accuracy"] = float(m["score"])
+                        except (ValueError, TypeError):
+                            pass
+                        break
 
     for m in re.findall(r"(\w+).*?accuracy.*?([\d.]+)", stdout, re.IGNORECASE):
         if m[0].lower() not in metrics:
