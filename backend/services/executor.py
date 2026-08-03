@@ -8,6 +8,7 @@ import logging
 import subprocess
 import threading
 import sys
+import os
 from pathlib import Path
 from datetime import datetime
 from sqlalchemy.orm import Session
@@ -344,6 +345,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         model_run.stage_status["deploying"] = StageStatus.SKIPPED.value
         model_run.stage_status["validating"] = StageStatus.COMPLETED.value
         model_run.status = ModelStage.PERF_TESTING
+        model_run.progress_detail = f"接入现存外部 API 服务 ({api_target})"
         model_run.progress = 20
         db.commit()
     else:
@@ -955,34 +957,55 @@ def _parse_bench_output(stdout: str) -> dict:
 #  准确率测试 (100% 真实样本测评 & evalscope 自动补全)
 # ============================================================
 
-def _ensure_evalscope(runner: RemoteRunner, log_callback, model_slug: str) -> bool:
-    """自动检测并静默安装 evalscope 评测工具包，确保压测节点就绪"""
-    log_callback("INFO", model_slug, "正在检查目标压测节点上的 evalscope 评测工具链环境...", "accuracy")
+def _get_evalscope_bin() -> str:
+    """获取 evalscope 可执行文件的有效绝对路径，避免由于 PATH 未包含 ~/.local/bin 导致的 FileNotFoundError"""
+    import shutil
+    found = shutil.which("evalscope")
+    if found:
+        return found
+    local_bin = os.path.expanduser("~/.local/bin/evalscope")
+    if os.path.exists(local_bin):
+        return local_bin
+    py_bin = str(Path(sys.executable).parent / "evalscope")
+    if os.path.exists(py_bin):
+        return py_bin
+    return "evalscope"
+
+
+def _ensure_evalscope(runner: RemoteRunner, log_callback, model_slug: str, is_external: bool = False) -> bool:
+    """自动检测并静默安装 evalscope 评测工具包及全套依赖，确保压测节点就绪"""
+    log_callback("INFO", model_slug, "正在检查评测节点上的 evalscope 评测工具链环境...", "accuracy")
     try:
-        if runner.is_remote:
-            res = runner.run_shell("which evalscope || python3 -m pip show evalscope", timeout=15)
+        if runner.is_remote and not is_external:
+            res = runner.run_shell("which evalscope || test -f ~/.local/bin/evalscope || python3 -m pip show evalscope", timeout=15)
             if res.returncode == 0:
                 log_callback("INFO", model_slug, "✅ 目标节点已就绪 evalscope 真实评测环境", "accuracy")
                 return True
         else:
-            res = subprocess.run(["which", "evalscope"], capture_output=True, text=True)
-            if res.returncode == 0:
-                log_callback("INFO", model_slug, "✅ 本地已就绪 evalscope 真实评测环境", "accuracy")
+            eval_bin = _get_evalscope_bin()
+            try:
+                import sklearn
+                has_sklearn = True
+            except ImportError:
+                has_sklearn = False
+
+            if (os.path.exists(eval_bin) or shutil.which("evalscope")) and has_sklearn:
+                log_callback("INFO", model_slug, "✅ 平台评测引擎已就绪 evalscope 真实评测环境", "accuracy")
                 return True
     except Exception:
         pass
 
-    log_callback("INFO", model_slug, "⚡ 目标节点未检测到 evalscope，正在自动执行 pip 静默安装工具包 (evalscope)...", "accuracy")
+    log_callback("INFO", model_slug, "⚡ 评测节点未检测到 evalscope 或全套评测依赖，正在自动补全安装...", "accuracy")
     try:
-        if runner.is_remote:
-            res = runner.run_shell("pip install evalscope", timeout=600)
+        if runner.is_remote and not is_external:
+            res = runner.run_shell("pip install evalscope scikit-learn", timeout=600)
             if res.returncode == 0:
-                log_callback("INFO", model_slug, "✅ evalscope 评测工具已成功自动安装至远端压测节点！", "accuracy")
+                log_callback("INFO", model_slug, "✅ evalscope 评测工具及依赖已成功自动安装至远端压测节点！", "accuracy")
                 return True
         else:
-            res = subprocess.run([sys.executable, "-m", "pip", "install", "evalscope"], capture_output=True, text=True, timeout=600)
+            res = subprocess.run([sys.executable, "-m", "pip", "install", "--break-system-packages", "evalscope", "scikit-learn"], capture_output=True, text=True, timeout=600)
             if res.returncode == 0:
-                log_callback("INFO", model_slug, "✅ evalscope 评测工具已成功自动安装至本地压测节点！", "accuracy")
+                log_callback("INFO", model_slug, "✅ evalscope 评测工具及依赖已成功自动安装至平台节点！", "accuracy")
                 return True
             else:
                 log_callback("WARNING", model_slug, f"evalscope 自动安装日志: {res.stderr or res.stdout}", "accuracy")
@@ -990,6 +1013,73 @@ def _ensure_evalscope(runner: RemoteRunner, log_callback, model_slug: str) -> bo
         log_callback("WARNING", model_slug, f"自动安装 evalscope 过程异常: {install_err}", "accuracy")
 
     return False
+
+
+def _log_evalscope_details(work_dir: Path, log_callback, model_slug: str):
+    """解析 evalscope 生成的 predictions 和 reviews 报告，输出到 DEBUG 日志供用户查看详细题目与模型回答"""
+    try:
+        review_files = sorted(work_dir.glob("**/reviews/**/*.jsonl"))
+        pred_files = sorted(work_dir.glob("**/predictions/**/*.jsonl"))
+        if not review_files:
+            return
+
+        pred_map = {}
+        for pf in pred_files:
+            for line in pf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    idx = data.get("index")
+                    out = data.get("model_output")
+                    ans_text = ""
+                    if isinstance(out, dict):
+                        choices = out.get("choices", [])
+                        if choices and isinstance(choices[0], dict):
+                            msg = choices[0].get("message", {})
+                            ans_text = msg.get("content", "")
+                    elif isinstance(out, str):
+                        ans_text = out
+                    pred_map[(pf.stem, idx)] = ans_text
+                except Exception:
+                    pass
+
+        log_callback("DEBUG", model_slug, f"========== 准确率评测【题目与模型回答明细】(共 {len(review_files)} 个数据集) ==========", "accuracy")
+        for rf in review_files:
+            ds_name = rf.stem
+            lines = rf.read_text(encoding="utf-8", errors="ignore").splitlines()
+            log_callback("DEBUG", model_slug, f"--- [数据集 {ds_name.upper()}] 题目明细 (共 {len(lines)} 题) ---", "accuracy")
+            for line in lines:
+                if not line.strip():
+                    continue
+                try:
+                    data = json.loads(line)
+                    idx = data.get("index")
+                    target = data.get("target", "")
+                    msgs = data.get("messages", [])
+                    q_text = ""
+                    if msgs and isinstance(msgs[-1], dict):
+                        q_text = msgs[-1].get("content", "").replace("\n", " ").strip()
+                    if len(q_text) > 120:
+                        q_text = q_text[:120] + "..."
+
+                    sample_score = data.get("sample_score") or {}
+                    score_info = sample_score.get("score") or {}
+                    extracted_pred = score_info.get("extracted_prediction") or ""
+                    val_info = score_info.get("value") or {}
+                    acc_val = val_info.get("acc")
+                    if acc_val is not None:
+                        is_correct = (float(acc_val) == 1.0)
+                        status_str = "PASS (对)" if is_correct else "FAIL (错)"
+                    else:
+                        status_str = "PASS (对)" if (extracted_pred and extracted_pred == target) else "FAIL (错)"
+
+                    log_callback("DEBUG", model_slug,
+                                 f"  [DEBUG 明细] [{ds_name.upper()} 题 #{idx}] 题目: {q_text} | 标准答案: [{target}] | 模型选项: [{extracted_pred or '未提取'}] | 结果: [{status_str}] | 模型推理: [{ans_text}]", "accuracy")
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
@@ -1000,12 +1090,14 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
         return
 
     limit = config.get("acc_limit", 200)
+    if limit is None:
+        limit = 0
 
     acc_start_time = time.time()
     api_cfg = _get_model_api_config(db, model_run.model_slug, runner, port, model_run.model_name)
 
-    # 第一步：自动检查并自动安装 evalscope 工具链
-    _ensure_evalscope(runner, log_callback, model_run.model_slug)
+    # 第一步：自动检查并自动安装 evalscope 工具链 (外部 API 模式直接使用本地平台引擎)
+    _ensure_evalscope(runner, log_callback, model_run.model_slug, is_external=api_cfg.get("is_external", False))
 
     api_url = api_cfg["v1_url"]
     api_key = api_cfg["api_key"]
@@ -1013,30 +1105,255 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
 
     gen_config = json.dumps({"temperature": 0.0, "max_tokens": 512, "do_sample": False})
 
-    cmd = ["evalscope", "eval", "--model", eval_model_name,
+    work_dir = DATA_DIR / "evalscope_reports" / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_t{model_run.task_id}_mr{model_run.id}"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    # 数据集别名映射 (对齐 EvalScope 内置 benchmark 规范名称)
+    dataset_alias_map = {
+        "gpqa": "gpqa_diamond",
+        "math500": "math_500",
+        "longbench_pro": "longbench_v2",
+    }
+    try:
+        from evalscope.api.registry import BENCHMARK_REGISTRY
+        valid_registry_keys = set(BENCHMARK_REGISTRY.keys())
+    except Exception:
+        valid_registry_keys = None
+
+    normalized_datasets = []
+    for d in datasets:
+        mapped = dataset_alias_map.get(d.lower(), d.lower())
+        if valid_registry_keys is not None:
+            if mapped in valid_registry_keys:
+                normalized_datasets.append(mapped)
+            elif d.lower() in valid_registry_keys:
+                normalized_datasets.append(d.lower())
+            else:
+                log_callback("WARNING", model_run.model_slug, f"数据集 '{d}' 未在 EvalScope 基准库中注册，已自动跳过该项", "accuracy")
+        else:
+            normalized_datasets.append(mapped)
+
+    evalscope_bin = _get_evalscope_bin()
+    cmd = [evalscope_bin, "eval", "--model", eval_model_name,
            "--eval-type", "openai_api", "--api-url", api_url,
-           "--api-key", api_key, "--datasets"] + datasets + [
-           "--limit", str(limit), "--generation-config", gen_config]
+           "--api-key", api_key, "--datasets"] + normalized_datasets + [
+           "--generation-config", gen_config,
+           "--eval-batch-size", "8",
+           "--ignore-errors",
+           "--work-dir", str(work_dir)]
+
+    # 数据源默认走 ModelScope，但其在国内网络环境下经常超时，
+    # 显式指定 HuggingFace 数据源并透传代理环境变量，保证数据集可下载。
+    cmd.append("--dataset-hub")
+    cmd.append("huggingface")
+
+    # 从 config/.env 读取代理配置，透传给 evalscope 子进程 (下载 HF 数据集需要)
+    eval_env = os.environ.copy()
+    local_bin_dir = os.path.expanduser("~/.local/bin")
+    if local_bin_dir not in eval_env.get("PATH", ""):
+        eval_env["PATH"] = f"{local_bin_dir}:{eval_env.get('PATH', '')}"
+
+    for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
+        if not eval_env.get(key):
+            from backend.config import load_dotenv
+            load_dotenv(Path(__file__).resolve().parent.parent.parent / "config" / ".env")
+            val = os.getenv(key, "")
+            if val:
+                eval_env[key] = val
+
+    # 为本地/内网模型 API 端点配置 NO_PROXY 直连保护，避免被 HTTP 代理拦截超时
+    no_proxy_defaults = "127.0.0.1,localhost,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12,0.0.0.0"
+    existing_no_proxy = eval_env.get("NO_PROXY") or eval_env.get("no_proxy") or ""
+    eval_env["NO_PROXY"] = f"{no_proxy_defaults},{existing_no_proxy}".rstrip(",")
+    eval_env["no_proxy"] = eval_env["NO_PROXY"]
+
+    if limit > 0:
+        cmd.extend(["--limit", str(limit)])
+        limit_desc = f"抽取样本 limit={limit}/数据集"
+    else:
+        limit_desc = "全量题库不限上限评测"
 
     log_callback("INFO", model_run.model_slug,
-                 f"评测指令: evalscope eval --model {eval_model_name} --datasets {' '.join(datasets)} --limit {limit}", "accuracy")
+                 f"评测指令: evalscope eval --model {eval_model_name} --datasets {' '.join(normalized_datasets)}" + (f" --limit {limit}" if limit > 0 else "") + " --dataset-hub huggingface", "accuracy")
     log_callback("INFO", model_run.model_slug, f"API 端点: {api_url}", "accuracy")
-    log_callback("INFO", model_run.model_slug, f"样本测试启动 (抽取真实样本 limit={limit}/数据集)...", "accuracy")
+    log_callback("INFO", model_run.model_slug, f"样本测试启动 ({limit_desc})...", "accuracy")
 
     evalscope_success = False
+    proc = None
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=14400)
-        if res.returncode == 0:
+        # 后台启动 evalscope，并实时监控其日志输出，保证前端进度条与日志持续刷新
+        log_file = work_dir / "evalscope_stdout.log"
+        with open(log_file, "w") as f:
+            f.write("")
+        proc = subprocess.Popen(
+            cmd,
+            stdout=open(log_file, "w"),
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            env=eval_env,
+        )
+
+        # 实时日志流与进度监控线程：解析 evalscope 控制台输出，及时推送到日志系统
+        stop_flag = threading.Event()
+        progress_state = {"pct": None, "ds": None, "done": False}
+        logged_detail_keys = set()
+
+        def _poll_realtime_details():
+            try:
+                review_files = sorted(work_dir.glob("**/reviews/**/*.jsonl"))
+                if not review_files:
+                    return
+                pred_map = {}
+                pred_files = sorted(work_dir.glob("**/predictions/**/*.jsonl"))
+                for pf in pred_files:
+                    for line in pf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            idx = data.get("index")
+                            out = data.get("model_output")
+                            ans_text = ""
+                            if isinstance(out, dict):
+                                choices = out.get("choices", [])
+                                if choices and isinstance(choices[0], dict):
+                                    msg = choices[0].get("message", {})
+                                    ans_text = msg.get("content", "")
+                            elif isinstance(out, str):
+                                ans_text = out
+                            pred_map[(pf.stem, idx)] = ans_text
+                        except Exception:
+                            pass
+
+                emitted_count = 0
+                max_emit_per_poll = 30
+
+                for rf in review_files:
+                    if emitted_count >= max_emit_per_poll:
+                        break
+                    ds_name = rf.stem
+                    lines = rf.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    for line in lines:
+                        if emitted_count >= max_emit_per_poll:
+                            break
+                        if not line.strip():
+                            continue
+                        try:
+                            data = json.loads(line)
+                            idx = data.get("index")
+                            key = (ds_name, idx)
+                            if key in logged_detail_keys:
+                                continue
+                            ans_text = pred_map.get(key)
+                            if ans_text is None:
+                                continue
+                            logged_detail_keys.add(key)
+                            target = data.get("target", "")
+                            msgs = data.get("messages", [])
+                            q_text = ""
+                            if msgs and isinstance(msgs[-1], dict):
+                                q_text = msgs[-1].get("content", "").replace("\n", " ").strip()
+                            if len(q_text) > 120:
+                                q_text = q_text[:120] + "..."
+                            sample_score = data.get("sample_score") or {}
+                            score_info = sample_score.get("score") or {}
+                            extracted_pred = score_info.get("extracted_prediction") or ""
+                            val_info = score_info.get("value") or {}
+                            acc_val = val_info.get("acc")
+                            if acc_val is not None:
+                                is_correct = (float(acc_val) == 1.0)
+                                status_str = "PASS (对)" if is_correct else "FAIL (错)"
+                            else:
+                                status_str = "PASS (对)" if (extracted_pred and extracted_pred == target) else "FAIL (错)"
+
+                            ans_brief = ans_text.replace("\n", " ").strip()
+                            if len(ans_brief) > 100:
+                                ans_brief = ans_brief[:100] + "..."
+
+                            log_callback("DEBUG", model_run.model_slug,
+                                         f"  [DEBUG 明细] [{ds_name.upper()} 题 #{idx}] 题目: {q_text} | 标准答案: [{target}] | 模型选项: [{extracted_pred or '未提取'}] | 结果: [{status_str}] | 模型推理: [{ans_brief}]", "accuracy")
+                            emitted_count += 1
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        def _monitor_progress():
+            from backend.database import session_factory
+            last_file_pos = 0
+            last_heartbeat = time.time()
+            while not stop_flag.is_set():
+                try:
+                    if log_file.exists():
+                        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                            f.seek(last_file_pos)
+                            new_lines = f.readlines()
+                            last_file_pos = f.tell()
+
+                        for raw_line in new_lines:
+                            line = raw_line.strip()
+                            if not line:
+                                continue
+                            if any(k in line.lower() for k in ("evaluating", "loading", "downloading", "accuracy", "score", "metric", "pass", "dataset", "completed")):
+                                m = re.search(r"Evaluating\[(\w+)\]:?\s*(\d+)%", line)
+                                if m:
+                                    progress_state["ds"] = m.group(1)
+                                    progress_state["pct"] = int(m.group(2))
+                                log_callback("INFO", model_run.model_slug, f"  [EvalScope] {line[:250]}", "accuracy")
+                            else:
+                                log_callback("DEBUG", model_run.model_slug, f"  [EvalScope Console] {line[:300]}", "accuracy")
+
+                    # 实时轮询 predictions/reviews 数据集，将已评测试题输出到 DEBUG 日志
+                    _poll_realtime_details()
+
+                    pct = progress_state["pct"]
+                    ds = progress_state["ds"]
+                    now = time.time()
+
+                    # 每 10 秒进行数据库 progress 更新与日志保活心跳
+                    if now - last_heartbeat >= 10:
+                        last_heartbeat = now
+                        elapsed_str = _format_duration(now - acc_start_time)
+                        with session_factory() as mdb:
+                            mr = mdb.get(ModelRun, model_run.id)
+                            if mr is not None:
+                                if pct is not None:
+                                    mr.progress = max(mr.progress, 60 + int(30 * (pct / 100)))
+                                    detail_ds = ds.upper() if ds else "ALL"
+                                    mr.progress_detail = f"准确率测试中 | 正在评测: {detail_ds} | 进度: {pct}% | 已用: {elapsed_str} | 实时推理中..."
+                                else:
+                                    mr.progress_detail = f"准确率测试中 | 已用: {elapsed_str} | 真实题库推理评测进行中..."
+                                mdb.commit()
+                        if pct is not None and ds:
+                            log_callback("INFO", model_run.model_slug, f"  └─ [{ds.upper()}] 准确率评测进行中: {pct}% | 已用: {elapsed_str}", "accuracy")
+                        else:
+                            log_callback("INFO", model_run.model_slug, f"  └─ 准确率评测后台任务持续运行中 | 已用: {elapsed_str}", "accuracy")
+                except Exception:
+                    pass
+                time.sleep(3)
+
+        monitor_thread = threading.Thread(target=_monitor_progress, daemon=True)
+        monitor_thread.start()
+
+        returncode = proc.wait(timeout=14400)
+        stop_flag.set()
+        monitor_thread.join(timeout=2)
+
+        # 将 evalscope 输出落盘
+        with open(log_file, encoding="utf-8", errors="ignore") as f:
+            out_text = f.read()
+
+        if returncode == 0:
             evalscope_success = True
-            metrics = _parse_evalscope_output(res.stdout)
+            metrics = _parse_evalscope_output(out_text, work_dir=work_dir, model_name=eval_model_name)
+            _log_evalscope_details(work_dir, log_callback, model_run.model_slug)
 
-            # 将 EvalScope 原生全量控制台输出作为 DEBUG 级别推送 (高档过滤模式可见)
-            if res.stdout:
-                for line in res.stdout.strip().split("\n"):
-                    if line.strip():
-                        log_callback("DEBUG", model_run.model_slug, f"  [EvalScope Raw] {line.strip()[:300]}", "accuracy")
+            for line in out_text.split("\n"):
+                if line.strip():
+                    log_callback("DEBUG", model_run.model_slug, f"  [EvalScope Raw] {line.strip()[:300]}", "accuracy")
 
-            for line in res.stdout.strip().split("\n")[-20:]:
+            for line in out_text.split("\n")[-20:]:
                 if any(kw in line.lower() for kw in ("accuracy", "score", "result", "metric", "pass", "eval")):
                     log_callback("INFO", model_run.model_slug, f"  {line.strip()[:200]}", "accuracy")
             
@@ -1045,8 +1362,9 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             acc_summary = []
             for ds in datasets:
                 acc = None
+                mapped_ds = dataset_alias_map.get(ds.lower(), ds.lower())
                 for k, v in metrics.items():
-                    if ds in k.lower() and "accuracy" in k.lower():
+                    if (ds.lower() in k.lower() or mapped_ds in k.lower()) and "accuracy" in k.lower():
                         try:
                             acc = float(v)
                         except (ValueError, TypeError):
@@ -1070,10 +1388,20 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                              f"  ✅ 准确率 {ds.upper()}: {acc_str} (已用 {elapsed_str}, 预计剩余 {eta_str})", "accuracy")
             return
     except Exception as e:
+        if "proc" in locals() and proc is not None and proc.poll() is None:
+            proc.kill()
+        from backend.services.task_manager import _cancel_flags
+        if _cancel_flags.get(model_run.task_id, False):
+            log_callback("INFO", model_run.model_slug, "准确率测试收到终止/重启指令，评测任务已停止", "accuracy")
+            return
         log_callback("INFO", model_run.model_slug, f"evalscope 命令拉起遇到网络问题: {e}，自动启用【真实题库逐题推理评估引擎】", "accuracy")
 
     # 第二步：如果 evalscope CLI 下载网络超时，启动【真实题库逐题 HTTP 推理与对错校对引擎】（100% 真实推理与对错打分，零假数据）
     if not evalscope_success:
+        from backend.services.task_manager import _cancel_flags
+        if _cancel_flags.get(model_run.task_id, False) or (proc and proc.returncode in (-9, -15, 137, 143)):
+            log_callback("INFO", model_run.model_slug, "准确率测试收到终止/重启指令，评测子进程已停止", "accuracy")
+            return
         _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, datasets, limit, acc_start_time)
 
 
@@ -1151,7 +1479,10 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
         samples = eval_benchmark_samples.get(ds_lower, eval_benchmark_samples["mmlu"])
         correct_count = 0
         total_eval = 0
-        total_samples_cnt = min(limit, 50)
+        if limit and limit > 0:
+            total_samples_cnt = min(limit, len(samples))
+        else:
+            total_samples_cnt = len(samples)
 
         elapsed_sec = time.time() - acc_start_time
         if completed_ds > 0:
@@ -1168,6 +1499,7 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
 
         log_callback("INFO", model_run.model_slug, f"[{ds.upper()}] 评测阶段启动 ({ds_idx+1}/{total_ds}) | 已用 {elapsed_str} | 预计剩余 {eta_str} | 评估样本: {total_samples_cnt} 题", "accuracy")
 
+        log_step = max(1, total_samples_cnt // 10)
         for i in range(total_samples_cnt):
             sample = samples[i % len(samples)]
             prompt = f"Please answer the following multiple-choice question. Give ONLY the option letter (A, B, C, or D).\n\nQuestion:\n{sample['q']}\n\nAnswer:"
@@ -1178,7 +1510,7 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
                 "temperature": 0.0
             }
             try:
-                r = requests.post(api_url, json=payload, headers=headers, timeout=15)
+                r = requests.post(api_url, json=payload, headers=headers, timeout=30, proxies={"http": None, "https": None})
                 if r.status_code == 200:
                     resp_json = r.json()
                     ans_text = resp_json["choices"][0]["message"]["content"].strip().upper()
@@ -1187,10 +1519,17 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
                         correct_count += 1
                     total_eval += 1
                     status_flag = "PASS" if is_correct else "FAIL"
-                    q_brief = sample['q'].replace('\n', ' ')[:45]
+                    q_brief = sample['q'].replace('\n', ' ')
+                    if len(q_brief) > 120:
+                        q_brief = q_brief[:120] + "..."
                     current_accuracy = correct_count / total_eval
-                    log_callback("INFO", model_run.model_slug,
-                                 f"  └─ [{ds.upper()} 题 #{i+1}/{total_samples_cnt}] 实时准确率: {current_accuracy:.1%} ({correct_count}/{total_eval}) | 结果: [{status_flag}]", "accuracy")
+                    # 当切换到【调试 (全量/协议参数)】日志模式时，输出完整的题目内容、标准答案与模型回答
+                    log_callback("DEBUG", model_run.model_slug,
+                                 f"  [DEBUG 明细] [{ds.upper()} 题 #{i+1}/{total_samples_cnt}] 题目: {q_brief} | 标准答案: [{sample['ans']}] | 模型回答: [{ans_text}] | 结果: [{status_flag}]", "accuracy")
+                    # 首尾题目及每 10% 打印 INFO 概览日志，避免数据库锁死与日志过载
+                    if i == 0 or i == total_samples_cnt - 1 or (i + 1) % log_step == 0:
+                        log_callback("INFO", model_run.model_slug,
+                                     f"  └─ [{ds.upper()} 题 #{i+1}/{total_samples_cnt}] 实时准确率: {current_accuracy:.1%} ({correct_count}/{total_eval}) | 结果: [{status_flag}]", "accuracy")
                 else:
                     log_callback("WARNING", model_run.model_slug, f"  └─ [{ds.upper()} 题 #{i+1}/{total_samples_cnt}] 接口响应异常: HTTP {r.status_code}", "accuracy")
             except Exception as req_err:
@@ -1225,22 +1564,81 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
         db.commit()
 
 
-def _parse_evalscope_output(stdout: str) -> dict:
+def _parse_evalscope_output(stdout: str, work_dir: Path = None, model_name: str = "") -> dict:
+    """从 evalscope 输出中提取各数据集的准确率指标。
+
+    优先从 EvalScope 生成的 reports/<model>/<dataset>.json 中读取真实 score (mean_acc)，
+    该 JSON 由 evalscope 在评测成功后自动落盘，比解析控制台输出更可靠。
+    读取不到时退化为解析 stdout 中的 accuracy 字段。
+    """
     metrics = {}
+
+    if work_dir is not None:
+        report_dir = work_dir / "reports"
+        if model_name:
+            report_dir = report_dir / model_name
+        if report_dir.exists():
+            for report_file in sorted(report_dir.glob("*.json")):
+                try:
+                    data = json.loads(report_file.read_text(encoding="utf-8"))
+                except Exception:
+                    continue
+                ds = (data.get("dataset_name") or report_file.stem).lower()
+                score = data.get("score")
+                if score is not None:
+                    try:
+                        metrics[f"{ds}_accuracy"] = float(score)
+                    except (ValueError, TypeError):
+                        pass
+                # 若无顶层 score，从 metrics 中找第一个含 acc 的指标
+                if f"{ds}_accuracy" not in metrics and data.get("metrics"):
+                    for m in data["metrics"]:
+                        mname = str(m.get("name", "")).lower()
+                        if "acc" in mname and m.get("score") is not None:
+                            try:
+                                metrics[f"{ds}_accuracy"] = float(m["score"])
+                            except (ValueError, TypeError):
+                                pass
+                            break
+
     for m in re.findall(r"(\w+).*?accuracy.*?([\d.]+)", stdout, re.IGNORECASE):
-        try:
-            metrics[f"{m[0].lower()}_accuracy"] = float(m[1])
-        except ValueError:
-            pass
+        if m[0].lower() not in metrics:
+            try:
+                metrics[f"{m[0].lower()}_accuracy"] = float(m[1])
+            except ValueError:
+                pass
     return metrics
 
 
+_running_evalscope_procs: dict[int, subprocess.Popen] = {}
+
+
 def stop_task_containers(task):
-    """强行清理该任务占用的 Docker 测试容器，彻底释放 GPU 显存与系统内存空间"""
+    """强行清理该任务占用的 Docker 测试容器与关联的 evalscope 后台进程，彻底释放 GPU 显存与系统资源"""
     try:
         device = task.device if task else None
         runner = RemoteRunner(device)
         _stop_container(runner)
+    except Exception:
+        pass
+    try:
+        if task and hasattr(task, "model_runs") and task.model_runs:
+            for mr in task.model_runs:
+                proc = _running_evalscope_procs.pop(mr.id, None)
+                if proc and proc.poll() is None:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        if task and hasattr(task, "id"):
+            # 根据 Task ID 精准销毁属于该任务的 evalscope 进程，防误杀其他任务
+            res = subprocess.run(["pgrep", "-f", f"_t{task.id}_mr"], capture_output=True, text=True)
+            if res.returncode == 0 and res.stdout.strip():
+                for pid in res.stdout.strip().split():
+                    try:
+                        os.kill(int(pid), 9)
+                    except Exception:
+                        pass
     except Exception:
         pass
 
@@ -1262,9 +1660,11 @@ def restart_task(db: Session, task_id: int):
 
     # 3. 重置关联的所有 ModelRun 并擦除旧的废弃测试结果
     for mr in task.model_runs:
+        model_info = db.execute(select(ModelInfo).where(ModelInfo.slug == mr.model_slug)).scalar_one_or_none()
+        is_ext = model_info and bool(model_info.is_external or model_info.api_base)
         mr.status = "deploying"
         mr.progress = 0
-        mr.progress_detail = "重新下发测试任务，正在启动容器..."
+        mr.progress_detail = "重新下发测试任务，正在接入外部 API 端点..." if is_ext else "重新下发测试任务，正在启动容器..."
         mr.stage_status = {
             "deploying": "running",
             "validating": "pending",

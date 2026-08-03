@@ -168,6 +168,7 @@ class Task(Base):
     config = Column(JSON, default=dict)
 
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+    scheduled_at = Column(DateTime, nullable=True, comment="定时下发执行时间")
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
 

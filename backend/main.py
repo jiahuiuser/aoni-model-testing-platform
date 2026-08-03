@@ -29,6 +29,14 @@ async def lifespan(app: FastAPI):
         created = ensure_admin(db)
         if created:
             log.info("已自动创建默认管理员账号: admin / jiahui123")
+
+    # 自动恢复自愈：扫描并恢复服务端重启前处于 RUNNING 状态的任务线程
+    try:
+        from backend.services.task_manager import recover_running_tasks
+        recover_running_tasks()
+        log.info("任务运行线程自愈扫描完成")
+    except Exception as e:
+        log.error(f"自愈恢复运行任务失败: {e}")
     yield
 
 

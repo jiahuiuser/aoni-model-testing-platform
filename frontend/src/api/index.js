@@ -64,8 +64,12 @@ export const apiListTasks = () => api.get('/tasks').then(r => r.data)
 export const apiGetTask = (id) => api.get(`/tasks/${id}`).then(r => r.data)
 export const apiTaskAction = (id, action) => api.post(`/tasks/${id}/action`, { action }).then(r => r.data)
 export const apiDeleteTask = (id) => api.delete(`/tasks/${id}`).then(r => r.data)
-export const apiGetTaskLogs = (id, model_slug, limit = 200) =>
-  api.get(`/tasks/${id}/logs`, { params: { model_slug, limit } }).then(r => r.data)
+export const apiGetTaskLogs = (id, model_slug, limit = 500, after_id = null) => {
+  const params = { limit }
+  if (model_slug) params.model_slug = model_slug
+  if (after_id) params.after_id = after_id
+  return api.get(`/tasks/${id}/logs`, { params }).then(r => r.data)
+}
 
 // 设备管理 API
 export const apiListDevices = () => api.get('/devices').then(r => r.data)

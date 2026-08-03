@@ -95,6 +95,24 @@
                   多选设备将自动并发批量下发独立测试任务。
                 </div>
               </el-form-item>
+
+              <el-form-item label="定时下发">
+                <div style="display: flex; align-items: center; gap: 12px">
+                  <el-switch v-model="form.is_scheduled" />
+                  <el-date-picker
+                    v-if="form.is_scheduled"
+                    v-model="form.scheduled_at"
+                    type="datetime"
+                    placeholder="选择定时下发时间"
+                    format="YYYY-MM-DD HH:mm:ss"
+                    value-format="YYYY-MM-DD HH:mm:ss"
+                    style="width: 220px"
+                  />
+                </div>
+                <div v-if="form.is_scheduled" class="form-tip">
+                  设定时间到达前，任务将保持在【定时等待中】队列。
+                </div>
+              </el-form-item>
             </el-card>
 
             <!-- 2. 测试模型选择 -->
@@ -339,9 +357,9 @@
               <template v-if="form.config.acc_enabled">
                 <el-form-item label="快捷选集">
                   <div style="display: flex; gap: 6px; flex-wrap: wrap">
-                    <el-button size="small" type="danger" plain @click="selectUltraDatasets">300B+ 旗舰集</el-button>
-                    <el-button size="small" type="warning" plain @click="selectHardDatasets">高难度进阶集</el-button>
-                    <el-button size="small" type="info" plain @click="selectStandardDatasets">基础通用基准</el-button>
+                    <el-button size="small" type="danger" plain @click="selectUltraDatasets">全选高阶综合推理集</el-button>
+                    <el-button size="small" type="warning" plain @click="selectHardDatasets">全选专项能力扩展集</el-button>
+                    <el-button size="small" type="info" plain @click="selectStandardDatasets">全选基础通用基准集</el-button>
                     <el-button size="small" @click="form.config.acc_datasets = []">清空</el-button>
                   </div>
                 </el-form-item>
@@ -349,39 +367,68 @@
                 <el-form-item label="评测集">
                   <el-checkbox-group v-model="form.config.acc_datasets" style="width: 100%">
                     <div class="dataset-group-box ultra">
-                      <div class="group-title">300B+ 极高难度集</div>
+                      <div class="group-title">高阶综合推理集 (High-Order Reasoning)</div>
                       <div class="checkbox-row">
-                        <el-checkbox label="aime24">AIME24</el-checkbox>
-                        <el-checkbox label="arena_hard">Arena-Hard</el-checkbox>
-                        <el-checkbox label="gpqa">GPQA</el-checkbox>
+                        <el-checkbox label="aime24">AIME24 (数学推演 · 30 题)</el-checkbox>
+                        <el-checkbox label="arena_hard">Arena-Hard (Query 对战 · 500 题)</el-checkbox>
+                        <el-checkbox label="gpqa">GPQA (学术问答 · 198 题)</el-checkbox>
                       </div>
                     </div>
 
                     <div class="dataset-group-box hard">
-                      <div class="group-title">高难度进阶集</div>
+                      <div class="group-title">专项能力扩展集 (Specialized Benchmarks)</div>
                       <div class="checkbox-row">
-                        <el-checkbox label="math500">MATH-500</el-checkbox>
-                        <el-checkbox label="bigcodebench">BigCodeBench</el-checkbox>
-                        <el-checkbox label="longbench_pro">LongBench Pro</el-checkbox>
+                        <el-checkbox label="math500">MATH-500 (竞赛数学 · 500 题)</el-checkbox>
+                        <el-checkbox label="bigcodebench">BigCodeBench (代码生成 · 1,140 题)</el-checkbox>
+                        <el-checkbox label="longbench_pro">LongBench Pro (长文本分析 · 1,500 题)</el-checkbox>
                       </div>
                     </div>
 
                     <div class="dataset-group-box standard">
-                      <div class="group-title">基础通用集</div>
+                      <div class="group-title">基础通用基准集 (Standard Benchmarks)</div>
                       <div class="checkbox-row">
-                        <el-checkbox label="mmlu">MMLU</el-checkbox>
-                        <el-checkbox label="ceval">C-Eval</el-checkbox>
-                        <el-checkbox label="gsm8k">GSM8K</el-checkbox>
-                        <el-checkbox label="arc">ARC</el-checkbox>
-                        <el-checkbox label="humaneval">HumanEval</el-checkbox>
+                        <el-checkbox label="mmlu">MMLU (学科知识 · 14,042 题)</el-checkbox>
+                        <el-checkbox label="ceval">C-Eval (中文推理 · 13,948 题)</el-checkbox>
+                        <el-checkbox label="gsm8k">GSM8K (应用题推理 · 1,319 题)</el-checkbox>
+                        <el-checkbox label="arc">ARC (科学常识 · 2,590 题)</el-checkbox>
+                        <el-checkbox label="humaneval">HumanEval (Python 编程 · 164 题)</el-checkbox>
                       </div>
                     </div>
                   </el-checkbox-group>
                 </el-form-item>
 
                 <el-form-item label="数据集抽样">
-                  <el-input v-model.number="form.config.acc_limit" placeholder="200" style="width: 140px" />
-                  <span style="color: #909399; font-size: 12px; margin-left: 8px">推荐 50~200 题</span>
+                  <div style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+                    <el-checkbox
+                      v-model="form.is_full_acc"
+                      @change="handleFullAccChange"
+                    >
+                      <span style="font-weight: 600;">全量评测 (不限定额全题库)</span>
+                    </el-checkbox>
+
+                    <div v-if="!form.is_full_acc" style="display: flex; align-items: center; gap: 8px;">
+                      <span style="font-size: 13px; color: #475569;">自定义抽样数量:</span>
+                      <el-input-number
+                        v-model="form.config.acc_limit"
+                        :min="1"
+                        :max="100000"
+                        size="small"
+                        placeholder="如 200"
+                        style="width: 140px"
+                      />
+                      <span style="font-size: 12px; color: #94a3b8;">题 / 数据集</span>
+                    </div>
+                  </div>
+                  <div style="font-size: 12px; color: #64748b; margin-top: 4px;">
+                    <span v-if="form.is_full_acc">
+                      <el-tag size="small" type="success" effect="dark" style="margin-right: 4px;">全量模式</el-tag>
+                      已启用全量评测，将 100% 遍历评估数据集内全部题目。
+                    </span>
+                    <span v-else>
+                      <el-tag size="small" type="info" style="margin-right: 4px;">抽样模式</el-tag>
+                      每个已选数据集抽取 <b>{{ form.config.acc_limit || 200 }}</b> 题进行评测。
+                    </span>
+                  </div>
                 </el-form-item>
               </template>
               <template v-else>
@@ -492,6 +539,9 @@ const form = reactive({
   device_ids: [],
   template_id: null,
   template_ids: [],
+  is_scheduled: false,
+  scheduled_at: null,
+  is_full_acc: false,
   config: {
     model_slugs: [],
     gateway_enabled: true,
@@ -507,6 +557,14 @@ const form = reactive({
     container_startup_timeout: 7200,
   },
 })
+
+const handleFullAccChange = (val) => {
+  if (val) {
+    form.config.acc_limit = 0
+  } else {
+    form.config.acc_limit = 200
+  }
+}
 
 const onlineDevices = computed(() =>
   (Array.isArray(devices.value) ? devices.value : []).filter((d) => d && d.status === 'online')
@@ -717,6 +775,7 @@ const handleSubmit = async () => {
       device_id: form.device_ids && form.device_ids.length > 0 ? form.device_ids[0] : form.device_id,
       device_ids: form.device_ids,
       template_id: form.template_id,
+      scheduled_at: form.is_scheduled && form.scheduled_at ? form.scheduled_at : null,
       config: finalConfig,
     }
     if (editId.value) {

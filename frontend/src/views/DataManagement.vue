@@ -89,7 +89,7 @@
           <div class="toolbar-left" style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
             <el-radio-group v-model="difficultyFilter" size="default" @change="loadDatasets">
               <el-radio-button value="all">全部难度</el-radio-button>
-              <el-radio-button value="ultra">极高难度 (300B+旗舰)</el-radio-button>
+              <el-radio-button value="ultra">高阶综合推理</el-radio-button>
               <el-radio-button value="hard">高难度进阶</el-radio-button>
               <el-radio-button value="standard">基础通用</el-radio-button>
             </el-radio-group>
@@ -138,7 +138,7 @@
           <el-table-column label="难度等级" width="160" align="center">
             <template #default="{ row }">
               <el-tag v-if="row.difficulty === 'ultra'" type="danger" effect="dark" size="small" style="font-weight:600;">
-                极高难度 (300B+)
+                高阶综合推理
               </el-tag>
               <el-tag v-else-if="row.difficulty === 'hard'" type="warning" effect="light" size="small" style="font-weight:600;">
                 高难度进阶
@@ -196,7 +196,7 @@
         </el-form-item>
         <el-form-item label="测试数据集">
           <el-checkbox-group v-model="tplForm.datasets">
-            <div style="font-weight:600; color:#dc2626; margin-bottom:4px; font-size:12px;">300B+ 极高难度评测集：</div>
+            <div style="font-weight:600; color:#dc2626; margin-bottom:4px; font-size:12px;">高阶综合推理评测集：</div>
             <div style="display:flex; gap:8px; margin-bottom:8px; flex-wrap:wrap;">
               <el-checkbox label="aime24">aime24 (AIME竞赛数学)</el-checkbox>
               <el-checkbox label="arena_hard">arena_hard (Arena对战)</el-checkbox>

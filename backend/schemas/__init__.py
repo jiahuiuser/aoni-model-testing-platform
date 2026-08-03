@@ -52,6 +52,7 @@ class TaskCreate(BaseModel):
     device_id: Optional[int] = None
     device_ids: Optional[List[int]] = None  # 支持选择多台设备下发测试
     template_id: Optional[int] = None      # 关联测试模板 ID
+    scheduled_at: Optional[datetime] = None # 定时下发执行时间
     config: TaskConfig = Field(default_factory=TaskConfig)
 
 
@@ -97,6 +98,7 @@ class TaskOut(BaseModel):
     device_name: Optional[str] = None
     config: dict
     created_at: datetime
+    scheduled_at: Optional[datetime] = None
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
     model_count: int = 0

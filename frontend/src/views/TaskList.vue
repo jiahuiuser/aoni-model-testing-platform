@@ -91,9 +91,12 @@
           </el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="状态" width="110">
+      <el-table-column label="状态" width="160">
         <template #default="{ row }">
-          <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
+          <el-tag v-if="row.scheduled_at && new Date(row.scheduled_at) > new Date() && (row.status === 'queued' || row.status === 'scheduled')" type="warning" size="small">
+            定时等待中 ({{ formatTime(row.scheduled_at) }})
+          </el-tag>
+          <el-tag v-else :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
       <el-table-column label="测试进度" min-width="180">
@@ -153,15 +156,17 @@
               {{ currentConfigTask.config?.acc_enabled ? '已开启' : '未开启' }}
             </el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="评测数据集与 Limit">
-            <div class="tag-wrap">
-              <el-tag v-for="ds in (currentConfigTask.config?.acc_datasets || [])" :key="ds" size="small" type="warning" style="margin:2px">
-                {{ ds.toUpperCase() }}
+          <el-descriptions-item label="样本评估模式/限制">
+            <el-tag type="danger" effect="plain" size="small" style="font-weight: 600">
+              {{ (currentConfigTask.config?.acc_limit === 0 || currentConfigTask.config?.acc_limit === undefined) ? '全量测试模式 (全量题库不限上限评估)' : `抽样模式 (${currentConfigTask.config?.acc_limit} 题/数据集)` }}
+            </el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="勾选评测数据集与题量">
+            <div class="tag-wrap" style="display:flex; flex-wrap:wrap; gap:4px; margin-top:2px">
+              <el-tag v-for="ds in (currentConfigTask.config?.acc_datasets || [])" :key="ds" size="small" type="warning">
+                <b>{{ ds.toUpperCase() }}</b>: {{ getDatasetSampleText(ds) }}
               </el-tag>
             </div>
-            <span style="font-size:12px;color:#6b7280;margin-top:4px;display:block">
-              每数据集评测样本上限: <b>{{ currentConfigTask.config?.acc_limit || 200 }}</b> 条
-            </span>
           </el-descriptions-item>
         </el-descriptions>
       </div>
@@ -189,6 +194,28 @@ const tasks = ref([])
 const loading = ref(false)
 const selectedTasks = ref([])
 const singleSelected = computed(() => selectedTasks.value.length === 1 ? selectedTasks.value[0] : null)
+
+const DATASET_SAMPLE_COUNTS = {
+  mmlu: '14,042 题 (全量 57 子集)',
+  ceval: '13,948 题 (全量 52 科目)',
+  gsm8k: '1,319 题 (全量)',
+  arc: '1,172 题 (全量)',
+  math500: '500 题 (全量)',
+  humaneval: '164 题 (全量)',
+  bigcodebench: '1,140 题 (全量)',
+  longbench_pro: '3,000 题 (全量)',
+  gpqa: '198 题 (全量)',
+  aime24: '30 题 (全量)',
+  arena_hard: '500 题 (全量)',
+  math_500: '500 题 (全量)',
+  longbench_v2: '3,000 题 (全量)',
+  gpqa_diamond: '198 题 (全量)',
+}
+
+const getDatasetSampleText = (ds) => {
+  const key = (ds || '').toLowerCase()
+  return DATASET_SAMPLE_COUNTS[key] || '真实样本库'
+}
 
 useDragSelect(tableRef, tasks)
 

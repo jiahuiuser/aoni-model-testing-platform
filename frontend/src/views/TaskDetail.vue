@@ -75,33 +75,57 @@
           </el-table>
         </el-card>
 
-        <!-- API 协议规范校验明细 -->
+        <!-- API 协议规范校验明细 (按接口协议分为独立测试套件用例) -->
         <el-card v-if="hasGatewayResults" style="margin-bottom: 16px;" shadow="never">
-          <template #header><span style="font-weight:700">API 协议规范校验结果明细</span></template>
-          <div v-for="mr in modelRuns" :key="mr.id" style="margin-bottom: 16px;">
+          <template #header>
+            <div style="display:flex; justify-content:space-between; align-items:center;">
+              <span style="font-weight:700">API 协议规范校验测试套件结论</span>
+              <el-tag type="info" size="small">按接口协议独立用例集拆分展示</el-tag>
+            </div>
+          </template>
+
+          <div v-for="mr in modelRuns" :key="mr.id" style="margin-bottom: 24px;">
             <div v-if="mr.gateway_results && mr.gateway_results.length > 0">
-              <h4 style="margin: 8px 0; color: #1e293b; font-weight: 600;">测试模型：{{ formatModelDisplayName(mr) }}</h4>
-              <el-table :data="mr.gateway_results" size="small" border stripe>
-                <el-table-column prop="test_item" label="测试项名称" min-width="200" />
-                <el-table-column prop="protocol" label="协议分类" width="120" align="center">
-                  <template #default="{ row }">
-                    <el-tag size="small" effect="plain">{{ (row.protocol || 'system').toUpperCase() }}</el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="status" label="测试状态" width="110" align="center">
-                  <template #default="{ row }">
-                    <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'FAIL' ? 'danger' : 'warning')" size="small" effect="dark">
-                      {{ row.status === 'PASS' ? '通过' : (row.status === 'FAIL' ? '失败' : '跳过') }}
+              <div style="margin-bottom: 12px; display:flex; align-items:center; gap:8px;">
+                <span style="font-weight: 600; font-size: 14px; color: #1e293b;">测试模型：{{ formatModelDisplayName(mr) }}</span>
+              </div>
+
+              <!-- 按协议套件卡片列表 -->
+              <div v-for="suite in getProtocolSuites(mr.gateway_results)" :key="suite.protocol" style="margin-bottom: 14px; border: 1px solid #e2e8f0; border-radius: 6px; padding: 12px; background: #fafafa;">
+                <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+                  <div style="display: flex; align-items: center; gap: 8px;">
+                    <el-tag size="small" type="primary" effect="dark">{{ suite.protocol }}</el-tag>
+                    <span style="font-weight: 600; font-size: 13px; color: #334155;">{{ suite.name }}</span>
+                    <span style="color: #64748b; font-size: 12px;">({{ suite.items.length }} 个测试用例)</span>
+                  </div>
+                  <div>
+                    <el-tag
+                      :type="suite.items.every(i => i.status === 'PASS') ? 'success' : (suite.items.some(i => i.status === 'FAIL') ? 'danger' : 'warning')"
+                      size="small"
+                      effect="dark"
+                    >
+                      {{ suite.items.every(i => i.status === 'PASS') ? '全量 PASS' : (suite.items.some(i => i.status === 'FAIL') ? '存在 FAIL' : '部分 SKIP') }}
                     </el-tag>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="latency_ms" label="响应耗时" width="110" align="right">
-                  <template #default="{ row }">
-                    <span>{{ row.latency_ms ? `${row.latency_ms} ms` : '--' }}</span>
-                  </template>
-                </el-table-column>
-                <el-table-column prop="message" label="结果诊断 / 说明" min-width="260" />
-              </el-table>
+                  </div>
+                </div>
+
+                <el-table :data="suite.items" size="small" border stripe>
+                  <el-table-column prop="test_item" label="用例名称 / 校验点" min-width="200" />
+                  <el-table-column prop="status" label="结论" width="90" align="center">
+                    <template #default="{ row }">
+                      <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'FAIL' ? 'danger' : 'warning')" size="small" effect="dark">
+                        {{ row.status === 'PASS' ? '通过' : (row.status === 'FAIL' ? '失败' : '跳过') }}
+                      </el-tag>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="latency_ms" label="耗时" width="95" align="right">
+                    <template #default="{ row }">
+                      <span>{{ row.latency_ms ? `${row.latency_ms} ms` : '--' }}</span>
+                    </template>
+                  </el-table-column>
+                  <el-table-column prop="message" label="校验诊断与依据" min-width="260" />
+                </el-table>
+              </div>
             </div>
           </div>
         </el-card>
@@ -160,6 +184,11 @@
                 {{ slug }}
               </el-tag>
             </el-descriptions-item>
+            <el-descriptions-item label="网关协议校验">
+              <el-tag :type="task.config?.gateway_enabled !== false ? 'success' : 'info'">
+                {{ task.config?.gateway_enabled !== false ? '已开启 (全量 OpenAI/Anthropic/Responses 规范校验)' : '已关闭' }}
+              </el-tag>
+            </el-descriptions-item>
             <el-descriptions-item label="性能测试开关">
               <el-tag :type="task.config?.perf_enabled ? 'success' : 'info'">
                 {{ task.config?.perf_enabled ? '已开启' : '已关闭' }}
@@ -178,10 +207,21 @@
                 {{ task.config?.acc_enabled ? '已开启' : '已关闭' }}
               </el-tag>
             </el-descriptions-item>
-            <el-descriptions-item label="评测数据集">
-              <el-tag v-for="ds in (task.config?.acc_datasets || [])" :key="ds" type="warning" style="margin-right:6px">
-                {{ ds.toUpperCase() }}
+            <el-descriptions-item label="样本评估模式/限制">
+              <el-tag type="danger" effect="plain" style="font-weight: 600">
+                {{ getAccLimitText(task.config) }}
               </el-tag>
+            </el-descriptions-item>
+            <el-descriptions-item label="勾选评测数据集与题量">
+              <div style="display:flex; flex-wrap:wrap; gap:6px; margin-top:4px">
+                <el-tag v-for="ds in (task.config?.acc_datasets || [])" :key="ds" type="warning">
+                  <b>{{ ds.toUpperCase() }}</b>: {{ getDatasetSampleText(ds) }}
+                </el-tag>
+              </div>
+            </el-descriptions-item>
+            <el-descriptions-item label="超时与通知配置">
+              <span>容器启动超时: <b>{{ task.config?.container_startup_timeout || 7200 }}秒</b> | </span>
+              <span>通知邮箱: <b>{{ task.config?.notify_email || '未配置' }}</b></span>
             </el-descriptions-item>
             <el-descriptions-item label="创建时间">{{ formatTime(task.created_at) }}</el-descriptions-item>
           </el-descriptions>
@@ -208,6 +248,37 @@ const mainTab = ref('execution')
 const logTab = ref('all')
 const logVerbosity = ref('medium') // 'low' | 'medium' | 'high'
 const isUserScrolledUp = ref(false)
+
+const DATASET_SAMPLE_COUNTS = {
+  mmlu: '14,042 题 (全量 57 子集)',
+  ceval: '13,948 题 (全量 52 科目)',
+  gsm8k: '1,319 题 (全量)',
+  arc: '1,172 题 (全量)',
+  math500: '500 题 (全量)',
+  humaneval: '164 题 (全量)',
+  bigcodebench: '1,140 题 (全量)',
+  longbench_pro: '3,000 题 (全量)',
+  gpqa: '198 题 (全量)',
+  aime24: '30 题 (全量)',
+  arena_hard: '500 题 (全量)',
+  math_500: '500 题 (全量)',
+  longbench_v2: '3,000 题 (全量)',
+  gpqa_diamond: '198 题 (全量)',
+}
+
+const getDatasetSampleText = (ds) => {
+  const key = (ds || '').toLowerCase()
+  return DATASET_SAMPLE_COUNTS[key] || '真实样本库'
+}
+
+const getAccLimitText = (cfg) => {
+  if (!cfg) return '全量测试 (不限上限)'
+  const limit = cfg.acc_limit
+  if (limit === 0 || limit === undefined || limit === null) {
+    return '全量测试模式 (全量题库不限上限评估)'
+  }
+  return `抽样测试模式 (每数据集评估上限 ${limit} 题)`
+}
 
 const lastLogId = ref(0)
 
@@ -308,6 +379,26 @@ const hasGatewayResults = computed(() => {
   return modelRuns.value.some(r => r.gateway_results && r.gateway_results.length > 0)
 })
 
+function getProtocolSuites(gatewayResults) {
+  if (!gatewayResults || gatewayResults.length === 0) return []
+  const groupMap = {
+    system: { name: '系统与服务可达性测试套件', protocol: 'SYSTEM', items: [] },
+    openai: { name: 'OpenAI 接口规范测试套件 (/v1/chat/completions)', protocol: 'OPENAI', items: [] },
+    responses: { name: 'OpenAI Responses 接口规范测试套件 (/v1/responses)', protocol: 'RESPONSES', items: [] },
+    anthropic: { name: 'Anthropic Messages 接口规范测试套件 (/v1/messages)', protocol: 'ANTHROPIC', items: [] },
+  }
+  
+  gatewayResults.forEach(gr => {
+    const proto = (gr.protocol || 'system').toLowerCase()
+    if (!groupMap[proto]) {
+      groupMap[proto] = { name: `${proto.toUpperCase()} 接口协议测试套件`, protocol: proto.toUpperCase(), items: [] }
+    }
+    groupMap[proto].items.push(gr)
+  })
+  
+  return Object.values(groupMap).filter(g => g.items.length > 0)
+}
+
 const modelStatusType = (s) => ({ deploying: 'warning', validating: 'warning', gateway_testing: 'primary', perf_testing: 'primary', acc_testing: 'primary', reporting: '', done: 'success' })[s] || 'info'
 const modelStatusLabel = (s) => ({ deploying: '容器部署', validating: '服务就绪', gateway_testing: '网关测试', perf_testing: '性能测试', acc_testing: '准确率测试', reporting: '生成报告', done: '完成' })[s] || s
 
@@ -330,16 +421,25 @@ const handleRerunTask = async () => {
   }
 }
 
+const MAX_LOGS_DISPLAY = 2000
+
 const pollLogs = async () => {
   try {
-    const newLogs = await apiGetTaskLogs(taskId.value)
+    const afterId = lastLogId.value > 0 ? lastLogId.value : null
+    const newLogs = await apiGetTaskLogs(taskId.value, null, 500, afterId)
     if (newLogs && newLogs.length > 0) {
-      const sorted = [...newLogs].reverse()
-      for (const log of sorted) {
+      if (lastLogId.value > 0 && newLogs[0].id < lastLogId.value) {
+        logs.value = []
+        lastLogId.value = 0
+      }
+      for (const log of newLogs) {
         if (log.id > lastLogId.value) {
           logs.value.push(log)
           lastLogId.value = log.id
         }
+      }
+      if (logs.value.length > MAX_LOGS_DISPLAY) {
+        logs.value = logs.value.slice(logs.value.length - MAX_LOGS_DISPLAY)
       }
       scrollToBottom(false)
     }

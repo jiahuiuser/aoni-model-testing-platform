@@ -5,7 +5,7 @@ from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func, desc, asc
 from sqlalchemy.orm import Session, selectinload
 
 from backend.database import get_db
@@ -35,6 +35,8 @@ def api_create_task(
 ):
     import threading
 
+    from backend.services.task_manager import schedule_or_start_task
+
     device_list = data.device_ids if data.device_ids else ([data.device_id] if data.device_id else [None])
     created_tasks = []
 
@@ -44,14 +46,14 @@ def api_create_task(
             profile=data.profile,
             device_id=dev_id,
             template_id=data.template_id,
+            scheduled_at=data.scheduled_at,
             config=data.config
         )
         try:
             task = create_task(db, sub_data, user_id=current_user.id)
             created_tasks.append(task)
-            # 后台异步启动
-            t = threading.Thread(target=start_task, args=(task.id,), daemon=True)
-            t.start()
+            # 调度或即刻启动
+            schedule_or_start_task(db, task.id)
         except ValueError as e:
             if not created_tasks:
                 raise HTTPException(400, detail=str(e))
@@ -102,7 +104,7 @@ def api_task_action(
     if action.action == "pause":
         pause_task(db, task_id)
     elif action.action == "resume":
-        resume_task(task_id)
+        resume_task(db, task_id)
     elif action.action == "cancel":
         cancel_task(db, task_id)
     elif action.action in ("rerun", "restart"):
@@ -171,12 +173,26 @@ def api_delete_task(
 
 
 @router.get("/{task_id}/logs", response_model=list[TaskLogOut])
-def api_get_logs(task_id: int, model_slug: Optional[str] = None, limit: int = 200, db: Session = Depends(get_db)):
+def api_get_logs(
+    task_id: int,
+    model_slug: Optional[str] = None,
+    after_id: Optional[int] = None,
+    limit: int = 500,
+    db: Session = Depends(get_db)
+):
     query = select(TaskLog).where(TaskLog.task_id == task_id)
     if model_slug:
         query = query.where(TaskLog.model_slug == model_slug)
+
+    if after_id is not None and after_id > 0:
+        max_id = db.execute(select(func.max(TaskLog.id)).where(TaskLog.task_id == task_id)).scalar() or 0
+        if after_id <= max_id:
+            query = query.where(TaskLog.id > after_id).order_by(asc(TaskLog.id)).limit(limit)
+            return db.execute(query).scalars().all()
+
     query = query.order_by(desc(TaskLog.id)).limit(limit)
-    return db.execute(query).scalars().all()
+    logs = db.execute(query).scalars().all()
+    return list(reversed(logs))
 
 
 # ---------- 辅助函数 ----------
@@ -210,13 +226,22 @@ def _task_to_out(t: Task) -> TaskOut:
         except Exception:
             pass
 
+    # 设备名称展示优化：如果任务下的模型全是外部 API，标注为外部 API 端点
+    device_name = t.device.name if t.device else None
+    if model_runs:
+        ext_runs = [mr for mr in model_runs if "外部 API" in (mr.device_name or "")]
+        if len(ext_runs) == len(model_runs):
+            device_name = ext_runs[0].device_name
+        elif ext_runs:
+            device_name = f"{ext_runs[0].device_name} 等"
+
     return TaskOut(
         id=t.id, name=t.name, status=status_str, profile=t.profile,
         user_id=t.user_id, username=t.user.username if t.user else None,
-        device_id=t.device_id, device_name=t.device.name if t.device else None,
-        config=t.config, created_at=t.created_at, started_at=t.started_at,
-        completed_at=t.completed_at, model_count=len(model_runs),
-        completed_count=completed,
+        device_id=t.device_id, device_name=device_name,
+        config=t.config, created_at=t.created_at, scheduled_at=t.scheduled_at,
+        started_at=t.started_at, completed_at=t.completed_at,
+        model_count=len(model_runs), completed_count=completed,
     )
 
 
