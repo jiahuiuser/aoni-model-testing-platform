@@ -1148,6 +1148,9 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     if local_bin_dir not in eval_env.get("PATH", ""):
         eval_env["PATH"] = f"{local_bin_dir}:{eval_env.get('PATH', '')}"
 
+    if "HF_ENDPOINT" not in eval_env:
+        eval_env["HF_ENDPOINT"] = "https://hf-mirror.org"
+
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
         if not eval_env.get(key):
             from backend.config import load_dotenv
