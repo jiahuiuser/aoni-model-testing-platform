@@ -123,6 +123,7 @@ class Device(Base):
 
 class TaskStatus(str, enum.Enum):
     QUEUED = "queued"
+    SCHEDULED = "scheduled"
     RUNNING = "running"
     PAUSED = "paused"
     COMPLETED = "completed"
