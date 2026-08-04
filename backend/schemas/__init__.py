@@ -103,6 +103,7 @@ class TaskOut(BaseModel):
     completed_at: Optional[datetime] = None
     model_count: int = 0
     completed_count: int = 0
+    has_failed_runs: bool = False  # 是否存在失败/跳过的子任务
 
     class Config:
         from_attributes = True

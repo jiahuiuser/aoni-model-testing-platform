@@ -150,21 +150,39 @@ def schedule_or_start_task(db: Session, task_id: int):
 
 def pause_task(db: Session, task_id: int):
     """暂停任务：挂起测试基准脚本调度，不停止与下线 Docker 容器"""
+    import os, signal, subprocess
     _pause_flags[task_id] = True
     task = db.get(Task, task_id)
     if task:
         task.status = TaskStatus.PAUSED
         db.commit()
-        _add_log(db, task_id, "INFO", None, "任务已暂停 (基准测试挂起，推理服务容器保持运行中)", "system")
+        # 实时给该任务绑定的所有后台评测进程发送 SIGSTOP 信号，实现瞬时挂机冻结
+        res = subprocess.run(["pgrep", "-f", f"_t{task.id}_mr"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            for pid in res.stdout.strip().split():
+                try:
+                    os.kill(int(pid), signal.SIGSTOP)
+                except Exception:
+                    pass
+        _add_log(db, task_id, "INFO", None, "任务已暂停 (测试进程已挂起 SIGSTOP 冻结，推理服务容器保持运行中)", "system")
 
 
 def resume_task(db: Session, task_id: int):
+    import os, signal, subprocess
     _pause_flags[task_id] = False
     task = db.get(Task, task_id)
     if task:
         task.status = TaskStatus.RUNNING
         db.commit()
-        _add_log(db, task_id, "INFO", None, "任务已恢复运行", "system")
+        # 实时给该任务绑定的所有后台评测进程发送 SIGCONT 信号，恢复解冻运行
+        res = subprocess.run(["pgrep", "-f", f"_t{task.id}_mr"], capture_output=True, text=True)
+        if res.returncode == 0 and res.stdout.strip():
+            for pid in res.stdout.strip().split():
+                try:
+                    os.kill(int(pid), signal.SIGCONT)
+                except Exception:
+                    pass
+        _add_log(db, task_id, "INFO", None, "任务已恢复运行 (测试进程已唤醒 SIGCONT 继续评测)", "system")
     t = _running_tasks.get(task_id)
     if not t or not t.is_alive():
         start_task(task_id)
@@ -185,8 +203,8 @@ def cancel_task(db: Session, task_id: int):
 
 
 def restart_task(db: Session, task_id: int):
-    """一键重新运行 / 重试指定测试任务"""
-    from backend.models import PerfResult, AccResult, GatewayResult
+    """一键重新运行：重置所有子模型，从头开始执行"""
+    from backend.models import PerfResult, AccResult, GatewayResult, ModelInfo
     from backend.services.executor import stop_task_containers
     import time
 
@@ -194,29 +212,20 @@ def restart_task(db: Session, task_id: int):
     if not task:
         raise ValueError("任务不存在")
 
-    # 1. 标记取消旧线程并强行清理已存在的残留容器与进程
     _cancel_flags[task_id] = True
     _pause_flags[task_id] = False
     stop_task_containers(task)
     time.sleep(0.5)
     _cancel_flags[task_id] = False
 
-    # 2. 重置主任务状态
     task.status = TaskStatus.RUNNING
     task.started_at = datetime.utcnow()
     task.completed_at = None
     db.commit()
 
-    # 3. 重置关联的所有 ModelRun 并擦除旧的废弃测试结果
-    from backend.models import ModelInfo
     for mr in task.model_runs:
         model_info = db.query(ModelInfo).filter_by(slug=mr.model_slug).first()
         is_ext = model_info and bool(model_info.is_external or model_info.api_base)
-        if is_ext:
-            api_target = model_info.api_base or "外部 API"
-            mr.device_name = f"外部 API 接入 ({api_target})"
-        else:
-            mr.device_name = task.device.name if task.device else "独立/云端环境"
         mr.status = ModelStage.DEPLOYING
         mr.progress = 0
         mr.progress_detail = "重新下发测试任务，正在接入外部 API 端点..." if is_ext else "重新下发测试任务，正在启动容器..."
@@ -236,9 +245,64 @@ def restart_task(db: Session, task_id: int):
 
     db.query(TaskLog).filter_by(task_id=task.id).delete()
     db.commit()
+    _add_log(db, task_id, "INFO", None, f"========== 任务 #{task_id} 已全量重置并重新下发评测 ==========", "system")
+    start_task(task_id)
+    return task
 
-    # 4. 重新拉起后台评测线程
-    _add_log(db, task_id, "INFO", None, f"========== 任务 #{task_id} 已重置并重新下发测试评测 ==========", "system")
+
+def retry_failed_task(db: Session, task_id: int):
+    """断点重试：仅重试失败/跳过的子模型，完整保留已成功的测试结果"""
+    from backend.models import PerfResult, AccResult, GatewayResult, ModelInfo
+    from backend.services.executor import stop_task_containers
+    import time
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise ValueError("任务不存在")
+
+    # 1. 标记取消旧线程并清理残留
+    _cancel_flags[task_id] = True
+    _pause_flags[task_id] = False
+    stop_task_containers(task)
+    time.sleep(0.5)
+    _cancel_flags[task_id] = False
+
+    # 2. 重置主任务状态
+    task.status = TaskStatus.RUNNING
+    task.started_at = datetime.utcnow()
+    task.completed_at = None
+    db.commit()
+
+    # 3. 仅重置失败/跳过或未完成的子模型，保留成功的 ModelRun 结果
+    reset_count = 0
+    for mr in task.model_runs:
+        has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (mr.stage_status or {}).values())
+        has_error_detail = any(kw in (mr.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止"])
+        is_failed = mr.status in (ModelStage.FAILED.value, "failed") or has_failed_stage or has_error_detail
+
+        if is_failed:
+            reset_count += 1
+            model_info = db.query(ModelInfo).filter_by(slug=mr.model_slug).first()
+            is_ext = model_info and bool(model_info.is_external or model_info.api_base)
+            mr.status = ModelStage.DEPLOYING
+            mr.progress = 0
+            mr.progress_detail = "断点重试：重新下发测试任务..."
+            mr.stage_status = {
+                "deploying": StageStatus.RUNNING.value,
+                "validating": StageStatus.PENDING.value,
+                "gateway_testing": StageStatus.PENDING.value,
+                "perf_testing": StageStatus.PENDING.value,
+                "acc_testing": StageStatus.PENDING.value,
+                "reporting": StageStatus.PENDING.value
+            }
+            mr.started_at = datetime.utcnow()
+            mr.completed_at = None
+            db.query(GatewayResult).filter_by(model_run_id=mr.id).delete()
+            db.query(PerfResult).filter_by(model_run_id=mr.id).delete()
+            db.query(AccResult).filter_by(model_run_id=mr.id).delete()
+
+    db.commit()
+    _add_log(db, task_id, "INFO", None, f"========== 任务 #{task_id} 启动断点重试: 已重置 {reset_count} 个失败/跳过模型，保留已成功模型测试数据 ==========", "system")
     start_task(task_id)
     return task
 
@@ -278,6 +342,13 @@ def _execute_task_pipeline(task_id: int):
         for model_run in model_runs:
             try:
                 _check_pause(task_id)
+                # 断点续跑保护：如果该模型已成功完成且无失败记录，则直接跳过该模型
+                has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (model_run.stage_status or {}).values())
+                has_error_detail = any(kw in (model_run.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止"])
+                if model_run.status in (ModelStage.DONE.value, "done") and not has_failed_stage and not has_error_detail:
+                    _add_log(db, task_id, "INFO", model_run.model_slug, f"[{model_run.model_name}] 已测试成功 (断点跳过)", "system")
+                    continue
+
                 _add_log(db, task_id, "INFO", model_run.model_slug,
                          f"[{model_run.model_name}] 开始测试", "system")
                 run_model_pipeline(db, task_id, model_run, task.config,
@@ -292,10 +363,25 @@ def _execute_task_pipeline(task_id: int):
                 model_run.completed_at = datetime.utcnow()
                 db.commit()
 
-        task.status = TaskStatus.COMPLETED
-        task.completed_at = datetime.utcnow()
-        db.commit()
-        _add_log(db, task_id, "INFO", None, "全部模型测试完成", "system")
+        # 统计子模型执行结果，精准判定 Task 主任务最终状态 (防盲目覆盖 completed)
+        total_runs = len(model_runs)
+        failed_runs = 0
+        for mr in model_runs:
+            has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (mr.stage_status or {}).values())
+            has_error_detail = any(kw in (mr.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止", "拦截", "崩溃"])
+            if mr.status in (ModelStage.FAILED.value, "failed") or has_failed_stage or has_error_detail:
+                failed_runs += 1
+
+        if failed_runs > 0:
+            task.status = TaskStatus.FAILED
+            task.completed_at = datetime.utcnow()
+            db.commit()
+            _add_log(db, task_id, "WARNING", None, f"⚠️ 任务测试结束：共 {total_runs} 个模型，其中 {failed_runs} 个模型因环境/拦截原因未能完成测试，主任务标记为 [测试失败 (Failed)]", "system")
+        else:
+            task.status = TaskStatus.COMPLETED
+            task.completed_at = datetime.utcnow()
+            db.commit()
+            _add_log(db, task_id, "INFO", None, f"✅ 全部 {total_runs} 个模型测试顺利完成 [COMPLETED]", "system")
     finally:
         db.close()
         _running_tasks.pop(task_id, None)

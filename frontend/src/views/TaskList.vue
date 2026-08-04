@@ -22,7 +22,15 @@
           <el-icon><VideoPlay /></el-icon> 继续任务
         </el-button>
         <el-button v-if="singleSelected && ['failed', 'completed', 'cancelled', 'paused'].includes(singleSelected?.status)" type="primary" plain @click="handleAction('rerun')">
-          <el-icon><RefreshRight /></el-icon> 🔁 重新运行任务
+          <el-icon><RefreshRight /></el-icon> 重新运行任务
+        </el-button>
+        <el-button
+          v-if="singleSelected && ['failed', 'completed', 'cancelled', 'paused'].includes(singleSelected?.status) && singleSelectedHasFailed"
+          type="warning"
+          plain
+          @click="handleRetryFailed"
+        >
+          <el-icon><RefreshLeft /></el-icon> 重试失败子任务
         </el-button>
         <el-button
           v-if="selectedTasks.length > 0"
@@ -281,8 +289,29 @@ const handleAction = async (action) => {
   try {
     await apiTaskAction(singleSelected.value.id, action)
     await loadTasks()
-    ElMessage.success('操作成功')
+    ElMessage.success('操作执行成功')
   } catch (e) { ElMessage.error('操作失败') }
+}
+
+const singleSelectedHasFailed = computed(() => {
+  return singleSelected.value?.has_failed_runs === true
+})
+
+const handleRetryFailed = async () => {
+  if (!singleSelected.value) return
+  try {
+    await ElMessageBox.confirm(
+      '仅重试失败/跳过的子任务，已成功模型的测试数据将被保留，是否继续？',
+      '重试失败子任务',
+      { confirmButtonText: '确认重试', cancelButtonText: '取消', type: 'warning' }
+    )
+    await apiTaskAction(singleSelected.value.id, 'retry_failed')
+    await loadTasks()
+    ElMessage.success('已触发断点重试，失败子任务正在重新执行。')
+  } catch (e) {
+    if (e === 'cancel') return
+    ElMessage.error('重试失败子任务操作失败')
+  }
 }
 
 const confirmDeleteSelectedTasks = () => {

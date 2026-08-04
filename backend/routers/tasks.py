@@ -110,6 +110,9 @@ def api_task_action(
     elif action.action in ("rerun", "restart"):
         from backend.services.task_manager import restart_task
         restart_task(db, task_id)
+    elif action.action == "retry_failed":
+        from backend.services.task_manager import retry_failed_task
+        retry_failed_task(db, task_id)
     else:
         raise HTTPException(400, f"未知操作: {action.action}")
 
@@ -185,8 +188,9 @@ def api_get_logs(
         query = query.where(TaskLog.model_slug == model_slug)
 
     if after_id is not None and after_id > 0:
-        max_id = db.execute(select(func.max(TaskLog.id)).where(TaskLog.task_id == task_id)).scalar() or 0
-        if after_id <= max_id:
+        min_id = db.execute(select(func.min(TaskLog.id)).where(TaskLog.task_id == task_id)).scalar()
+        max_id = db.execute(select(func.max(TaskLog.id)).where(TaskLog.task_id == task_id)).scalar()
+        if min_id is not None and min_id <= after_id <= max_id:
             query = query.where(TaskLog.id > after_id).order_by(asc(TaskLog.id)).limit(limit)
             return db.execute(query).scalars().all()
 
@@ -235,6 +239,18 @@ def _task_to_out(t: Task) -> TaskOut:
         elif ext_runs:
             device_name = f"{ext_runs[0].device_name} 等"
 
+    # 计算是否存在失败/跳过子任务（用于前端"重试失败子任务"按钮显示逻辑）
+    def _mr_is_failed(mr):
+        if _get_status_str(mr.status) == "failed":
+            return True
+        stage_vals = list((mr.stage_status or {}).values())
+        if any(v in ("failed",) for v in stage_vals):
+            return True
+        detail = mr.progress_detail or ""
+        return any(kw in detail for kw in ["跳过", "超时", "失败", "终止"])
+
+    has_failed = any(_mr_is_failed(mr) for mr in model_runs)
+
     return TaskOut(
         id=t.id, name=t.name, status=status_str, profile=t.profile,
         user_id=t.user_id, username=t.user.username if t.user else None,
@@ -242,6 +258,7 @@ def _task_to_out(t: Task) -> TaskOut:
         config=t.config, created_at=t.created_at, scheduled_at=t.scheduled_at,
         started_at=t.started_at, completed_at=t.completed_at,
         model_count=len(model_runs), completed_count=completed,
+        has_failed_runs=has_failed,
     )
 
 

@@ -704,7 +704,7 @@ def api_import_tos_selected(data: ImportTOSSelectedRequest, db: Session = Depend
                 f"sudo docker run -it --rm --runtime=nvidia --network host "
                 f"-e MODEL_OSS=True -e MODEL_ROOT=/models -e ENGINE_URI={tos_uri} "
                 f"-e MODEL_NAME={clean_name} -v ~/models:/models "
-                f"aoni/nvidia-ai-iot/vllm:latest-jetson-thor vllm serve {clean_name} "
+                f"aoni/vllm/vllm-openai:nightly-aarch64 vllm serve {clean_name} "
                 f"--port 8300 --max-model-len 4096 --gpu-memory-utilization 0.8"
             )
 

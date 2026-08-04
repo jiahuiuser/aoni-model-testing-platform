@@ -19,6 +19,14 @@
       >
         <el-icon><RefreshRight /></el-icon> 重新运行任务
       </el-button>
+      <el-button
+        v-if="task && ['failed', 'completed', 'cancelled', 'paused'].includes(task.status) && hasFailedRuns"
+        type="warning"
+        size="small"
+        @click="handleRetryFailed"
+      >
+        <el-icon><RefreshLeft /></el-icon> 重试失败子任务
+      </el-button>
     </div>
 
     <!-- 顶部大 Tab 区分配置与日志 -->
@@ -236,7 +244,7 @@ import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { apiGetTask, apiGetTaskLogs, apiTaskAction } from '../api'
 import { formatTime } from '../utils/format'
-import { ElMessage } from 'element-plus'
+import { ElMessage, ElMessageBox } from 'element-plus'
 
 const route = useRoute()
 const taskId = computed(() => route.params.id)
@@ -413,11 +421,40 @@ const handleRerunTask = async () => {
   if (!task.value) return
   try {
     await apiTaskAction(task.value.id, 'rerun')
-    ElMessage.success('已重置并重新下发测试任务！')
+    ElMessage.success('已全量重置并重新下发测试任务。')
     await loadTask()
     startPolling()
   } catch (e) {
     ElMessage.error('重新运行任务失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+const hasFailedRuns = computed(() => {
+  if (!modelRuns.value) return false
+  return modelRuns.value.some(mr => {
+    if (mr.status === 'failed') return true
+    const stageVals = Object.values(mr.stage_status || {})
+    if (stageVals.some(v => v === 'failed')) return true
+    const detail = mr.progress_detail || ''
+    return ['跳过', '超时', '失败', '终止'].some(kw => detail.includes(kw))
+  })
+})
+
+const handleRetryFailed = async () => {
+  if (!task.value) return
+  try {
+    await ElMessageBox.confirm(
+      '仅重试失败/跳过的子任务，已成功模型的测试数据将被保留，是否继续？',
+      '重试失败子任务',
+      { confirmButtonText: '确认重试', cancelButtonText: '取消', type: 'warning' }
+    )
+    await apiTaskAction(task.value.id, 'retry_failed')
+    ElMessage.success('已触发断点重试，失败子任务正在重新执行。')
+    await loadTask()
+    startPolling()
+  } catch (e) {
+    if (e === 'cancel') return
+    ElMessage.error('重试失败子任务操作失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 
