@@ -62,7 +62,8 @@ export const apiCreateTask = (data) => api.post('/tasks', data).then(r => r.data
 export const apiUpdateTask = (id, data) => api.patch(`/tasks/${id}`, data).then(r => r.data)
 export const apiListTasks = () => api.get('/tasks').then(r => r.data)
 export const apiGetTask = (id) => api.get(`/tasks/${id}`).then(r => r.data)
-export const apiTaskAction = (id, action) => api.post(`/tasks/${id}/action`, { action }).then(r => r.data)
+export const apiTaskAction = (taskId, action) => api.post(`/tasks/${taskId}/action`, { action }).then(r => r.data)
+export const apiRetrySingleModelRun = (taskId, mrId) => api.post(`/tasks/${taskId}/model_runs/${mrId}/retry`).then(r => r.data)
 export const apiDeleteTask = (id) => api.delete(`/tasks/${id}`).then(r => r.data)
 export const apiGetTaskLogs = (id, model_slug, limit = 500, after_id = null) => {
   const params = { limit }

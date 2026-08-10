@@ -49,8 +49,7 @@ REMAINING_MODELS = [
     {
         "name": "llama-3-1-70b",
         "type": "hf_download",
-        "repo_id": "bartowski/Meta-Llama-3.1-70B-Instruct-GGUF",
-        "include": ["*Q4_K_M*"],
+        "repo_id": "neuralmagic/Meta-Llama-3.1-70B-Instruct-quantized.w4a16",
         "tos_key": "models/llama/llama-3-1-70b.tar.gz",
         "min_size_gb": 30.0,
     },

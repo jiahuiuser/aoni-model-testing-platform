@@ -277,7 +277,7 @@ def retry_failed_task(db: Session, task_id: int):
     reset_count = 0
     for mr in task.model_runs:
         has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (mr.stage_status or {}).values())
-        has_error_detail = any(kw in (mr.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止"])
+        has_error_detail = any(kw in (mr.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止", "0.0 tok/s"])
         is_failed = mr.status in (ModelStage.FAILED.value, "failed") or has_failed_stage or has_error_detail
 
         if is_failed:
@@ -288,7 +288,7 @@ def retry_failed_task(db: Session, task_id: int):
             mr.progress = 0
             mr.progress_detail = "断点重试：重新下发测试任务..."
             mr.stage_status = {
-                "deploying": StageStatus.RUNNING.value,
+                "deploying": StageStatus.PENDING.value,
                 "validating": StageStatus.PENDING.value,
                 "gateway_testing": StageStatus.PENDING.value,
                 "perf_testing": StageStatus.PENDING.value,
@@ -357,11 +357,26 @@ def _execute_task_pipeline(task_id: int):
                 _add_log(db, task_id, "INFO", model_run.model_slug, "任务已收到取消/中断指令，流水线终止", "system")
                 return
             except Exception as e:
-                _add_log(db, task_id, "ERROR", model_run.model_slug, f"异常: {str(e)}", "system")
-                model_run.status = ModelStage.DONE
+                import traceback
+                tb = traceback.format_exc()
+                _add_log(db, task_id, "ERROR", model_run.model_slug, f"流水线异常终止: {str(e)}", "system")
+                _add_log(db, task_id, "ERROR", model_run.model_slug, f"异常堆栈: {tb[:500]}", "system")
+                # 标记为 FAILED（原来错误地标记为 DONE）
+                model_run.status = ModelStage.FAILED.value
                 model_run.stage_status["acc_testing"] = StageStatus.FAILED.value
+                model_run.progress = 100
+                model_run.progress_detail = f"流水线异常终止: {str(e)[:100]}"
                 model_run.completed_at = datetime.utcnow()
                 db.commit()
+                # 清理容器，释放 GPU/内存，保证下一个模型能正常启动
+                try:
+                    from backend.services.executor import _stop_container
+                    from backend.services.runner import RemoteRunner
+                    _runner = RemoteRunner(model_run.task.device if model_run.task else None)
+                    _stop_container(_runner)
+                    _add_log(db, task_id, "INFO", model_run.model_slug, "异常后容器已清理，继续下一个模型", "system")
+                except Exception as cleanup_err:
+                    _add_log(db, task_id, "WARNING", model_run.model_slug, f"容器清理失败: {cleanup_err}", "system")
 
         # 统计子模型执行结果，精准判定 Task 主任务最终状态 (防盲目覆盖 completed)
         total_runs = len(model_runs)
@@ -385,6 +400,49 @@ def _execute_task_pipeline(task_id: int):
     finally:
         db.close()
         _running_tasks.pop(task_id, None)
+
+
+def retry_single_model_run(db: Session, task_id: int, mr_id: int):
+    """单独重试某一个子模型"""
+    from backend.models import GatewayResult, PerfResult, AccResult
+    mr = db.get(ModelRun, mr_id)
+    if not mr or mr.task_id != task_id:
+        raise ValueError("模型运行记录不存在")
+
+    task = db.get(Task, task_id)
+    if not task:
+        raise ValueError("任务不存在")
+
+    # 重置该 ModelRun 的状态
+    mr.status = ModelStage.DEPLOYING
+    mr.progress = 0
+    mr.progress_detail = "单模型重试：重新下发测试任务..."
+    mr.stage_status = {
+        "deploying": StageStatus.PENDING.value,
+        "validating": StageStatus.PENDING.value,
+        "gateway_testing": StageStatus.PENDING.value,
+        "perf_testing": StageStatus.PENDING.value,
+        "acc_testing": StageStatus.PENDING.value,
+        "reporting": StageStatus.PENDING.value
+    }
+    mr.started_at = datetime.utcnow()
+    mr.completed_at = None
+
+    db.query(GatewayResult).filter_by(model_run_id=mr.id).delete()
+    db.query(PerfResult).filter_by(model_run_id=mr.id).delete()
+    db.query(AccResult).filter_by(model_run_id=mr.id).delete()
+
+    task.status = TaskStatus.RUNNING
+    task.completed_at = None
+    db.commit()
+
+    _add_log(db, task_id, "INFO", mr.model_slug, f"========== 手动触发【单模型重试】: 正在重新下发 [{mr.model_name}] ==========", "system")
+
+    # 如果任务线程未在运行，拉起 start_task
+    if task_id not in _running_tasks:
+        start_task(task_id)
+
+    return mr
 
 
 def recover_running_tasks():

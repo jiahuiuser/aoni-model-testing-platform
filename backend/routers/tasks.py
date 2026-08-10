@@ -119,6 +119,26 @@ def api_task_action(
     return {"status": "ok", "action": action.action}
 
 
+@router.post("/{task_id}/model_runs/{mr_id}/retry")
+def api_retry_single_model_run(
+    task_id: int,
+    mr_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """单独重试任务中的某一个特定模型"""
+    from backend.services.task_manager import retry_single_model_run
+    task = db.get(Task, task_id)
+    if not task:
+        raise HTTPException(404, "任务不存在")
+    check_task_access(task, current_user)
+    try:
+        mr = retry_single_model_run(db, task_id, mr_id)
+        return {"status": "ok", "model_run_id": mr.id, "model_name": mr.model_name}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
 class TaskUpdate(BaseModel):
     name: Optional[str] = None
     profile: Optional[str] = None
@@ -303,3 +323,37 @@ def _task_to_detail(t: Task) -> TaskDetailOut:
         completed_at=basic.completed_at, model_count=basic.model_count,
         completed_count=basic.completed_count, model_runs=runs,
     )
+
+
+@router.get("/{task_id}/models/{model_slug}/container_logs")
+def get_model_container_logs(
+    task_id: int,
+    model_slug: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """读取指定模型的 500 行全量容器落盘 Dump 日志"""
+    import os
+    log_dir = "/home/sd1/Desktop/Aoni_Model_Testing_Platform/data/container_logs"
+    filepath = f"{log_dir}/task_{task_id}_{model_slug}.log"
+
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                content = f.read()
+            return {"logs": content, "source": "container_dump_file", "found": True}
+        except Exception:
+            pass
+
+    # 回退机制：去 task_logs 中抓取该 slug 对应的全部原生控制台 Log
+    logs = db.query(TaskLog).filter(
+        TaskLog.task_id == task_id,
+        (TaskLog.model_slug == model_slug) | (TaskLog.message.like(f"%{model_slug}%"))
+    ).order_by(TaskLog.id.asc()).all()
+
+    if logs:
+        content = f"=== Model: {model_slug} (Task #{task_id}) System Trace Logs ===\n\n"
+        content += "\n".join([f"[{l.created_at}] [{l.level}] [{l.module}] {l.message}" for l in logs])
+        return {"logs": content, "source": "database_logs", "found": True}
+
+    return {"logs": f"暂未捕获到模型 [{model_slug}] 的容器崩溃或输出日志", "source": "none", "found": False}

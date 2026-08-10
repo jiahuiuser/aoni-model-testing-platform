@@ -79,8 +79,14 @@ def download_with_huggingface(repo_id, local_dir, include=None, min_free_gb=100.
     from huggingface_hub import snapshot_download
 
     # 设置网络代理与磁盘缓存目录
-    os.environ["HTTP_PROXY"] = os.getenv("HTTP_PROXY", "http://127.0.0.1:7897")
-    os.environ["HTTPS_PROXY"] = os.getenv("HTTPS_PROXY", "http://127.0.0.1:7897")
+    if os.getenv("HF_ENDPOINT", "").find("hf-mirror") != -1:
+        os.environ.pop("HTTP_PROXY", None)
+        os.environ.pop("HTTPS_PROXY", None)
+        os.environ.pop("http_proxy", None)
+        os.environ.pop("https_proxy", None)
+    else:
+        os.environ["HTTP_PROXY"] = os.getenv("HTTP_PROXY", "http://127.0.0.1:7897")
+        os.environ["HTTPS_PROXY"] = os.getenv("HTTPS_PROXY", "http://127.0.0.1:7897")
     if os.getenv("HF_TOKEN"):
         os.environ["HF_TOKEN"] = os.getenv("HF_TOKEN")
     os.environ["HF_HOME"] = os.getenv("HF_HOME", "/home/sd1/models/.hf_cache")
@@ -94,6 +100,7 @@ def download_with_huggingface(repo_id, local_dir, include=None, min_free_gb=100.
     kwargs = dict(
         repo_id=repo_id,
         local_dir=local_dir,
+        max_workers=16,
     )
     if include:
         kwargs["allow_patterns"] = include

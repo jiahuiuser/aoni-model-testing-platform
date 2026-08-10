@@ -189,26 +189,134 @@ def _quote_arg(arg: str) -> str:
 #  容器管理
 # ============================================================
 
-def _stop_container(runner: RemoteRunner):
-    """停止并删除旧容器，并等候网络端口完全释放"""
-    # 先检查容器是否存在
-    inspect = runner.run_docker(["inspect", CONTAINER_NAME], timeout=5)
-    if inspect.returncode != 0:
-        return  # 容器不存在
+def _get_gpu_free_mib(runner: RemoteRunner) -> float:
+    """获取系统可用内存 (MiB)。
+    Jetson Thor 为 CPU/GPU 统一内存架构，直接读 /proc/meminfo MemAvailable。
+    标准 PCIe GPU 优先用 nvidia-smi memory.free，不支持时回退到 /proc/meminfo。
+    """
+    # 优先尝试 nvidia-smi（标准独立 GPU）
+    try:
+        r = runner.run_shell(
+            "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>/dev/null",
+            timeout=5,
+        )
+        val = (r.stdout or "").strip().split("\n")[0].strip()
+        if val and val != "[N/A]" and val.lstrip("-").isdigit():
+            return float(val)
+    except Exception:
+        pass
 
-    runner.run_docker(["stop", "-t", "3", CONTAINER_NAME], timeout=5)
-    runner.run_docker(["rm", "-f", CONTAINER_NAME], timeout=5)
-    time.sleep(2)
+    # Jetson 统一内存：读 /proc/meminfo MemAvailable (单位 kB → MiB)
+    try:
+        r = runner.run_shell("grep MemAvailable /proc/meminfo", timeout=3)
+        line = (r.stdout or "").strip()
+        kb = int(line.split()[1])
+        return kb / 1024.0
+    except Exception:
+        pass
+
+    return 999999.0  # 无法获取时视为充足
+
+
+def _wait_gpu_free(runner: RemoteRunner, min_free_mib: float = 81920, max_wait: int = 120, log_callback=None):
+    """等待系统可用内存 >= min_free_mib (默认 80 GiB)，最多等 max_wait 秒。
+    vLLM 需要 0.6 × 122.82 GiB = 73.69 GiB，加 6 GiB 余量设为 80 GiB。
+    """
+    for elapsed in range(0, max_wait, 3):
+        free_mib = _get_gpu_free_mib(runner)
+        if free_mib >= min_free_mib:
+            if log_callback and elapsed > 0:
+                log_callback("INFO", "", f"  内存已回收：可用 {free_mib/1024:.1f} GiB，满足启动条件 (≥{min_free_mib/1024:.0f} GiB)", "container")
+            return True
+        if log_callback:
+            log_callback("INFO", "", f"  等待内存回收... 当前可用 {free_mib/1024:.1f} GiB / 需要 {min_free_mib/1024:.0f} GiB ({elapsed}s)", "container")
+        time.sleep(3)
+    free_mib = _get_gpu_free_mib(runner)
+    if log_callback:
+        log_callback("WARNING", "", f"  内存等待超时 ({max_wait}s)，当前可用 {free_mib/1024:.1f} GiB，强制继续", "container")
+    return False
+
+
+
+def _stop_container(runner: RemoteRunner, log_callback=None):
+    """停止并删除旧容器，强杀僵尸子进程，深度释放 GPU 显存与系统内存，等待 GPU 完全空闲"""
+    # 第 1 步：强制删除所有相关容器
+    runner.run_shell("sudo docker rm -f aoni_benchmark_runner test_eager test_vl_live debug_gemma27b_file 2>/dev/null || true", timeout=5)
+    runner.run_shell("sudo docker ps -a --filter name=test_ --filter name=debug_ -q | xargs -r sudo docker rm -f 2>/dev/null || true", timeout=5)
+
+    # 第 2 步：杀掉占用推理端口的进程
+    runner.run_shell("fuser -k 8300/tcp 2>/dev/null || true", timeout=3)
+
+    # 第 3 步：强制回收所有僵尸 CUDA 进程（排除 Xorg / gnome）
+    runner.run_shell(
+        "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null "
+        "| xargs -r -I{} sh -c 'kill -9 {} 2>/dev/null || true'",
+        timeout=5,
+    )
+
+    # 第 4 步：清理系统页缓存和 slab（优先通过免密特权容器或 sysctl 彻底释放）
+    try:
+        runner.run_shell("docker run --rm --privileged -v /proc/sys/vm:/host_vm alpine sh -c 'sync && echo 3 > /host_vm/drop_caches' 2>/dev/null || sudo sysctl -w vm.drop_caches=3 2>/dev/null || true", timeout=10)
+    except Exception:
+        pass
+
+    # 第 5 步：等待系统可用内存满足启动门槛（设为 32 GiB，当前 52 GiB 已完全足够）
+    _wait_gpu_free(runner, min_free_mib=32768, max_wait=30, log_callback=log_callback)
+
+
 
 
 def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callback) -> tuple[bool, str]:
     """启动容器并返回 (成功, container_id)"""
+    # 强制无条件清空同名冲突容器，确保 docker run 绝不报 Conflict 错
+    runner.run_shell(f"sudo docker rm -f {CONTAINER_NAME} 2>/dev/null || docker rm -f {CONTAINER_NAME} 2>/dev/null", timeout=5)
+    time.sleep(1)
+
     cmd = docker_cmd.strip()
     cmd = cmd.replace("&quot;", '"').replace("&amp;", "&")
     cmd = cmd.replace("\\\n", " ").replace("\\", " ")
     cmd = re.sub(r"\s+-([it]{1,2})\b", "", cmd)
     cmd = re.sub(r"\s+--rm\b", "", cmd)
+
+    # ── 本地模型优先策略 ────────────────────────────────────────────────────────
+    # 若本地 MODEL_ROOT/MODEL_NAME 目录已存在，直接使用本地权重，跳过 TOS 下载
+    _model_name_m = re.search(r"-e\s+MODEL_NAME=(\S+)", cmd)
+    _model_root_m = re.search(r"-e\s+MODEL_ROOT=(\S+)", cmd)
+    if _model_name_m and _model_root_m:
+        _model_name = _model_name_m.group(1)
+        _model_root_container = _model_root_m.group(1)  # 容器内路径, e.g. /models
+        # 找 volume 挂载：-v <host_path>:<container_root>
+        _vol_m = re.search(rf"-v\s+(\S+):{re.escape(_model_root_container)}", cmd)
+        _host_root = _vol_m.group(1) if _vol_m else None
+        if _host_root:
+            # 展开 ~
+            _host_root = os.path.expanduser(_host_root)
+            _local_model_path = os.path.join(_host_root, _model_name)
+            # 容器内的模型路径（挂载后）
+            _container_model_path = f"{_model_root_container}/{_model_name}"
+            if os.path.isdir(_local_model_path):
+                # 本地已有完整模型目录 → 强制禁用 TOS 下载
+                cmd = re.sub(r"-e\s+MODEL_OSS=\S+", "-e MODEL_OSS=False", cmd)
+                # 关键：vllm_monkey 在 MODEL_OSS=False 时不会自动传 --model 参数
+                # 必须在命令行里显式追加 --model <容器内路径>，否则 vLLM 使用默认模型
+                if "--model " not in cmd and "-m " not in cmd:
+                    # 在镜像名之后、其他 vllm 参数之前插入 --model
+                    cmd = re.sub(
+                        r"(aoni/vllm/vllm-openai:\S+)\s*",
+                        rf"\1 --model {_container_model_path} ",
+                        cmd,
+                        count=1,
+                    )
+                if log_callback:
+                    log_callback("INFO", "", f"  [本地优先] 检测到本地模型: {_local_model_path}，已跳过 TOS 下载 (MODEL_OSS=False, --model {_container_model_path})", "container")
+            else:
+                if log_callback:
+                    log_callback("INFO", "", f"  [TOS 下载] 本地路径 {_local_model_path} 不存在，将从 TOS 拉取模型权重", "container")
+    # ───────────────────────────────────────────────────────────────────────────
+
+
     if os.path.exists("/models/python_packages"):
+
         if "-v /models/python_packages" not in cmd and "-v /models:" not in cmd:
             cmd = re.sub(r"(docker run\b)", r"\1 -v /models/python_packages:/models/python_packages", cmd, count=1)
         if "-e PYTHONPATH=" not in cmd:
@@ -216,19 +324,44 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
         if "-e PIP_FIND_LINKS=" not in cmd:
             cmd = re.sub(r"(docker run\b)", r"\1 -e PIP_FIND_LINKS=file:///models/python_packages -e PIP_NO_INDEX=1", cmd, count=1)
 
+    if "-e VLLM_USE_V1=" not in cmd:
+        cmd = re.sub(r"(docker run\b)", r"\1 -e VLLM_USE_V1=0", cmd, count=1)
+
+    is_llama_cpp = "llama_cpp" in cmd or "llama-cpp" in cmd
     if runner.is_remote:
         cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "sudo docker run", cmd)
         cmd = re.sub(r"\s+-d\b", "", cmd)
+        cmd = re.sub(r"\s+-it\b", "", cmd)
+        cmd = re.sub(r"\s+--rm\b", "", cmd)
         cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
         cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
+        if is_llama_cpp:
+            cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+        else:
+            cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
+        # 清除重复的 --shm-size，然后统一追加一个
+        cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
+        cmd = re.sub(r"(sudo docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
     else:
         cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "docker run", cmd)
         cmd = re.sub(r"\s+-d\b", "", cmd)
+        cmd = re.sub(r"\s+-it\b", "", cmd)
+        cmd = re.sub(r"\s+--rm\b", "", cmd)
         cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
         cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
+        if is_llama_cpp:
+            cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+        else:
+            cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
+        # 清除重复的 --shm-size，然后统一追加一个
+        cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
+        cmd = re.sub(r"(docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
     cmd = re.sub(r"--port\s+\d+", f"--port {port}", cmd)
+    if not is_llama_cpp:
+        if "--trust-remote-code" not in cmd:
+            cmd += " --trust-remote-code"
+        if ("-vl-" in cmd.lower() or "gemma-3" in cmd.lower() or "gemma-4" in cmd.lower()) and "--limit-mm-per-prompt" not in cmd:
+            cmd += ' --limit-mm-per-prompt \'{"image": 4}\''
     if "nightly-aarch64" in cmd:
         cmd = re.sub(r'(aoni/vllm/vllm-openai:nightly-aarch64\s+)vllm\s+serve(\s+[^-][^\s]*)?', r'\1', cmd)
 
@@ -240,39 +373,56 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
         cid = res.stdout.strip()
         if res.returncode == 0:
             log_callback("INFO", "", f"  容器启动成功, ID: {cid[:12]}", "container")
-            # 抓取容器详细 Stdout/Stderr 日志推送为 DEBUG 级别 (供高档全量日志模式使用)
             time.sleep(2)
             init_logs = runner.run_docker(["logs", "--tail", "30", CONTAINER_NAME], timeout=10)
             if init_logs.stdout:
                 for line in init_logs.stdout.strip().split("\n"):
                     if line.strip():
-                        log_callback("DEBUG", "", f"  [Container Out] {line.strip()[:300]}", "container")
-            if init_logs.stderr:
-                for line in init_logs.stderr.strip().split("\n"):
-                    if line.strip():
-                        log_callback("DEBUG", "", f"  [Container Err] {line.strip()[:300]}", "container")
+                        log_callback("DEBUG", "", f"   [Container Log] {line.strip()[:200]}", "container")
             return True, cid
         else:
-            log_callback("WARNING", "", f"  容器启动提示: {res.stderr[:200] if res.stderr else '镜像未预载或未在宿主直接运行'}", "container")
-            log_callback("INFO", "", "  已自动启用直连推理引擎评估模式，流水线继续进行", "container")
-            return True, "native_container_eval"
+            err_msg = (res.stderr or res.stdout or "").strip()
+            log_callback("ERROR", "", f"❌ 容器启动失败 (docker run returncode={res.returncode}): {err_msg[:300]}", "container")
+            return False, ""
     except Exception as e:
-        log_callback("WARNING", "", f"  容器命令执行提示: {e}", "container")
-        log_callback("INFO", "", "  已自动启用直连推理引擎评估模式，流水线继续进行", "container")
-        return True, "native_container_eval"
+        log_callback("ERROR", "", f"❌ 容器启动异常: {e}", "container")
+        return False, ""
 
 
-def _wait_for_vllm(runner: RemoteRunner, port: int, timeout: int = 60, log_callback=None) -> bool:
+def _save_container_logs_to_file(runner: RemoteRunner, task_id: int, model_slug: str):
+    """把未成功/失败模型的完整 Docker 容器 Output 倾倒保存到独立 log 文件中"""
+    log_dir = "/home/sd1/Desktop/Aoni_Model_Testing_Platform/data/container_logs"
+    try:
+        os.makedirs(log_dir, exist_ok=True)
+        filename = f"{log_dir}/task_{task_id}_{model_slug}.log"
+        logs_res = runner.run_docker(["logs", "--tail", "500", CONTAINER_NAME], timeout=5)
+        content = (logs_res.stderr or "") + "\n" + (logs_res.stdout or "")
+        with open(filename, "w", encoding="utf-8") as f:
+            f.write(f"=== Model: {model_slug} (Task #{task_id}) Container Full Dump Logs ===\n")
+            f.write(content)
+    except Exception:
+        pass
+
+
+def _wait_for_vllm(runner: RemoteRunner, port: int, timeout: int = 60, log_callback=None, task_id: int = 0) -> bool:
     """轮询等待 vLLM 服务就绪（带 180s TOS 网络超时快速跳过与实时日志增强）"""
     import requests
     url = f"http://{runner.api_host}:{port}/v1/models"
-    deadline = time.time() + (timeout if timeout and timeout > 0 else 1800)
+    # 给大型模型（如 Llama 3.1 8B / 30B / 多模态）至少保留 300 秒的权重加载与 CUDA 图捕获窗口
+    actual_timeout = max(timeout if timeout and timeout > 0 else 1800, 300)
+    deadline = time.time() + actual_timeout
     start_time = time.time()
     attempt = 0
     tos_error_count = 0
+    seen_log_lines = set()
 
     while time.time() < deadline:
         attempt += 1
+        from backend.services.task_manager import _cancel_flags
+        if task_id and _cancel_flags.get(task_id, False):
+            if log_callback:
+                log_callback("WARNING", "", "检测到任务已重新下发/取消，旧服务轮询线程安全终止退出", "vllm")
+            return False
         try:
             r = requests.get(url, timeout=3)
             if r.status_code == 200:
@@ -304,24 +454,39 @@ def _wait_for_vllm(runner: RemoteRunner, port: int, timeout: int = 60, log_callb
                 elapsed = int(time.time() - start_time)
 
                 if status in ("exited", "dead"):
-                    err_logs = runner.run_docker(["logs", "--tail", "15", CONTAINER_NAME], timeout=5)
-                    log_callback("ERROR", "", f"❌ 测试容器意外退出 (Status: {status})！最后容器输出:", "vllm")
+                    _save_container_logs_to_file(runner, task_id, getattr(runner, "current_model_slug", "unknown"))
+                    err_logs = runner.run_docker(["logs", "--tail", "100", CONTAINER_NAME], timeout=5)
+                    log_callback("ERROR", "", f"❌ 测试容器意外退出 (Status: {status})！完整容器 Log 已自动转存至 data/container_logs/，控制台摘要如下:", "vllm")
                     if err_logs.stdout or err_logs.stderr:
-                        for line in (err_logs.stderr or err_logs.stdout).strip().split("\n")[-10:]:
+                        full_err = (err_logs.stderr or "") + "\n" + (err_logs.stdout or "")
+                        for line in full_err.strip().split("\n"):
                             if line.strip():
-                                log_callback("ERROR", "", f"   [Container Log] {line.strip()[:250]}", "vllm")
+                                log_callback("ERROR", "", f"   [Container Log] {line.strip()}", "vllm")
                     return False
                 elif status not in ("running", "created"):
                     log_callback("WARNING", "", f"  容器状态: {status}，放弃等待服务初始化", "vllm")
                     return False
 
-                # 提取容器最新日志判断 TOS 下载与解压状态
-                clogs = runner.run_docker(["logs", "--tail", "15", CONTAINER_NAME], timeout=3)
-                log_text = (clogs.stdout or "") + (clogs.stderr or "")
+                # 提取容器全量最新日志，增量流式推送全新 Log 行
+                clogs = runner.run_docker(["logs", "--tail", "100", CONTAINER_NAME], timeout=3)
+                log_text = (clogs.stdout or "") + "\n" + (clogs.stderr or "")
+
+                # 过滤出全新的、未展示过的 log 行，流式推送到前端控制台
+                all_lines = [l.strip() for l in log_text.strip().split("\n") if l.strip()]
+                new_lines = [l for l in all_lines if l not in seen_log_lines]
+                if new_lines:
+                    for line in new_lines[-5:]:
+                        seen_log_lines.add(line)
+                        log_callback("INFO", "", f"  [Live Log] {line}", "vllm")
 
                 # 动态提取日志中的下载/解压百分比
                 progress_match = re.search(r"(\d{1,3})%", log_text)
                 progress_str = f" 进度: {progress_match.group(1)}%" if progress_match else ""
+
+                if "TosServerError" in log_text or "tos.exceptions" in log_text:
+                    if log_callback:
+                        log_callback("ERROR", "", "❌ 远程 TOS 模型文件不存在/拉取失败 (TosServerError)，自动跳过该模型", "vllm")
+                    return False
 
                 if "SSLError" in log_text or "Max retries exceeded" in log_text or "request timeout" in log_text:
                     tos_error_count += 1
@@ -395,15 +560,10 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
             return
         log_callback("INFO", model_slug, f"磁盘空间检测通过：目标节点可用空间 {avail_disk_gb:.1f} GB (≥ 100 GB)", "container")
 
-        log_callback("INFO", model_slug, "正在清理旧容器...", "container")
-        _stop_container(runner)
-        log_callback("INFO", model_slug, "释放系统缓存...", "container")
-        try:
-            runner.run_shell("sudo sysctl -w vm.drop_caches=3", timeout=5)
-        except Exception:
-            pass
-        time.sleep(2)
+        log_callback("INFO", model_slug, "正在清理旧容器并等待 GPU 显存回收...", "container")
+        _stop_container(runner, log_callback=log_callback)
 
+        runner.current_model_slug = model_slug
         ok, container_id = _start_container(runner, docker_cmd, port, log_callback)
         if not ok:
             log_callback("ERROR", model_slug, "容器启动失败，测试终止", "container")
@@ -445,7 +605,8 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         # Stage 2: 等待 vLLM
         log_callback("INFO", model_slug, "========== vLLM 服务启动 ==========", "vllm")
         log_callback("INFO", model_slug, f"轮询 {runner.api_host}:{port} 等待推理服务就绪...", "vllm")
-        if not _wait_for_vllm(runner, port, config.get("container_startup_timeout", 7200), log_callback):
+        if not _wait_for_vllm(runner, port, config.get("container_startup_timeout", 7200), log_callback, task_id=task_id):
+            _save_container_logs_to_file(runner, task_id, model_slug)
             log_callback("ERROR", model_slug, "vLLM 启动超时，测试终止", "vllm")
             model_run.stage_status["validating"] = StageStatus.FAILED.value
             model_run.stage_status["gateway_testing"] = StageStatus.SKIPPED.value
@@ -454,10 +615,21 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
             model_run.stage_status["reporting"] = StageStatus.SKIPPED.value
             model_run.status = ModelStage.FAILED.value
             model_run.progress = 100
-            model_run.progress_detail = "缺少本地权重文件/在线拉取超时，已自动安全跳过"
+            
+            # 尝试提取容器最后的输出诊断最真实的原因
+            clogs = runner.run_docker(["logs", "--tail", "20", f"aoni_benchmark_runner_t{task_id}_mr{model_run.id}"], timeout=3)
+            log_txt = (clogs.stdout or "") + (clogs.stderr or "")
+            if "out of memory" in log_txt.lower() or "oom" in log_txt.lower():
+                detail_reason = "硬件显存不足 (CUDA Out of Memory)，请使用更小规模或量化版模型"
+            elif "repo id must be in the form" in log_txt.lower():
+                detail_reason = "模型加载路径格式校验报错，请核查容器配置"
+            else:
+                detail_reason = "推理服务 8300 端口未按时就绪 (详情见控制台日志)"
+
+            model_run.progress_detail = detail_reason
             model_run.completed_at = datetime.utcnow()
             db.commit()
-            _stop_container(runner)
+            _stop_container(runner, log_callback=log_callback)
             return
 
         model_run.stage_status["validating"] = StageStatus.COMPLETED.value
@@ -508,7 +680,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
     model_run.progress = 100
     model_run.completed_at = datetime.utcnow()
     db.commit()
-    _stop_container(runner)
+    _stop_container(runner, log_callback=log_callback)
     log_callback("INFO", model_slug, "========== 测试完成 ==========", "system")
 
 
@@ -554,6 +726,31 @@ def _get_model_api_config(db: Session, model_slug: str, runner: RemoteRunner, po
     }
 
 
+def _resolve_verified_model_id(api_cfg: dict, fallback_name: str, log_callback=None, slug: str = "") -> str:
+    """在下发网关与性能压测请求前，先连接 /v1/models 准确获取服务端真正注册的模型 ID"""
+    import requests
+    models_url = api_cfg.get("models_url", "")
+    api_key = api_cfg.get("api_key", "EMPTY")
+    headers = {}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    try:
+        r = requests.get(models_url, headers=headers, timeout=5)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict) and "data" in data and len(data["data"]) > 0:
+                served_id = data["data"][0].get("id")
+                if served_id:
+                    if log_callback:
+                        log_callback("INFO", slug, f"  [Model ID Guard] 服务端模型 ID 校验成功: '{served_id}'", "container")
+                    return served_id
+    except Exception as e:
+        if log_callback:
+            log_callback("WARNING", slug, f"  [Model ID Guard] 模型 ID 预检异常 ({e})，使用回退 ID: '{fallback_name}'", "container")
+    return fallback_name
+
+
 def _run_gateway_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
     """在目标推理节点或外部 API 上跑网关与协议兼容性测试"""
     from backend.services.gateway_validator import GatewayValidator
@@ -576,7 +773,9 @@ def _run_gateway_stage(db: Session, model_run: ModelRun, config: dict, log_callb
     if not protocols:
         log_callback("INFO", model_slug, "未勾选任何 API 校验协议，已自动跳过 API 协议规范校验阶段", "gateway")
         return
-    validator = GatewayValidator(base_url, api_cfg["model_name"], api_key=api_key)
+
+    verified_model_name = _resolve_verified_model_id(api_cfg, api_cfg["model_name"], log_callback, model_slug)
+    validator = GatewayValidator(base_url, verified_model_name, api_key=api_key)
     results = validator.run_all_checks(protocols=protocols, test_longctx=test_longctx, log_callback=log_callback)
 
     for item in results:
@@ -636,11 +835,12 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
     is_llama_cpp = "llama-server" in (model_run.docker_command or "") or "llama_cpp" in (model_run.docker_command or "")
 
     if is_external:
-        vllm_model_name = api_cfg["model_name"]
+        vllm_model_name = _resolve_verified_model_id(api_cfg, api_cfg["model_name"], log_callback, model_run.model_slug)
         use_fallback = True
     else:
         m = re.search(r"-e MODEL_NAME=([^ \n\\]+)", model_run.docker_command or "")
-        vllm_model_name = m.group(1).strip() if m else model_run.model_name
+        fallback_id = m.group(1).strip() if m else model_run.model_name
+        vllm_model_name = _resolve_verified_model_id(api_cfg, fallback_id, log_callback, model_run.model_slug)
         use_fallback = is_llama_cpp or not _check_vllm_bench(runner)
 
     # 预先计算并解析总压测项数
@@ -659,10 +859,15 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
         if not output_lens:
             output_lens = [128, 512]
 
-        # 动态上限保护：若配置的输入长度 + 输出长度超过模型 max_model_len * 0.85，自动动态调整 input_len
-        max_output_len = max(output_lens)
-        if input_len + max_output_len > max_model_len * 0.85:
-            input_len = max(128, int(max_model_len * 0.85 - max_output_len))
+        # 动态自适应剪裁：若用例 input_len 超过模型规格上限，自动收缩 input_len
+        if input_len >= max_model_len * 0.80:
+            input_len = max(128, int(max_model_len * 0.40))
+
+        # 计算该模型当前 input_len 下安全输出上限，并对用例做去重处理
+        safe_output_limit = max(64, int(max_model_len * 0.80 - input_len))
+        output_lens = sorted(list(set(min(out_l, safe_output_limit) for out_l in output_lens if out_l > 0)))
+        if not output_lens:
+            output_lens = [safe_output_limit]
 
         if concurrencies_str:
             try:
@@ -926,9 +1131,15 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
     if api_key and api_key != "EMPTY":
         headers["Authorization"] = f"Bearer {api_key}"
 
-    # 1. 快速检查端口连通性
+    # 1. 快速检查端口连通性，并动态尝试获取 vLLM 实际注册的服务模型名称
     try:
-        requests.get(ping_url, headers=headers, timeout=5)
+        resp = requests.get(ping_url, headers=headers, timeout=5)
+        if resp.status_code == 200:
+            m_data = resp.json()
+            if isinstance(m_data, dict) and "data" in m_data and len(m_data["data"]) > 0:
+                served_model_id = m_data["data"][0].get("id")
+                if served_model_id:
+                    model_name = served_model_id
     except Exception as ping_err:
         try:
             requests.options(url, headers=headers, timeout=5)
@@ -954,6 +1165,8 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
                    "max_tokens": output_len, "temperature": 0, "stream": True}
         try:
             r = requests.post(url, json=payload, headers=headers, timeout=30, stream=True)
+            if r.status_code != 200:
+                return {"success": False, "error_msg": f"HTTP {r.status_code}: {(r.text or '')[:120]}"}
             first_token_ts = None; token_count = 0; last_ts = t_start
             for line in r.iter_lines():
                 if not line: continue
@@ -966,8 +1179,8 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
             ttft = (first_token_ts - t_start) if first_token_ts else total
             tpot = ((last_ts - first_token_ts) / token_count) if first_token_ts and token_count > 0 else 0
             return {"ttft": ttft, "tpot": tpot, "output_tokens": token_count, "success": token_count > 0}
-        except Exception:
-            return {"success": False}
+        except Exception as err:
+            return {"success": False, "error_msg": str(err)}
 
     t0 = time.time()
     results = []
@@ -979,9 +1192,10 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
 
     successes = [r for r in results if r.get("success")]
     if not successes:
+        first_err = results[0].get("error_msg") if results else "未收到响应"
         return {
             "concurrency": concurrency,
-            "error": "目标模型 API 服务未正常响应，未采集到有效性能数据",
+            "error": f"目标模型 API 服务未正常响应: {first_err}",
             "request_throughput": 0.0,
             "output_throughput": 0.0,
             "mean_ttft_ms": 0.0,
@@ -1258,6 +1472,11 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     eval_env["HTTP_RETRIES"] = "10"
     eval_env["REQUESTS_MAX_RETRIES"] = "10"
     eval_env["HF_HUB_ENABLE_HF_TRANSFER"] = "0"
+
+    # 注入 BigCodeBench 代码安全执行与沙盒支持
+    eval_env["EVALSCOPE_ALLOW_CODE_EXECUTION"] = "true"
+    eval_env["EVALSCOPE_USE_SANDBOX"] = "true"
+    eval_env["BIGCODEBENCH_ALLOW_CODE_EXECUTION"] = "1"
 
     for key in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy"):
         if not eval_env.get(key):

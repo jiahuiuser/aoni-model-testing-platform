@@ -80,6 +80,29 @@
                 <div v-else style="color:#909399; font-size:12px;">等待执行...</div>
               </template>
             </el-table-column>
+            <el-table-column label="操作" width="220" align="center">
+              <template #default="{ row }">
+                <div style="display: flex; gap: 6px; justify-content: center;">
+                  <el-button 
+                    type="info" 
+                    size="small" 
+                    plain 
+                    @click="handleViewContainerLogs(row)"
+                  >
+                    📄 容器日志
+                  </el-button>
+                  <el-button 
+                    type="warning" 
+                    size="small" 
+                    plain 
+                    :disabled="task && task.status === 'running' && row.status === 'running'"
+                    @click="handleRetrySingleModel(row)"
+                  >
+                    重试
+                  </el-button>
+                </div>
+              </template>
+            </el-table-column>
           </el-table>
         </el-card>
 
@@ -235,6 +258,28 @@
           </el-descriptions>
         </div>
       </el-tab-pane>
+
+    <!-- 容器原生 500 行 Dump 日志弹窗 -->
+    <el-dialog
+      v-model="showContainerLogModal"
+      :title="`[容器原生 500 行 Dump 日志] ${currentLogModelName}`"
+      width="85%"
+      top="4vh"
+      destroy-on-close
+    >
+      <div style="background: #0f172a; color: #f8fafc; padding: 18px; border-radius: 8px; font-family: Monaco, Menlo, Consolas, 'Courier New', monospace; font-size: 13px; max-height: 65vh; overflow-y: auto; white-space: pre-wrap; word-break: break-all; line-height: 1.6; border: 1px solid #334155;">
+        {{ containerLogContent || '正在倾倒调取容器 Dump 日志...' }}
+      </div>
+      <template #footer>
+        <div style="display: flex; justify-content: space-between; align-items: center;">
+          <span style="font-size: 12px; color: #64748b;">日志存储来源: <b>{{ containerLogSource }}</b></span>
+          <div>
+            <el-button type="success" plain @click="copyContainerLogs">复制全部日志</el-button>
+            <el-button type="primary" @click="showContainerLogModal = false">关闭窗口</el-button>
+          </div>
+        </div>
+      </template>
+    </el-dialog>
     </el-tabs>
   </div>
 </template>
@@ -242,7 +287,8 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
-import { apiGetTask, apiGetTaskLogs, apiTaskAction } from '../api'
+import axios from 'axios'
+import { apiGetTask, apiGetTaskLogs, apiTaskAction, apiRetrySingleModelRun } from '../api'
 import { formatTime } from '../utils/format'
 import { ElMessage, ElMessageBox } from 'element-plus'
 
@@ -256,6 +302,33 @@ const mainTab = ref('execution')
 const logTab = ref('all')
 const logVerbosity = ref('medium') // 'low' | 'medium' | 'high'
 const isUserScrolledUp = ref(false)
+
+// 容器原生 Dump 日志弹窗状态
+const showContainerLogModal = ref(false)
+const containerLogContent = ref('')
+const containerLogSource = ref('')
+const currentLogModelName = ref('')
+
+const handleViewContainerLogs = async (mr) => {
+  currentLogModelName.value = mr.model_name || mr.model_slug
+  containerLogContent.value = '正在倾倒读取 500 行容器 Dump 日志...'
+  containerLogSource.value = '读取中...'
+  showContainerLogModal.value = true
+  try {
+    const res = await axios.get(`/api/tasks/${task.value.id}/models/${mr.model_slug}/container_logs`)
+    containerLogContent.value = res.data.logs
+    containerLogSource.value = res.data.source === 'container_dump_file' ? '容器 Dump 磁盘转存文件 (data/container_logs/)' : '系统全量日志流'
+  } catch (e) {
+    containerLogContent.value = '调取日志失败: ' + (e.response?.data?.detail || e.message)
+    containerLogSource.value = '读取异常'
+  }
+}
+
+const copyContainerLogs = () => {
+  if (!containerLogContent.value) return
+  navigator.clipboard.writeText(containerLogContent.value)
+  ElMessage.success('已将全量 500 行容器日志复制到剪贴板！')
+}
 
 const DATASET_SAMPLE_COUNTS = {
   mmlu: '14,042 题 (全量 57 子集)',
@@ -455,6 +528,24 @@ const handleRetryFailed = async () => {
   } catch (e) {
     if (e === 'cancel') return
     ElMessage.error('重试失败子任务操作失败: ' + (e.response?.data?.detail || e.message))
+  }
+}
+
+const handleRetrySingleModel = async (mr) => {
+  if (!task.value || !mr) return
+  try {
+    await ElMessageBox.confirm(
+      `确定要单独重置并重试模型 [${mr.model_name}] 吗？该模型的历史测试数据将被清理并重新下发。`,
+      '单模型重试',
+      { confirmButtonText: '确认重试', cancelButtonText: '取消', type: 'warning' }
+    )
+    await apiRetrySingleModelRun(task.value.id, mr.id)
+    ElMessage.success(`已单独触发 [${mr.model_name}] 的重新测试。`)
+    await loadTask()
+    startPolling()
+  } catch (e) {
+    if (e === 'cancel') return
+    ElMessage.error('重试此模型操作失败: ' + (e.response?.data?.detail || e.message))
   }
 }
 
