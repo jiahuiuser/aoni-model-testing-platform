@@ -105,6 +105,17 @@ class DeviceCreate(BaseModel):
     gpu_info: str | None = None
     gpu_count: int | None = None
     description: str = ""
+    # 便捷密码字段：填了会自动创建/复用 password 凭证并绑定
+    ssh_username: str | None = None
+    ssh_password: str | None = None
+    ssh_port: int = 22
+
+
+def _get_or_none(data, field: str):
+    """字段存在且非 None 时返回值，否则 None"""
+    if field in data.model_fields_set:
+        return getattr(data, field, None)
+    return None
 
 
 class DeviceUpdate(BaseModel):
@@ -119,6 +130,49 @@ class DeviceUpdate(BaseModel):
     gpu_info: str | None = None
     gpu_count: int | None = None
     description: str | None = None
+    # 便捷密码字段
+    ssh_username: str | None = None
+    ssh_password: str | None = None
+    ssh_port: int | None = None
+
+
+def _resolve_device_credential(db: Session, device: Device, data) -> None:
+    """若提供了 ssh_username/ssh_password，自动创建或复用 password 凭证并绑定到设备"""
+    ssh_username = getattr(data, "ssh_username", None)
+    ssh_password = getattr(data, "ssh_password", None)
+    ssh_port = getattr(data, "ssh_port", 22) or 22
+
+    if not ssh_username or not ssh_password:
+        return  # 未填密码则不处理
+
+    if device.credential and device.credential.type == "password":
+        # 复用/更新已有密码凭证
+        c = device.credential
+        c.ssh_username = ssh_username
+        c.ssh_port = ssh_port
+        c.password = ssh_password
+    else:
+        # 查找该 host 是否已有 password 凭证，否则新建
+        existing = db.execute(
+            select(Credential).where(
+                Credential.type == "password",
+                Credential.ssh_username == ssh_username,
+            )
+        ).scalars().first()
+        if existing:
+            c = existing
+        else:
+            c = Credential(
+                name=f"{ssh_username}@{device.host or 'device'}-自动",
+                type="password",
+                ssh_username=ssh_username,
+                ssh_port=ssh_port,
+                password=ssh_password,
+                description="设备表单自动创建的密码凭证",
+            )
+            db.add(c)
+            db.flush()
+    device.credential_id = c.id
 
 
 def _device_to_dict(d: Device) -> dict:
@@ -157,10 +211,17 @@ def api_get_device(device_id: int, db: Session = Depends(get_db)):
 
 @router.post("/devices")
 def api_create_device(data: DeviceCreate, db: Session = Depends(get_db)):
-    d = Device(**data.model_dump())
+    fields = data.model_dump()
+    # 排除便捷 SSH 字段（它们不落在 devices 表，单独处理为凭证）
+    for k in ("ssh_username", "ssh_password", "ssh_port"):
+        fields.pop(k, None)
+    d = Device(**fields)
     db.add(d)
     db.commit()
     db.refresh(d)
+    # 若填了密码，自动创建/复用凭证并绑定
+    _resolve_device_credential(db, d, data)
+    db.commit()
     # 重新加载关联
     d = db.execute(select(Device).options(joinedload(Device.credential)).where(Device.id == d.id)).unique().scalar()
     return _device_to_dict(d)
@@ -176,6 +237,21 @@ def api_update_device(device_id: int, data: DeviceUpdate, db: Session = Depends(
         val = getattr(data, field, None)
         if val is not None:
             setattr(d, field, val)
+    # 便捷密码字段：更新设备自身属性（若填了密码）
+    ssh_username = _get_or_none(data, "ssh_username")
+    ssh_password = _get_or_none(data, "ssh_password")
+    ssh_port = _get_or_none(data, "ssh_port")
+    # 更新到已绑定凭证或创建新凭证
+    if ssh_username is not None or ssh_password is not None:
+        # 构建一个伪 data 供 _resolve 使用（合并当前值 + 新值）
+        from types import SimpleNamespace
+        merged = SimpleNamespace(
+            ssh_username=ssh_username if ssh_username is not None else (d.credential.ssh_username if d.credential else None),
+            ssh_password=ssh_password,
+            ssh_port=ssh_port if ssh_port is not None else (d.credential.ssh_port if d.credential else 22),
+        )
+        if merged.ssh_username and merged.ssh_password:
+            _resolve_device_credential(db, d, merged)
     db.commit()
     d = db.execute(select(Device).options(joinedload(Device.credential)).where(Device.id == d.id)).unique().scalar()
     return _device_to_dict(d)
@@ -186,6 +262,13 @@ def api_delete_device(device_id: int, db: Session = Depends(get_db)):
     d = db.get(Device, device_id)
     if not d:
         raise HTTPException(404, "设备不存在")
+    # 显式清理该设备的模型-设备配置，避免删除后残留孤立的 PASS/FAIL 记录
+    from backend.models import ModelDeviceConfig, Task
+    db.execute(
+        ModelDeviceConfig.__table__.delete().where(ModelDeviceConfig.device_id == device_id)
+    )
+    # 解除指向该设备的任务/模型运行引用
+    db.execute(Task.__table__.update().where(Task.device_id == device_id).values(device_id=None))
     db.delete(d)
     db.commit()
     return {"status": "deleted"}
@@ -202,9 +285,9 @@ def _get_ssh_from_device(d: Device) -> dict | None:
         return {
             "username": c.ssh_username,
             "ssh_port": c.ssh_port or 22,
-            "type": c.type,
             "key_path": c.ssh_key_path,
             "password": c.password,
+            "type": c.type,
         }
     return None
 
@@ -403,7 +486,7 @@ def _update_device_info(d: Device, detail: dict, db: Session):
 
 @router.post("/devices/{device_id}/doctor")
 def api_doctor_device(device_id: int, db: Session = Depends(get_db)):
-    """一键诊断设备环境健康度 (Device Doctor)"""
+    """一键诊断设备环境健康度 (Device Doctor，融合资源快照采集)"""
     from backend.services.executor import RemoteRunner
     from backend.services.hardware import get_hardware_driver
 
@@ -504,11 +587,96 @@ def api_doctor_device(device_id: int, db: Session = Depends(get_db)):
     passed_count = sum(1 for it in items if it["ok"])
     score = int(passed_count / len(items) * 100)
 
+    # 融合资源快照采集 (复用健康检查逻辑，本机/远程通吃)
+    resource = _collect_resource_detail(d, runner)
+    _update_device_info(d, resource, db)
+
     return {
         "device_id": d.id,
         "device_name": d.name,
         "chip_name": driver.chip_name,
         "chip_type": chip_type,
         "score": score,
-        "items": items
+        "items": items,
+        "resource": resource
     }
+
+
+def _runner_run(runner, cmd: str, timeout: int = 10) -> str:
+    """通过 RemoteRunner 执行命令并返回 stdout"""
+    try:
+        res = runner.run_shell(cmd, timeout=timeout)
+        return (res.stdout or "").strip()
+    except Exception:
+        return ""
+
+
+def _collect_resource_detail(d: Device, runner) -> dict:
+    """采集设备资源快照 (SSH/Docker/GPU/内存/磁盘/CPU/vLLM/平台API)，兼容本机与远程"""
+    import requests as _requests
+    ssh_info = _get_ssh_from_device(d)
+    run = lambda cmd, t=10: _runner_run(runner, cmd, t)
+
+    detail = {
+        "ssh_ok": False, "docker_ok": False, "gpu_info": "", "gpu_count": 0,
+        "memory": {}, "disk": {}, "cpu_cores": 0, "vllm": "", "errors": [],
+    }
+
+    if not ssh_info:
+        detail["ssh_ok"] = True  # 本机
+        try:
+            r = _requests.get(f"http://{d.host}:{d.port}/api/health", timeout=5)
+            detail["platform_api"] = "ok" if r.status_code == 200 else f"HTTP {r.status_code}"
+        except Exception as e:
+            detail["platform_api"] = str(e)
+    else:
+        ssh_test = _ssh_run(ssh_info, d.host, "echo OK", 10)
+        if not ssh_test["ok"]:
+            detail["errors"].append(f"SSH连接失败: {ssh_test['stderr']}")
+        else:
+            detail["ssh_ok"] = True
+        try:
+            r = _requests.get(f"http://{d.host}:{d.port}/api/health", timeout=5)
+            detail["platform_api"] = "ok" if r.status_code == 200 else f"HTTP {r.status_code}"
+        except Exception as e:
+            detail["platform_api"] = str(e)
+
+    # Docker 容器列表
+    dock = run("docker ps --format '{{.Names}}' 2>/dev/null | head -10")
+    if dock:
+        detail["docker_ok"] = True
+        detail["docker_containers"] = [x for x in dock.split("\n") if x.strip()]
+
+    # GPU
+    gpu = run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null")
+    if gpu:
+        detail["gpu_info"] = gpu
+        detail["gpu_count"] = len([l for l in gpu.split("\n") if l.strip()])
+    else:
+        teg = run("cat /proc/device-tree/model 2>/dev/null; tegrastats --interval 100 --count 1 2>/dev/null | head -2", 15)
+        if teg:
+            detail["gpu_info"] = teg
+
+    # 内存
+    mem = run("LC_ALL=C free -h")
+    if mem:
+        detail["memory"] = _parse_free_output(mem)
+
+    # 磁盘
+    disk = run("LC_ALL=C df -h / | tail -1")
+    if disk:
+        parts = disk.split()
+        if len(parts) >= 5:
+            detail["disk"] = {"total": parts[1], "used": parts[2], "available": parts[3], "use_pct": parts[4]}
+
+    # CPU
+    cpu = run("nproc")
+    if cpu and cpu.isdigit():
+        detail["cpu_cores"] = int(cpu)
+
+    # vLLM 版本
+    vllm = run("pip show vllm 2>/dev/null | grep Version | awk '{print $2}'")
+    if vllm:
+        detail["vllm"] = vllm
+
+    return detail

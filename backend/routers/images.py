@@ -34,8 +34,8 @@ DEFAULT_IMAGES = [
     },
     {
         "name": "aoni vLLM Nightly aarch64/ARM64 引擎镜像",
-        "image_tag": "aoni/vllm/vllm-openai:nightly-aarch64",
-        "download_url": "http://10.10.250.214:5000/aoni/vllm/vllm-openai:nightly-aarch64",
+        "image_tag": "aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64",
+        "download_url": "aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64",
         "hardware_group": "NVIDIA_jetson_AGX_Thor",
         "status": "ready",
         "description": "针对 ARM64 / aarch64 架构发行的 aoni vLLM Nightly 版标准 OpenAI 评测引擎镜像",

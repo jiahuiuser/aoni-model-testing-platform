@@ -704,7 +704,7 @@ def api_import_tos_selected(data: ImportTOSSelectedRequest, db: Session = Depend
                 f"sudo docker run -it --rm --runtime=nvidia --network host "
                 f"-e MODEL_OSS=True -e MODEL_ROOT=/models -e ENGINE_URI={tos_uri} "
                 f"-e MODEL_NAME={clean_name} -v ~/models:/models "
-                f"aoni/vllm/vllm-openai:nightly-aarch64 vllm serve {clean_name} "
+                f"aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64 vllm serve {clean_name} "
                 f"--port 8300 --max-model-len 4096 --gpu-memory-utilization 0.8"
             )
 
@@ -815,7 +815,7 @@ def _build_test_command(original_cmd: str, is_remote: bool = False) -> str:
     cmd = re.sub(r"--port\s+\d+", f"--port {TEST_PORT}", cmd)
     cmd = re.sub(r"--gpu-memory-utilization\s+[\d.]+", "--gpu-memory-utilization 0.25", cmd)
     if "nightly-aarch64" in cmd:
-        cmd = re.sub(r'(aoni/vllm/vllm-openai:nightly-aarch64\s+)vllm\s+serve\s+\S+(?=\s|\\|$)', r'\1', cmd)
+        cmd = re.sub(r'(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:vllm-openai-nightly-aarch64|aoni/vllm/vllm-openai:nightly-aarch64)\s+vllm\s+serve\s+\S+(?=\s|\\|$)', r'\1', cmd)
     if "vllm" in cmd:
         # 清理 vllm serve 后面的多余位置参数 (如 /models/qwen/Qwen3-4B 或 Qwen/Qwen3-4B)，防止与 vllm_monkey 自动注入的 --model 参数发生冲突冲突
         cmd = re.sub(r'vllm\s+serve\s+([^-]\S*)', 'vllm serve', cmd)

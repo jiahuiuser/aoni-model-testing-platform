@@ -302,7 +302,7 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
                 if "--model " not in cmd and "-m " not in cmd:
                     # 在镜像名之后、其他 vllm 参数之前插入 --model
                     cmd = re.sub(
-                        r"(aoni/vllm/vllm-openai:\S+)\s*",
+                        r"(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:[^\s]+|aoni/vllm/vllm-openai:\S+)\s*",
                         rf"\1 --model {_container_model_path} ",
                         cmd,
                         count=1,
@@ -363,7 +363,7 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
         if ("-vl-" in cmd.lower() or "gemma-3" in cmd.lower() or "gemma-4" in cmd.lower()) and "--limit-mm-per-prompt" not in cmd:
             cmd += ' --limit-mm-per-prompt \'{"image": 4}\''
     if "nightly-aarch64" in cmd:
-        cmd = re.sub(r'(aoni/vllm/vllm-openai:nightly-aarch64\s+)vllm\s+serve(\s+[^-][^\s]*)?', r'\1', cmd)
+        cmd = re.sub(r'(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:vllm-openai-nightly-aarch64|aoni/vllm/vllm-openai:nightly-aarch64)\s+vllm\s+serve(\s+[^-][^\s]*)?', r'\1', cmd)
 
     short_cmd = cmd[:300] + "..." if len(cmd) > 300 else cmd
     log_callback("INFO", "", f"  [{runner.host_label}] docker run 命令: {short_cmd}", "container")

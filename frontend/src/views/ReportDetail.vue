@@ -13,12 +13,14 @@
             <el-button type="success" size="small" plain @click="exportCSV">
               <el-icon><Download /></el-icon> 导出 CSV 表格
             </el-button>
-            <el-button type="primary" size="small" plain @click="printReport">
-              <el-icon><Printer /></el-icon> 打印 / 导出 PDF 报告
+            <el-button type="primary" size="small" plain :loading="exportingPdf" @click="exportPdf">
+              <el-icon><Document /></el-icon> 导出 PDF 报告
             </el-button>
           </div>
         </div>
       </template>
+      <!-- 导出 PDF 的报告主体内容区域 -->
+      <div ref="reportBody">
       <!-- 权威评测物理环境与模型参数面板 -->
       <div class="env-metadata-box" style="margin-bottom:24px;">
         <el-descriptions title="测试环境与引擎配置" :column="3" border size="small">
@@ -157,6 +159,7 @@
         </el-table-column>
         <el-table-column prop="error" label="错误" />
       </el-table>
+      </div>
     </el-card>
   </div>
 </template>
@@ -164,6 +167,7 @@
 <script setup>
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
+import { ElMessage } from 'element-plus'
 import { apiGetReport } from '../api'
 import * as echarts from 'echarts'
 
@@ -374,6 +378,35 @@ const printReport = () => {
   setTimeout(() => {
     window.print()
   }, 300)
+}
+
+const reportBody = ref(null)
+const exportingPdf = ref(false)
+const exportPdf = async () => {
+  if (!reportBody.value) return
+  try {
+    exportingPdf.value = true
+    ElMessage.info("正在生成 PDF 报告，请稍候...")
+    // 等待图表重绘完成后再截图
+    await nextTick()
+    await new Promise(resolve => setTimeout(resolve, 600))
+    const { default: html2pdf } = await import('html2pdf.js')
+    const opt = {
+      margin: [10, 10, 10, 10],
+      filename: `AONI_Report_${report.value?.model_slug || 'model'}_${new Date().toISOString().slice(0, 10)}.pdf`,
+      image: { type: 'jpeg', quality: 0.98 },
+      html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
+      jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },
+      pagebreak: { mode: ['avoid-all', 'css', 'legacy'] }
+    }
+    await html2pdf().set(opt).from(reportBody.value).save()
+    ElMessage.success("PDF 报告已导出！")
+  } catch (e) {
+    console.error('PDF 导出失败', e)
+    ElMessage.error("PDF 导出失败，请重试")
+  } finally {
+    exportingPdf.value = false
+  }
 }
 
 onMounted(async () => {

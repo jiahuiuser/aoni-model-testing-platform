@@ -6,17 +6,11 @@
         <el-button type="primary" @click="showAddDialog">
           <el-icon><Plus /></el-icon> 添加设备
         </el-button>
-        <el-button type="success" plain :disabled="!selectedDevice" :loading="checking === selectedDevice?.id" @click="handleCheckSelected">
-          <el-icon><Refresh /></el-icon> 节点健康检查
-        </el-button>
-        <el-button type="warning" plain :disabled="!selectedDevice" :loading="doctorLoading" @click="handleRunDoctor">
-          <el-icon><FirstAidKit /></el-icon> 🩺 一键诊断 (Doctor)
+        <el-button type="success" plain :disabled="!selectedDevice" :loading="doctorLoading" @click="handleRunDoctor">
+          <el-icon><FirstAidKit /></el-icon> 🩺 节点诊断 (健康检查 + 环境体检)
         </el-button>
         <el-button type="info" plain :disabled="!selectedDevice" @click="openEditSelected">
           <el-icon><Edit /></el-icon> 编辑设备
-        </el-button>
-        <el-button @click="showCredDialog = true">
-          <el-icon><Key /></el-icon> 凭证管理
         </el-button>
         <el-button v-if="selectedDevice" type="danger" plain @click="confirmDeleteSelectedDevice">
           <el-icon><Delete /></el-icon> 删除设备
@@ -40,7 +34,7 @@
         class="hardware-card"
         :class="[dev.status, { selected: selectedDevice?.id === dev.id }]"
         @click="selectedDevice = dev"
-        @dblclick="handleCheckSelected"
+        @dblclick="handleRunDoctor"
       >
         <div class="card-header-bar">
           <div class="chip-avatar">
@@ -60,7 +54,6 @@
             </div>
             <div class="dev-host-row">
               <code>{{ dev.host }}</code>
-              <el-tag size="small" type="info" style="margin-left:6px">{{ dev.device_type.toUpperCase() }}</el-tag>
             </div>
           </div>
         </div>
@@ -96,7 +89,7 @@
             </div>
           </template>
           <div v-else class="empty-metric-tip">
-            未进行诊断，选择节点并点击“节点健康检查”
+            尚未诊断，点击「🩺 节点诊断」获取资源数据
           </div>
         </div>
       </div>
@@ -112,14 +105,13 @@
       border
       @selection-change="handleSelectionChange"
       @row-click="handleRowClick"
-      @row-dblclick="handleCheckSelected"
+      @row-dblclick="handleRunDoctor"
       class="custom-table"
     >
       <el-table-column type="selection" width="50" align="center" />
       <el-table-column prop="id" label="ID" width="55" align="center" />
       <el-table-column prop="name" label="设备名称" min-width="160" />
       <el-table-column prop="host" label="地址 (Host)" width="150" />
-      <el-table-column prop="device_type" label="类型" width="90" />
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
           <el-tag :type="row.status === 'online' ? 'success' : 'danger'" size="small">
@@ -148,43 +140,6 @@
       </el-table-column>
     </el-table>
 
-    <!-- 检测详情对话框 -->
-    <el-dialog v-model="detailVisible" title="节点诊断详情" width="650px">
-      <div v-if="currentDetail" class="check-detail">
-        <el-descriptions :column="2" border size="small">
-          <el-descriptions-item label="SSH 连接">
-            <el-tag :type="currentDetail.ssh_ok ? 'success' : 'danger'" size="small">
-              {{ currentDetail.ssh_ok ? '连通正常' : '连接失败' }}
-            </el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="Docker 引擎">
-            <el-tag :type="currentDetail.docker_ok ? 'success' : 'danger'" size="small">
-              {{ currentDetail.docker_ok ? '服务可用' : '服务异常' }}
-            </el-tag>
-          </el-descriptions-item>
-          <el-descriptions-item label="GPU 架构">
-            {{ currentDetail.gpu_info || '未检测到' }} ({{ currentDetail.gpu_count || 0 }}块)
-          </el-descriptions-item>
-          <el-descriptions-item label="vLLM 版本">
-            {{ currentDetail.vllm || '未安装' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="CPU 核心">
-            {{ currentDetail.cpu_cores || '-' }}
-          </el-descriptions-item>
-          <el-descriptions-item label="内存" :span="2">
-            <span v-if="currentDetail.memory?.total">
-              {{ currentDetail.memory.used }} / {{ currentDetail.memory.total }} (可用: {{ currentDetail.memory.available }})
-            </span>
-          </el-descriptions-item>
-          <el-descriptions-item label="磁盘" :span="2">
-            <span v-if="currentDetail.disk?.total">
-              {{ currentDetail.disk.used }} / {{ currentDetail.disk.total }} (已用: {{ currentDetail.disk.use_pct }})
-            </span>
-          </el-descriptions-item>
-        </el-descriptions>
-      </div>
-    </el-dialog>
-
     <!-- 添加/编辑设备对话框 -->
     <el-dialog v-model="dialogVisible" :title="editing ? '编辑设备' : '添加设备'" width="550px">
       <el-form :model="form" label-width="110px">
@@ -194,13 +149,6 @@
         <el-form-item label="IP/主机名">
           <el-input v-model="form.host" placeholder="192.168.1.16" />
         </el-form-item>
-        <el-form-item label="设备类型">
-          <el-select v-model="form.device_type">
-            <el-option label="Jetson" value="jetson" />
-            <el-option label="Server" value="server" />
-            <el-option label="Cloud" value="cloud" />
-          </el-select>
-        </el-form-item>
         <el-form-item label="算力芯片架构">
           <el-select v-model="form.chip_type" placeholder="选择硬件算力芯片架构" style="width:100%">
             <el-option label="NVIDIA Jetson AGX Thor (T5000)" value="nvidia_thor" />
@@ -209,18 +157,14 @@
             <el-option label="摩尔线程 MUSA (musa-smi)" value="mthreads_musa" />
           </el-select>
         </el-form-item>
-        <el-form-item label="vLLM 端口">
-          <el-input v-model.number="form.port" placeholder="8800" />
+        <el-form-item label="SSH 用户名">
+          <el-input v-model="form.ssh_username" placeholder="root 或 nv5000（留空=本机，无需登录）" />
         </el-form-item>
-        <el-form-item label="SSH 凭证">
-          <el-select v-model="form.credential_id" placeholder="选择凭证（留空=本机）" clearable style="width:100%">
-            <el-option v-for="c in credentials" :key="c.id" :label="`${c.name} (${c.type === 'ssh_key' ? '密钥' : '密码'})`" :value="c.id" />
-          </el-select>
+        <el-form-item label="SSH 密码">
+          <el-input v-model="form.ssh_password" type="password" show-password placeholder="设备登录密码（可选，留空则不保存凭证）" />
         </el-form-item>
-        <el-form-item label="部署/绑定镜像">
-          <el-select v-model="form.bound_image_id" placeholder="可选: 绑定平台内置/部署镜像版本" clearable style="width:100%">
-            <el-option v-for="img in dockerImages" :key="img.id" :label="`${img.name} (${img.image_tag})`" :value="img.id" />
-          </el-select>
+        <el-form-item label="SSH 端口">
+          <el-input v-model.number="form.ssh_port" placeholder="22 (默认)" />
         </el-form-item>
       </el-form>
       <template #footer>
@@ -242,6 +186,22 @@
               {{ doctorReport.score }}分
             </div>
             <div style="font-size: 12px; color: #6B7280;">环境健康度得分</div>
+          </div>
+        </div>
+
+        <!-- 融合资源快照概览 -->
+        <div v-if="doctorReport.resource" style="border:1px solid #E5E7EB;border-radius:6px;padding:12px;margin-bottom:12px;background:#F9FAFB;">
+          <div style="font-weight:700;font-size:14px;color:#1F2937;margin-bottom:10px;">📊 节点资源快照</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 16px;font-size:13px;color:#374151;">
+            <div><span style="color:#6B7280">SSH 连通:</span> <el-tag :type="doctorReport.resource.ssh_ok ? 'success' : 'danger'" size="small">{{ doctorReport.resource.ssh_ok ? '正常' : '失败' }}</el-tag></div>
+            <div><span style="color:#6B7280">Docker:</span> <el-tag :type="doctorReport.resource.docker_ok ? 'success' : 'danger'" size="small">{{ doctorReport.resource.docker_ok ? '可用' : '异常' }}</el-tag></div>
+            <div><span style="color:#6B7280">CPU 核数:</span> {{ doctorReport.resource.cpu_cores || '-' }}</div>
+            <div><span style="color:#6B7280">GPU:</span> {{ doctorReport.resource.gpu_count || '-' }}块</div>
+            <div v-if="doctorReport.resource.memory?.total"><span style="color:#6B7280">内存:</span> {{ doctorReport.resource.memory.used }} / {{ doctorReport.resource.memory.total }}</div>
+            <div v-if="doctorReport.resource.disk?.total"><span style="color:#6B7280">磁盘:</span> {{ doctorReport.resource.disk.used }} / {{ doctorReport.resource.disk.total }} ({{ doctorReport.resource.disk.use_pct }})</div>
+            <div v-if="doctorReport.resource.vllm"><span style="color:#6B7280">vLLM:</span> {{ doctorReport.resource.vllm }}</div>
+            <div v-if="doctorReport.resource.platform_api"><span style="color:#6B7280">平台API:</span> {{ doctorReport.resource.platform_api }}</div>
+            <div v-if="doctorReport.resource.gpu_info" style="grid-column:1/-1"><span style="color:#6B7280">GPU 明细:</span> {{ doctorReport.resource.gpu_info }}</div>
           </div>
         </div>
 
@@ -304,8 +264,8 @@
         </el-form-item>
         <el-form-item label="认证方式">
           <el-radio-group v-model="credForm.type">
-            <el-radio value="ssh_key">SSH 密钥</el-radio>
             <el-radio value="password">密码</el-radio>
+            <el-radio value="ssh_key">SSH 密钥</el-radio>
           </el-radio-group>
         </el-form-item>
         <el-form-item label="SSH 用户名">
@@ -364,16 +324,13 @@ const handleRowClick = (row) => {
 }
 
 const dialogVisible = ref(false)
-const detailVisible = ref(false)
 const showCredDialog = ref(false)
 const credFormVisible = ref(false)
 const editing = ref(null)
 const credEditing = ref(null)
-const checking = ref(null)
-const currentDetail = ref(null)
 
-const form = ref({ name: '', host: '', device_type: 'jetson', port: 8800, credential_id: null, description: '' })
-const credForm = ref({ name: '', type: 'ssh_key', ssh_username: '', ssh_port: 22, ssh_key_path: '', password: '', description: '' })
+const form = ref({ name: '', host: '', port: 8800, credential_id: null, ssh_username: '', ssh_password: '', ssh_port: 22, description: '' })
+const credForm = ref({ name: '', type: 'password', ssh_username: '', ssh_port: 22, ssh_key_path: '', password: '', description: '' })
 
 const memProgressColor = [
   { color: '#10B981', percentage: 60 },
@@ -416,27 +373,43 @@ const loadCredentials = async () => {
 
 const showAddDialog = () => {
   editing.value = null
-  form.value = { name: '', host: '', device_type: 'jetson', port: 8800, credential_id: null, description: '' }
+  form.value = { name: '', host: '', port: 8800, credential_id: null, ssh_username: '', ssh_password: '', ssh_port: 22, description: '' }
   dialogVisible.value = true
 }
 
 const openEditSelected = () => {
   if (!selectedDevice.value) return
   editing.value = selectedDevice.value.id
-  form.value = { ...selectedDevice.value }
+  const dev = { ...selectedDevice.value }
+  // 依据已绑定凭证 id 回填用户名/端口（密码不回显）
+  const cred = credentials.value.find(c => c.id === dev.credential_id)
+  dev.ssh_username = cred && cred.ssh_username ? cred.ssh_username : ''
+  dev.ssh_password = ''
+  dev.ssh_port = (cred && cred.ssh_port) ? cred.ssh_port : 22
+  form.value = dev
   dialogVisible.value = true
 }
 
 const handleSave = async () => {
   try {
+    let newId = null
     if (editing.value) {
       await axios.put(`/api/devices/${editing.value}`, form.value)
     } else {
-      await axios.post('/api/devices', form.value)
+      const res = await axios.post('/api/devices', form.value)
+      newId = res.data?.id
     }
     dialogVisible.value = false
     await loadDevices()
-    ElMessage.success('设备配置已成功保存')
+    // 新添加设备：选中并自动触发一次节点诊断，立即填充资源数据
+    if (newId) {
+      ElMessage.success('设备已添加，正在自动诊断节点...')
+      const dev = devices.value.find(x => x.id === newId)
+      if (dev) selectedDevice.value = dev
+      await handleRunDoctor()
+    } else {
+      ElMessage.success('设备配置已成功保存')
+    }
   } catch (e) { ElMessage.error('保存设备信息失败') }
 }
 
@@ -477,7 +450,8 @@ const handleRunDoctor = async () => {
     const res = await apiDoctorDevice(selectedDevice.value.id)
     doctorReport.value = res
     showDoctorDialog.value = true
-    ElMessage.success(`[${selectedDevice.value.name}] 一键健康诊断完成！得分: ${res.score}分`)
+    await loadDevices()
+    ElMessage.success(`[${selectedDevice.value.name}] 节点诊断完成！得分: ${res.score}分`)
   } catch (e) {
     ElMessage.error(`设备诊断执行异常: ${e.response?.data?.detail || e.message}`)
   } finally {
@@ -494,21 +468,6 @@ const copyCommand = (cmdText) => {
   })
 }
 
-const handleCheckSelected = async () => {
-  if (!selectedDevice.value) return
-  checking.value = selectedDevice.value.id
-  try {
-    await axios.post(`/api/devices/${selectedDevice.value.id}/check`)
-    await loadDevices()
-    if (selectedDevice.value && selectedDevice.value.last_check_detail) {
-      currentDetail.value = selectedDevice.value.last_check_detail
-      detailVisible.value = true
-    }
-    ElMessage.success(`设备 [${selectedDevice.value.name}] 诊断完成`)
-  } catch (e) { ElMessage.error('设备诊断失败') }
-  checking.value = null
-}
-
 // 凭证
 const showCredForm = (row) => {
   if (row) {
@@ -516,7 +475,7 @@ const showCredForm = (row) => {
     credForm.value = { ...row }
   } else {
     credEditing.value = null
-    credForm.value = { name: '', type: 'ssh_key', ssh_username: '', ssh_port: 22, ssh_key_path: '', password: '', description: '' }
+    credForm.value = { name: '', type: 'password', ssh_username: '', ssh_port: 22, ssh_key_path: '', password: '', description: '' }
   }
   credFormVisible.value = true
 }
@@ -540,16 +499,7 @@ const deleteCred = async (id) => {
 
 const dockerImages = ref([])
 
-const loadDockerImages = async () => {
-  try {
-    const res = await axios.get('/api/images')
-    dockerImages.value = res.data
-  } catch (e) {
-    console.error(e)
-  }
-}
-
-onMounted(() => { loadDevices(); loadCredentials(); loadDockerImages() })
+onMounted(() => { loadDevices(); loadCredentials() })
 </script>
 
 <style scoped>
