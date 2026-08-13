@@ -86,7 +86,9 @@ def _parse_docker_params(docker_cmd: str) -> dict:
         ctx_size = ctx.group(1) if ctx else ""
         ngl = re.search(r"-ngl\s+(\S+)", cmd)
         gpu_layers = ngl.group(1) if ngl else ""
-        max_len = ""
+        # llama.cpp 用 --max-model-len 或 -c 表达上下文长度
+        max_len_m = re.search(r"--max-model-len\s+(\S+)", cmd)
+        max_len = max_len_m.group(1) if max_len_m else (ctx_size or "")
     else:
         engine = "vLLM"
         model_path = re.search(r"--model\s+(\S+)", cmd)
