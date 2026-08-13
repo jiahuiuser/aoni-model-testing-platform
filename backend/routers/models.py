@@ -4,6 +4,7 @@
 import re
 import time
 import json
+import os
 import asyncio
 import logging
 from datetime import datetime
@@ -11,7 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from typing import Optional
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import select, func
 from sqlalchemy.orm import Session, joinedload
 
 from backend.database import get_db
@@ -71,6 +72,116 @@ class DeviceConfigUpdate(BaseModel):
     docker_command: str | None = None
 
 
+def _parse_docker_params(docker_cmd: str) -> dict:
+    """从 docker 命令中解析关键的部署参数信息"""
+    cmd = docker_cmd or ""
+    # 引擎类型
+    if "llama-server" in cmd or "llama_cpp" in cmd or "llama.cpp" in cmd:
+        engine = "llama.cpp (GGUF)"
+        model_path = re.search(r"-m\s+(\S+)", cmd)
+        model_path = model_path.group(1) if model_path else ""
+        port = re.search(r"--port\s+(\S+)", cmd)
+        port = port.group(1) if port else ""
+        ctx = re.search(r"-c\s+(\S+)", cmd)
+        ctx_size = ctx.group(1) if ctx else ""
+        ngl = re.search(r"-ngl\s+(\S+)", cmd)
+        gpu_layers = ngl.group(1) if ngl else ""
+        max_len = ""
+    else:
+        engine = "vLLM"
+        model_path = re.search(r"--model\s+(\S+)", cmd)
+        model_path = model_path.group(1) if model_path else ""
+        port = re.search(r"--port\s+(\S+)", cmd)
+        port = port.group(1) if port else "8300"
+        max_len = re.search(r"--max-model-len\s+(\S+)", cmd)
+        max_len = max_len.group(1) if max_len else ""
+        ctx_size = ""
+        gpu_layers = ""
+
+    util = re.search(r"--gpu-memory-utilization\s+([\d.]+)", cmd)
+    util = util.group(1) if util else "0.7"
+    model_oss = re.search(r"-e\s+MODEL_OSS=(\S+)", cmd)
+    model_oss = model_oss.group(1) if model_oss else ""
+    model_name_m = re.search(r"-e\s+MODEL_NAME=(\S+)", cmd)
+    model_name = model_name_m.group(1) if model_name_m else ""
+    engine_uri = re.search(r"-e\s+ENGINE_URI=(\S+)", cmd)
+    engine_uri = engine_uri.group(1) if engine_uri else ""
+    image_m = re.search(r"(ghcr\.io/[^\s]+|aoni-docker[^\s]+|aoni/vllm/vllm-openai:[^\s]+|vllm[^\s]*openai[^\s]*)", cmd)
+    image = image_m.group(1) if image_m else ""
+    # 量化/精度提示
+    quant = ""
+    upload = re.search(r"--quantized|w4a16|NVFP4|GGUF|Q4_K_M|Q8_0|IQ4", cmd, re.IGNORECASE)
+    if upload:
+        quant = upload.group(0)
+    # 多模态
+    mm = re.search(r"--limit-mm-per-prompt", cmd)
+    is_multimodal = bool(mm)
+    vol_m = re.search(r"-v\s+(\S+):/models", cmd)
+    host_root = os.path.expanduser(vol_m.group(1)) if vol_m else ""
+    return {
+        "engine": engine, "model_path": model_path, "port": port,
+        "max_model_len": max_len, "ctx_size": ctx_size, "gpu_layers": gpu_layers,
+        "gpu_memory_utilization": float(util) if _is_float(util) else util,
+        "model_oss": model_oss, "model_name": model_name, "engine_uri": engine_uri,
+        "image": image, "quantization": quant, "is_multimodal": is_multimodal,
+        "local_host_root": host_root,
+    }
+
+
+def _is_float(s) -> bool:
+    try:
+        float(s)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _load_local_model_config(docker_cmd: str) -> dict:
+    """根据 docker 命令推导本地模型目录，读取 config.json 获取模型配置"""
+    try:
+        params = _parse_docker_params(docker_cmd)
+        model_name = params.get("model_name")
+        host_root = params.get("local_host_root")
+        if not model_name or not host_root:
+            return {}
+        local_dir = os.path.join(host_root, model_name)
+        cfg_path = os.path.join(local_dir, "config.json")
+        if not os.path.isfile(cfg_path):
+            return {}
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        def g(*keys):
+            for k in keys:
+                if k in cfg and cfg[k] is not None:
+                    return cfg[k]
+            return None
+        # 部分 VLM/多模态模型把文本配置嵌套在 text_config 内
+        for nskey in ("text_config", "language_config", "llm_config"):
+            sub = cfg.get(nskey)
+            if isinstance(sub, dict) and not g("max_position_embeddings", "max_sequence_length", "n_positions", "hidden_size"):
+                cfg = {**cfg, **sub}
+                break
+        out = {
+            "max_model_len": g("max_position_embeddings", "max_sequence_length", "n_positions"),
+            "hidden_size": g("hidden_size", "d_model", "n_embd"),
+            "num_attention_heads": g("num_attention_heads", "n_head"),
+            "num_hidden_layers": g("num_hidden_layers", "n_layer"),
+            "num_key_value_heads": g("num_key_value_heads", "n_head_kv"),
+            "num_experts": g("num_local_experts", "num_experts"),
+            "num_local_experts": g("num_local_experts"),
+            "architectures": cfg.get("architectures", []),
+            "vocab_size": cfg.get("vocab_size"),
+            "model_type": cfg.get("model_type"),
+            "torch_dtype": cfg.get("torch_dtype"),
+            "sliding_window": g("sliding_window"),
+            "rope_scaling": cfg.get("rope_scaling"),
+            "_model_state_path": local_dir,
+        }
+        return out
+    except Exception:
+        return {}
+
+
 def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
     """模型转 dict，可选按 device_id 返回专属配置"""
     # 查找该设备的专属配置
@@ -81,6 +192,16 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
                 device_config = dc
                 break
 
+    docker_cmd = device_config.docker_command if device_config else (m.docker_command or "")
+    params = _parse_docker_params(docker_cmd)
+    local_cfg = _load_local_model_config(docker_cmd)
+    max_len = params.get("max_model_len") or local_cfg.get("max_model_len")
+    if max_len:
+        try:
+            max_len = int(float(max_len))
+        except (TypeError, ValueError):
+            pass
+
     return {
         "id": m.id,
         "idx": m.idx, "name": m.name, "slug": m.slug,
@@ -88,12 +209,25 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
         "size_category": m.size_category or "unknown",
         "status": device_config.status if device_config else m.status,
         "tos_path": m.tos_path or "",
-        "docker_command": device_config.docker_command if device_config else (m.docker_command or ""),
+        "docker_command": docker_cmd,
         "result_detail": device_config.result_detail if device_config else (m.result_detail or ""),
         "is_external": bool(m.is_external),
         "api_base": m.api_base or "",
         "api_key": m.api_key or "EMPTY",
         "model_endpoint_name": m.model_endpoint_name or "",
+        # 部署参数解析
+        "engine": params.get("engine"),
+        "docker_image": params.get("image"),
+        "model_path": params.get("model_path"),
+        "max_context_length": max_len,
+        "gpu_memory_utilization": params.get("gpu_memory_utilization"),
+        "quantization": params.get("quantization"),
+        "is_multimodal": params.get("is_multimodal"),
+        "docker_port": params.get("port"),
+        "model_oss": params.get("model_oss"),
+        "engine_uri": params.get("engine_uri"),
+        # 本地 config.json 详情
+        "model_config": local_cfg,
         "device_configs": [
             {
                 "id": dc.id,

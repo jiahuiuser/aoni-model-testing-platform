@@ -20,6 +20,56 @@ _running_tasks: dict[int, threading.Thread] = {}
 _pause_flags: dict[int, bool] = {}
 _cancel_flags: dict[int, bool] = {}
 
+# 设备级串行执行队列：记录每台设备当前正在运行的任务，以及等待队列
+_device_running: dict[int, int] = {}          # device_id -> running task_id
+_device_queue: dict[int, list[int]] = {}      # device_id -> [待执行 task_id 列表]
+_device_queue_lock = threading.Lock()
+
+
+def _device_of_task(task) -> int | None:
+    """返回任务绑定设备 id；外部 API 任务/无设备任务返回 None"""
+    if not task:
+        return None
+    if getattr(task, "device_id", None) is not None:
+        return task.device_id
+    # 兼容通过 config 指定 device（外部 API 通常无 device）
+    cfg = task.config or {}
+    if cfg.get("device_id") is not None:
+        return cfg["device_id"]
+    return None
+
+
+def _is_task_finished(task) -> bool:
+    """判断任务是否处于终态"""
+    try:
+        return task.status in (TaskStatus.COMPLETED, TaskStatus.FAILED, TaskStatus.CANCELLED)
+    except Exception:
+        return False
+
+
+def _schedule_next_for_device(device_id: int):
+    """设备当前任务结束后，启动同一设备的排队中的下一个任务（FIFO）"""
+    next_task_id = None
+    with _device_queue_lock:
+        q = _device_queue.get(device_id)
+        if q:
+            next_task_id = q.pop(0)
+        else:
+            _device_running.pop(device_id, None)  # 无排队任务，释放设备占用
+    if next_task_id is None:
+        return
+    # 校验排队任务状态后启动
+    with session_factory() as db:
+        t = db.get(Task, next_task_id)
+        if not t or t.status != TaskStatus.QUEUED:
+            # 该任务状态已非排队态（可能被删/取消），跳过继续取下一个
+            log.warning(f"排队任务 #{next_task_id} 状态非 QUEUED，跳过")
+            _schedule_next_for_device(device_id)
+            return
+        _add_log(db, next_task_id, "INFO", None,
+                 f"设备 #{device_id} 前一个任务已完成，本任务从排队态自动开始执行", "system")
+    start_task(next_task_id)
+
 
 def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) -> Task:
     """创建新任务"""
@@ -113,21 +163,47 @@ def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) ->
 
 
 def start_task(task_id: int):
-    """后台线程启动任务"""
+    """后台线程启动任务，并登记该任务对其设备的占用"""
     _pause_flags[task_id] = False
     _cancel_flags[task_id] = False
+    # 登记设备占用
+    try:
+        with session_factory() as db:
+            t = db.get(Task, task_id)
+            dev_id = _device_of_task(t)
+            if dev_id is not None:
+                with _device_queue_lock:
+                    _device_running[dev_id] = task_id
+    except Exception:
+        pass
     t = threading.Thread(target=_execute_task_pipeline, args=(task_id,), daemon=True)
     t.start()
     _running_tasks[task_id] = t
 
 
 def schedule_or_start_task(db: Session, task_id: int):
-    """支持定时下发逻辑 (对齐本地无时区时间进行精确秒级下发)"""
+    """支持定时下发逻辑，并在设备已忙时将其加入同一设备的串行执行队列排队等待"""
     task = db.get(Task, task_id)
     if not task:
         return
     # 前端传入的 scheduled_at 为本地无时区时间 (Naive Datetime)，此处必须使用 datetime.now() 进行比对计算
     now = datetime.now()
+    # ── 设备串行排队：若该设备已有任务在运行（且非定时等待中的任务），则本任务排队 ──
+    dev_id = _device_of_task(task)
+    if dev_id is not None:
+        with _device_queue_lock:
+            current = _device_running.get(dev_id)
+        # 只有当前设备确实有任务在真正执行时才排队（定时等待任务尚未 running）
+        if current is not None and current != task_id:
+            task.status = TaskStatus.QUEUED
+            db.commit()
+            with _device_queue_lock:
+                _device_queue.setdefault(dev_id, []).append(task_id)
+            _add_log(db, task_id, "INFO", None,
+                     f"设备 #{dev_id} 正在运行任务 #{current}，本任务加入设备串行队列排队等待（QUEUED）", "system")
+            log.info(f"任务 #{task_id} 排队：设备 #{dev_id} 忙 (任务 #{current})")
+            return
+
     if task.scheduled_at and task.scheduled_at > now:
         delay = (task.scheduled_at - now).total_seconds()
         task.status = TaskStatus.SCHEDULED
@@ -140,6 +216,15 @@ def schedule_or_start_task(db: Session, task_id: int):
             with session_factory() as db_inner:
                 t_inner = db_inner.get(Task, task_id)
                 if t_inner and t_inner.status in (TaskStatus.SCHEDULED, TaskStatus.QUEUED):
+                    dev = _device_of_task(t_inner)
+                    if dev is not None:
+                        with _device_queue_lock:
+                            cur = _device_running.get(dev)
+                        if cur is not None and cur != task_id:
+                            # 定时到了但设备仍忙 → 转排队
+                            _add_log(db_inner, task_id, "INFO", None,
+                                     f"设备 #{dev} 忙，定时任务转为等待队列", "system")
+                            return
                     start_task(task_id)
         t = threading.Thread(target=_delay_runner, daemon=True)
         t.start()
@@ -329,10 +414,12 @@ def _execute_task_pipeline(task_id: int):
     from backend.services.executor import run_model_pipeline
 
     db = session_factory()
+    this_device_id = None
     try:
         task = db.get(Task, task_id)
         if not task:
             return
+        this_device_id = _device_of_task(task)
         task.status = TaskStatus.RUNNING
         task.started_at = datetime.utcnow()
         db.commit()
@@ -400,6 +487,13 @@ def _execute_task_pipeline(task_id: int):
     finally:
         db.close()
         _running_tasks.pop(task_id, None)
+        # 释放设备占用并启动排队中的下一个任务
+        if this_device_id is not None:
+            with _device_queue_lock:
+                if _device_running.get(this_device_id) == task_id:
+                    if not _device_queue.get(this_device_id):
+                        _device_running.pop(this_device_id, None)
+            _schedule_next_for_device(this_device_id)
 
 
 def retry_single_model_run(db: Session, task_id: int, mr_id: int):
@@ -448,11 +542,18 @@ def retry_single_model_run(db: Session, task_id: int, mr_id: int):
 def recover_running_tasks():
     """后台服务启动或重启时自愈：扫描 DB 中处于 RUNNING 及 SCHEDULED/QUEUED 定时等待态任务并自动恢复运行线程"""
     with session_factory() as db:
+        # 清空旧的运行态占用，重新登记
+        _device_running.clear()
+        _device_queue.clear()
         # 1. 恢复运行态任务线程
         running_tasks = db.query(Task).filter(Task.status == TaskStatus.RUNNING).all()
         for t in running_tasks:
             if t.id not in _running_tasks:
                 start_task(t.id)
+            dev = _device_of_task(t)
+            if dev is not None:
+                with _device_queue_lock:
+                    _device_running.setdefault(dev, t.id)
 
         # 2. 恢复定时等待态/排队态任务线程 (若定时时间已到或即将到期，自动拉起下发)
         scheduled_tasks = db.query(Task).filter(

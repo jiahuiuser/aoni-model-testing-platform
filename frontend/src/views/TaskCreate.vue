@@ -200,6 +200,24 @@
                     </template>
                   </el-alert>
                 </div>
+
+                <!-- 已选模型配置查看 -->
+                <div v-if="selectedContainerModels.length > 0" class="selected-model-detail-box" style="margin-top: 12px">
+                  <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
+                    <span style="font-weight: 600; font-size: 13px; color: #1f2937">已选模型配置速览 ({{ selectedContainerModels.length }})</span>
+                    <span style="font-size: 12px; color: #6b7280">点击查看模型部署与上下文配置</span>
+                  </div>
+                  <div v-for="m in selectedContainerModels" :key="m.slug" class="selected-model-item"
+                       @click="openModelConfig(m)" style="display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px; cursor: pointer; background: #f9fafb; margin-bottom: 6px">
+                    <div style="display: flex; align-items: center; gap: 8px; overflow: hidden">
+                      <el-tag size="small" type="info" effect="plain">#{{ m.idx }}</el-tag>
+                      <b style="font-size: 13px; color: #1f2937; white-space: nowrap">{{ m.name }}</b>
+                      <el-tag v-if="m.max_context_length" size="small" type="warning">{{ m.max_context_length }}</el-tag>
+                      <el-tag size="small" type="info">{{ m.engine }}</el-tag>
+                    </div>
+                    <el-button size="small" type="primary" plain @click.stop="openModelConfig(m)">查看配置</el-button>
+                  </div>
+                </div>
               </el-form-item>
             </el-card>
 
@@ -455,6 +473,99 @@
         </el-button>
       </div>
     </div>
+
+    <!-- 模型配置详情弹窗 -->
+    <el-dialog v-model="configDialogVisible" :title="`模型部署与配置详情 — ${configDialogModel?.name || ''}`" width="720px" append-to-body>
+      <template v-if="configDialogModel">
+        <el-descriptions :column="2" border size="small">
+          <el-descriptions-item label="模型名称">{{ configDialogModel.name }}</el-descriptions-item>
+          <el-descriptions-item label="标识 (slug)">{{ configDialogModel.slug }}</el-descriptions-item>
+          <el-descriptions-item label="推理引擎">{{ configDialogModel.engine || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="硬件分组">{{ configDialogModel.group_name }}</el-descriptions-item>
+          <el-descriptions-item label="大小类别">{{ configDialogModel.size_category }}</el-descriptions-item>
+          <el-descriptions-item label="量化精度">{{ configDialogModel.quantization || '未标注' }}</el-descriptions-item>
+          <el-descriptions-item label="最大上下文 (Max Len)">
+            <el-tag type="warning" effect="dark">{{ configDialogModel.max_context_length || '未设置' }}</el-tag>
+          </el-descriptions-item>
+          <el-descriptions-item label="GPU 显存利用率">{{ configDialogModel.gpu_memory_utilization }}</el-descriptions-item>
+          <el-descriptions-item label="端口">{{ configDialogModel.docker_port || '-' }}</el-descriptions-item>
+          <el-descriptions-item label="多模态">{{ configDialogModel.is_multimodal ? '是' : '否' }}</el-descriptions-item>
+          <el-descriptions-item label="部署镜像" :span="2">
+            <span style="word-break: break-all">{{ configDialogModel.docker_image || '-' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="模型权重路径" :span="2">
+            <span style="word-break: break-all">{{ configDialogModel.model_path || '-' }}</span>
+          </el-descriptions-item>
+          <el-descriptions-item label="TOS 云端权重" :span="2">
+            <span style="word-break: break-all">{{ configDialogModel.engine_uri || (configDialogModel.tos_path || '-') }}</span>
+          </el-descriptions-item>
+        </el-descriptions>
+
+        <!-- 本地 config.json 详情 -->
+        <template v-if="configDialogModel.model_config && Object.keys(configDialogModel.model_config).some(k => configDialogModel.model_config[k])">
+          <h4 style="margin-top: 20px">📄 模型 config.json 配置</h4>
+          <el-descriptions :column="2" border size="small">
+            <el-descriptions-item v-if="configDialogModel.model_config.max_model_len" label="config 最大上下文">
+              {{ configDialogModel.model_config.max_model_len }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.hidden_size" label="隐藏层维度">
+              {{ configDialogModel.model_config.hidden_size }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.num_attention_heads" label="注意力头数">
+              {{ configDialogModel.model_config.num_attention_heads }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.num_hidden_layers" label="层数">
+              {{ configDialogModel.model_config.num_hidden_layers }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.num_key_value_heads" label="KV 头数">
+              {{ configDialogModel.model_config.num_key_value_heads }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.num_local_experts" label="专家数 (MoE)">
+              {{ configDialogModel.model_config.num_local_experts }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.vocab_size" label="词表大小">
+              {{ configDialogModel.model_config.vocab_size }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.model_type" label="模型类型">
+              {{ configDialogModel.model_config.model_type }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.torch_dtype" label="精度 (dtype)">
+              {{ configDialogModel.model_config.torch_dtype }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.sliding_window" label="滑窗大小">
+              {{ configDialogModel.model_config.sliding_window }}
+            </el-descriptions-item>
+            <el-descriptions-item v-if="configDialogModel.model_config.architectures && configDialogModel.model_config.architectures.length" label="架构" :span="2">
+              {{ configDialogModel.model_config.architectures.join(', ') }}
+            </el-descriptions-item>
+          </el-descriptions>
+        </template>
+
+        <!-- Docker 部署命令 -->
+        <h4 style="margin-top: 20px">🐳 Docker 部署命令</h4>
+        <div class="command-code-block">
+          <pre style="white-space: pre-wrap; word-break: break-all; background: #0f172a; color: #38bdf8; padding: 12px; border-radius: 6px; font-size: 12px; line-height: 1.5; margin: 0;">{{ configDialogModel.docker_command || '（外部 API 模型，无容器部署命令）' }}</pre>
+        </div>
+
+        <!-- 设备专属配置 -->
+        <template v-if="configDialogModel.device_configs && configDialogModel.device_configs.length">
+          <h4 style="margin-top: 20px">🖥️ 设备专属配置 ({{ configDialogModel.device_configs.length }})</h4>
+          <el-table :data="configDialogModel.device_configs" size="small" border stripe>
+            <el-table-column prop="device_name" label="设备" min-width="140" />
+            <el-table-column prop="status" label="状态" width="90">
+              <template #default="{ row }">
+                <el-tag :type="row.status === 'PASS' ? 'success' : (row.status === 'FAIL' ? 'danger' : 'info')" size="small">{{ row.status }}</el-tag>
+              </template>
+            </el-table-column>
+            <el-table-column label="命令" min-width="300" show-overflow-tooltip>
+              <template #default="{ row }">
+                <span style="font-family: monospace; font-size: 11px">{{ row.docker_command }}</span>
+              </template>
+            </el-table-column>
+          </el-table>
+        </template>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -635,6 +746,17 @@ const selectedExternalModels = computed(() => {
   return selectedModelObjects.value.filter((m) => Boolean(m.is_external) || Boolean(m.api_base))
 })
 
+const selectedContainerModels = computed(() => {
+  return selectedModelObjects.value.filter((m) => !m.is_external && !m.api_base)
+})
+
+const configDialogVisible = ref(false)
+const configDialogModel = ref(null)
+const openModelConfig = (m) => {
+  configDialogModel.value = m
+  configDialogVisible.value = true
+}
+
 const isExternalModelSelected = computed(() => {
   return selectedExternalModels.value.length > 0
 })
@@ -781,7 +903,7 @@ const handleSubmit = async () => {
     if (editId.value) {
       await apiUpdateTask(editId.value, payload)
       ElMessage.success('任务已更新')
-      router.push('/tasks')
+      router.push('/')
     } else {
       const task = await apiCreateTask(payload)
       ElMessage.success('任务已创建并开始执行')
