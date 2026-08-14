@@ -6,7 +6,13 @@
         <el-button type="primary" :disabled="selectedReports.length !== 1" @click="viewReportSelected(selectedReports[0])">
           <el-icon><View /></el-icon> 查看报告
         </el-button>
-        <el-button type="success" plain @click="exportSummaryCSV">
+        <el-button type="success" :disabled="selectedReports.length === 0" @click="downloadSelectedReportsZip">
+          <el-icon><FolderOpened /></el-icon> 导出 ZIP 打包 ({{ selectedReports.length }})
+        </el-button>
+        <el-button type="primary" plain :disabled="selectedReports.length === 0" @click="downloadSelectedReportsMarkdown">
+          <el-icon><Document /></el-icon> 逐个导出 MD ({{ selectedReports.length }})
+        </el-button>
+        <el-button type="primary" plain @click="exportSummaryCSV">
           <el-icon><Download /></el-icon> 导出汇总 CSV
         </el-button>
         <el-button type="warning" plain :disabled="selectedReports.length < 2" @click="compareSelectedReportsInTable">
@@ -23,9 +29,26 @@
       </div>
 
       <div class="toolbar-right">
-        <el-select v-model="filterDeviceId" placeholder="按设备筛选" clearable style="width:200px" @change="loadReports">
+        <el-select
+          v-model="filterTaskId"
+          placeholder="🎯 按任务筛选 (如 Task #39)"
+          clearable
+          filterable
+          style="width:240px"
+          @change="handleTaskFilterChange"
+        >
+          <el-option
+            v-for="t in reportTasks"
+            :key="t.id"
+            :label="`Task #${t.id} - ${t.name} (${t.report_count}份报告)`"
+            :value="t.id"
+          />
+        </el-select>
+
+        <el-select v-model="filterDeviceId" placeholder="按设备筛选" clearable style="width:180px" @change="loadReports">
           <el-option v-for="d in devices" :key="d.id" :label="d.name" :value="d.id" />
         </el-select>
+
         <el-button circle @click="loadReports"><el-icon><Refresh /></el-icon></el-button>
       </div>
     </div>
@@ -162,6 +185,12 @@
           <el-table-column label="完成时间" width="180">
             <template #default="{ row }">{{ formatTime(row.completed_at) }}</template>
           </el-table-column>
+          <el-table-column label="操作" width="140" align="center" fixed="right">
+            <template #default="{ row }">
+              <el-button type="primary" link size="small" @click.stop="viewReportSelected(row)">查看</el-button>
+              <el-button type="success" link size="small" @click.stop="downloadReportSelected(row)">导出 MD</el-button>
+            </template>
+          </el-table-column>
         </el-table>
       </el-tab-pane>
 
@@ -212,7 +241,15 @@
 <script setup>
 import { ref, watch, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { apiListReports, apiDeleteReport, apiCompareThroughput, apiCompareAccuracy } from '../api'
+import {
+  apiListReports,
+  apiGetReportTasks,
+  apiDeleteReport,
+  apiCompareThroughput,
+  apiCompareAccuracy,
+  apiDownloadReportMarkdown,
+  apiDownloadBatchReportsZip
+} from '../api'
 import { formatTime } from '../utils/format'
 import { use } from 'echarts/core'
 import { CanvasRenderer } from 'echarts/renderers'
@@ -220,6 +257,7 @@ import { BarChart, LineChart } from 'echarts/charts'
 import { TitleComponent, TooltipComponent, LegendComponent, GridComponent } from 'echarts/components'
 import VChart from 'vue-echarts'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { FolderOpened, Document, View, Download, DataAnalysis, Delete, Refresh } from '@element-plus/icons-vue'
 import axios from 'axios'
 import { useAuthStore } from '../stores/authStore'
 import { useDragSelect } from '../utils/dragSelect'
@@ -232,9 +270,11 @@ const router = useRouter()
 const tableRef = ref(null)
 const activeTab = ref('list')
 const reports = ref([])
+const reportTasks = ref([])
 const devices = ref([])
 const selectedReports = ref([])
 const filterDeviceId = ref(null)
+const filterTaskId = ref(null)
 const loading = ref(false)
 const throughputData = ref([])
 const accuracyData = ref([])
@@ -249,6 +289,17 @@ const handleSelectionChange = (val) => {
 const handleRowClick = (row) => {
   if (tableRef.value) {
     tableRef.value.toggleRowSelection(row)
+  }
+}
+
+const handleTaskFilterChange = async () => {
+  await loadReports()
+  if (filterTaskId.value && reports.value.length > 0 && tableRef.value) {
+    tableRef.value.clearSelection()
+    reports.value.forEach(row => {
+      tableRef.value.toggleRowSelection(row, true)
+    })
+    ElMessage.success(`已筛选并自动勾选 Task #${filterTaskId.value} 包含的全部 ${reports.value.length} 份报告`)
   }
 }
 
@@ -293,15 +344,77 @@ const exportSummaryCSV = () => {
   ElMessage.success(`已导出 ${targetList.length} 份测试报告的汇总 CSV 数据！`)
 }
 
-const downloadReportSelected = (target) => {
+const downloadSelectedReportsZip = async () => {
+  const targetList = selectedReports.value.length > 0 ? selectedReports.value : reports.value
+  if (!targetList || targetList.length === 0) return ElMessage.warning("请勾选需要导出的报告或先选择任务")
+
+  const ids = targetList.map(r => r.id)
+  const taskId = filterTaskId.value || (selectedReports.value.length > 0 ? selectedReports.value[0].task_id : null)
+
+  const msg = ElMessage.info({ message: `正在打包 ${targetList.length} 份测试报告为 ZIP 压缩包，请稍候...`, duration: 0 })
+  try {
+    const res = await apiDownloadBatchReportsZip({ ids, task_id: taskId })
+    msg.close()
+    const blob = new Blob([res.data], { type: 'application/zip' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = taskId ? `Task_${taskId}_Benchmark_Reports.zip` : `AONI_Batch_Benchmark_Reports.zip`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success(`🎉 成功导出 ${targetList.length} 份报告的 ZIP 压缩包！已自动规避浏览器多文件提示。`)
+  } catch (e) {
+    msg.close()
+    console.error(e)
+    ElMessage.error("导出 ZIP 打包失败，请重试")
+  }
+}
+
+const downloadSelectedReportsMarkdown = async () => {
+  const targetList = selectedReports.value.length > 0 ? selectedReports.value : reports.value
+  if (!targetList || targetList.length === 0) return ElMessage.warning("请勾选需要导出 Markdown 报告的条目")
+  
+  for (let i = 0; i < targetList.length; i++) {
+    const item = targetList[i]
+    try {
+      const res = await apiDownloadReportMarkdown(item.id)
+      const blob = new Blob([res.data], { type: 'text/markdown;charset=utf-8' })
+      const url = window.URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `${item.model_slug}_benchmark_report.md`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      window.URL.revokeObjectURL(url)
+    } catch (e) {
+      console.error(e)
+    }
+  }
+  ElMessage.success(`已完成 ${targetList.length} 份 Markdown 测试报告的导出！`)
+}
+
+const downloadReportSelected = async (target) => {
   const item = target || (selectedReports.value.length === 1 ? selectedReports.value[0] : null)
   if (!item) return
-  const link = document.createElement('a')
-  link.href = `/api/reports/${item.id}/download`
-  link.download = `${item.model_slug}_report.md`
-  document.body.appendChild(link)
-  link.click()
-  document.body.removeChild(link)
+  try {
+    const res = await apiDownloadReportMarkdown(item.id)
+    const blob = new Blob([res.data], { type: 'text/markdown;charset=utf-8' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${item.model_slug}_benchmark_report.md`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success(`已成功下载报告: ${item.model_name || item.model_slug}`)
+  } catch (e) {
+    console.error(e)
+    ElMessage.error("下载 Markdown 报告失败，请重试")
+  }
 }
 
 const handleSingleDelete = async (report) => {
@@ -478,7 +591,9 @@ const itlChartOption = computed(() => {
 const loadReports = async () => {
   loading.value = true
   try {
-    const params = filterDeviceId.value ? { device_id: filterDeviceId.value } : {}
+    const params = {}
+    if (filterDeviceId.value) params.device_id = filterDeviceId.value
+    if (filterTaskId.value) params.task_id = filterTaskId.value
     reports.value = await apiListReports(params)
   } catch (e) {
     console.error(e)
@@ -498,6 +613,7 @@ watch(accDataset, () => { apiCompareAccuracy(accDataset.value).then(r => accurac
 
 onMounted(async () => {
   try { devices.value = (await axios.get('/api/devices')).data } catch (e) { /* */ }
+  try { reportTasks.value = await apiGetReportTasks() } catch (e) { /* */ }
   await loadReports(); await loadCompare()
 })
 </script>

@@ -79,8 +79,11 @@ export const apiDoctorDevice = (id) => api.post(`/devices/${id}/doctor`).then(r 
 
 // 报告
 export const apiListReports = (params) => api.get('/reports', { params }).then(r => r.data)
+export const apiGetReportTasks = () => api.get('/reports/tasks').then(r => r.data)
 export const apiGetReport = (id) => api.get(`/reports/${id}`).then(r => r.data)
 export const apiDeleteReport = (id) => api.delete(`/reports/${id}`).then(r => r.data)
+export const apiDownloadReportMarkdown = (id) => api.get(`/reports/${id}/download`, { responseType: 'blob' })
+export const apiDownloadBatchReportsZip = (payload) => api.post('/reports/batch-download-zip', payload, { responseType: 'blob' })
 export const apiCompareThroughput = () => api.get('/reports/compare/throughput').then(r => r.data)
 export const apiCompareAccuracy = (dataset = 'mmlu') =>
   api.get('/reports/compare/accuracy', { params: { dataset } }).then(r => r.data)

@@ -10,11 +10,14 @@
             <el-tag style="margin-left:12px" :type="report.status === 'done' ? 'success' : (report.status === 'failed' ? 'danger' : 'info')" size="small">{{ report.status.toUpperCase() }}</el-tag>
           </div>
           <div style="display:flex;gap:10px;">
-            <el-button type="success" size="small" plain @click="exportCSV">
+            <el-button type="success" size="small" plain @click="downloadMarkdown">
+              <el-icon><Document /></el-icon> 导出 Markdown 报告
+            </el-button>
+            <el-button type="primary" size="small" plain @click="exportCSV">
               <el-icon><Download /></el-icon> 导出 CSV 表格
             </el-button>
-            <el-button type="primary" size="small" plain :loading="exportingPdf" @click="exportPdf">
-              <el-icon><Document /></el-icon> 导出 PDF 报告
+            <el-button type="warning" size="small" plain :loading="exportingPdf" @click="exportPdf">
+              <el-icon><Printer /></el-icon> 导出 PDF 报告
             </el-button>
           </div>
         </div>
@@ -168,7 +171,7 @@
 import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
-import { apiGetReport } from '../api'
+import { apiGetReport, apiDownloadReportMarkdown } from '../api'
 import * as echarts from 'echarts'
 
 const route = useRoute()
@@ -337,6 +340,26 @@ const renderAccChart = () => {
       label: { show: true, position: 'top', formatter: '{c}%', fontSize: 11, fontWeight: 'bold' },
     }],
   })
+}
+
+const downloadMarkdown = async () => {
+  if (!report.value) return
+  try {
+    const res = await apiDownloadReportMarkdown(report.value.id)
+    const blob = new Blob([res.data], { type: 'text/markdown;charset=utf-8' })
+    const url = window.URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `${report.value.model_slug}_benchmark_report.md`
+    document.body.appendChild(link)
+    link.click()
+    document.body.removeChild(link)
+    window.URL.revokeObjectURL(url)
+    ElMessage.success("已成功下载高保真 Markdown 基准测试报告！")
+  } catch (e) {
+    console.error(e)
+    ElMessage.error("下载 Markdown 报告失败，请检查网络或重新登录")
+  }
 }
 
 const exportCSV = () => {
