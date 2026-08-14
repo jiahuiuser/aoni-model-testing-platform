@@ -388,7 +388,8 @@ def retry_failed_task(db: Session, task_id: int):
 
     db.commit()
     _add_log(db, task_id, "INFO", None, f"========== 任务 #{task_id} 启动断点重试: 已重置 {reset_count} 个失败/跳过模型，保留已成功模型测试数据 ==========", "system")
-    start_task(task_id)
+    # 使用带设备串行排队的下发逻辑：若目标设备正被其他任务占用，则自动排队等待
+    schedule_or_start_task(db, task_id)
     return task
 
 

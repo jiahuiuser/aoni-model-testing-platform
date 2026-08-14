@@ -993,17 +993,26 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
 
 
 def _check_vllm_bench(runner: RemoteRunner) -> bool:
-    """检查容器内是否有 vllm 原生基准测试工具 (支持多种 vllm 入口)"""
-    try:
-        res1 = runner.run_docker(["exec", CONTAINER_NAME, "vllm", "--help"], timeout=5)
-        if res1.returncode == 0:
-            return True
-        res2 = runner.run_docker(["exec", CONTAINER_NAME, "python3", "-m", "vllm.entrypoints.openai.bench_serving", "--help"], timeout=5)
-        if res2.returncode == 0:
-            return True
-        return False
-    except Exception:
-        return False
+    """检查容器内是否有 vllm 原生基准测试工具 (支持多种 vllm 入口)。
+
+    注意：容器在压测时段 GPU 繁忙，docker exec 启动子进程可能较慢，
+    因此使用足够的探测超时（首次 8s，重试 20s），避免把"探测超时"
+    误判为"无 vllm bench"而错误回退到低效的 HTTP 压测。
+    """
+    checks = [
+        ["vllm", "--help"],
+        ["python3", "-m", "vllm.entrypoints.openai.bench_serving", "--help"],
+        ["vllm", "bench", "serve", "--help"],
+    ]
+    for attempt_timeout in (8, 20):
+        for sub in checks:
+            try:
+                res1 = runner.run_docker(["exec", CONTAINER_NAME] + sub, timeout=attempt_timeout)
+                if res1 and res1.returncode == 0:
+                    return True
+            except Exception:
+                continue
+    return False
 
 
 def _run_vllm_bench_single(runner: RemoteRunner, port, concurrency, input_len, output_len,
@@ -1157,7 +1166,12 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
                 "p99_tpot_ms": 0.0,
             }
 
-    prompt_text = "hello " * min(input_len // 2, 2000)
+    # 生成与 input_len 匹配的输入：不再用 2000 词硬截断，按目标 token 数近似构造
+    word_count = max(1, input_len)  # 近似：每个 "hello " 约 1 token；数字穿插提升分词粒度
+    parts = []
+    for i in range(word_count):
+        parts.append(str(i % 10000) if i % 17 == 0 else "hello")
+    prompt_text = " ".join(parts)
 
     def send_request():
         t_start = time.time()
@@ -1182,10 +1196,22 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
         except Exception as err:
             return {"success": False, "error_msg": str(err)}
 
+    import threading as _threading
     t0 = time.time()
     results = []
-    with ThreadPoolExecutor(max_workers=min(concurrency * 2, 64)) as ex:
-        futures = [ex.submit(send_request) for _ in range(num_prompts)]
+    sem = _threading.Semaphore(max(1, concurrency))  # 真正限制同时运行的请求数 = 目标并发
+    done_cnt = [0]
+    lock = _threading.Lock()
+
+    def _wrapped_send():
+        with sem:
+            res = send_request()
+        with lock:
+            done_cnt[0] += 1
+        return res
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
+        futures = [ex.submit(_wrapped_send) for _ in range(num_prompts)]
         for f in as_completed(futures):
             results.append(f.result())
     total_time = time.time() - t0

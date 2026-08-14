@@ -9,7 +9,7 @@ export const useThemeStore = defineStore('theme', () => {
     { id: 'glacier', name: '极地水晶', label: '极地水晶 🧊', dotColor: 'linear-gradient(135deg, #38bdf8, #818cf8)' },
   ]
 
-  const savedTheme = localStorage.getItem('aoni_theme') || localStorage.getItem('aoni_login_skin') || 'cyber'
+  const savedTheme = localStorage.getItem('aoni_theme') || localStorage.getItem('aoni_login_skin') || 'glacier'
   const currentTheme = ref(savedTheme)
 
   const setTheme = (themeId) => {
