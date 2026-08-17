@@ -552,16 +552,17 @@ def api_download_report(
     if env_probe.get("gpu_total_mib"):
         mem_total_gb = env_probe["gpu_total_mib"] / 1024.0
 
+    docker_cmd = mr.docker_command or "vllm serve --port 8300 --max-model-len 40960 --gpu-memory-utilization 0.8"
+    d_info = parse_full_docker_cmd(docker_cmd)
+    engine_label = "llama.cpp 推理引擎" if d_info["engine"] == "llama_cpp" else "vLLM 推理引擎"
+
     # 动态解析设备最近监控资源；探测不到时回退为已登记的 Total（不再写死 90GiB）
     mem_used_str = None
     if dev and dev.last_check_detail and isinstance(dev.last_check_detail, dict):
         mem_info = dev.last_check_detail.get("memory", {})
         if isinstance(mem_info, dict) and "used" in mem_info:
             mem_used_str = f"约 {mem_info['used']} 已用"
-    mem_spec = f"{mem_total_gb:g} GiB 总量" + (f"，{mem_used_str}" if mem_used_str else "") + "（vLLM 推理引擎 + 评测并发运行）"
-
-    docker_cmd = mr.docker_command or "vllm serve --port 8300 --max-model-len 40960 --gpu-memory-utilization 0.8"
-    d_info = parse_full_docker_cmd(docker_cmd)
+    mem_spec = f"{mem_total_gb:g} GiB 总量" + (f"，{mem_used_str}" if mem_used_str else "") + f"（{engine_label} + 评测并发运行）"
 
     # 性能指标统计
     perf_list = mr.perf_results or []
