@@ -1,4 +1,6 @@
 import io
+import json
+import datetime
 import zipfile
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -302,7 +304,7 @@ def parse_full_docker_cmd(cmd_str: str) -> dict:
         "image_tag": "nightly-aarch64",
         "container_name": "aoni_llm_server",
         "runtime": "nvidia",
-        "shm_size": "64 MB",
+        "shm_size": "16 GB",
         "restart_policy": "unless-stopped",
         "port": "8300",
         "volumes": [],
@@ -310,35 +312,48 @@ def parse_full_docker_cmd(cmd_str: str) -> dict:
         "served_model_name": "N/A",
         "max_model_len": "40960 tokens",
         "gpu_memory_utilization": "85.0%",
-        "gpu_layers": "N/A (GPU全量卸载)",
+        "gpu_layers": "N/A",
         "tp_size": "1",
         "dtype": "auto",
         "reasoning_parser": "N/A",
         "tool_call_parser": "N/A",
         "speculative_config": None,
+        # ---- 扩展：部署引擎 / 量化 / 上下文 ----
+        "engine": "vllm",            # vllm / llama_cpp
+        "llama_cpp_gfl": None,       # -ngl 值 (llama.cpp)
+        "llama_model_file": None,    # llama.cpp -m 指向的具体 gguf 文件
+        "quantization": None,        # 从权重路径/文件名解析出的量化
+        "actual_model_name": None,   # 从命令解析出的真实模型名
+        "actual_model_size": None,   # 从权重路径可能体现的规模
+        "context_len": "4096",       # llama.cpp -c
     }
     if not cmd_str:
         return info
 
-    m_img = re.search(r"([a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+)", cmd_str)
+    # 判定部署引擎：含 llama-server / llama_cpp / .gguf => llama.cpp；否则 vLLM
+    is_llama = ("llama-server" in cmd_str or "llama_cpp" in cmd_str
+                or ".gguf" in cmd_str or "llamacpp" in cmd_str.lower())
+    info["engine"] = "llama_cpp" if is_llama else "vllm"
+
+    m_img = re.search(r"(ghcr\.io/nvidia-ai-iot/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|aoni-docker-cn-guangzhou\.cr\.volces\.com/public/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|aoni/vllm/[a-zA-Z0-9_\-\.]+:[a-zA-Z0-9_\-\.]+)", cmd_str)
     if m_img:
-        parts = m_img.group(1).split(":")
+        parts = m_img.group(1).rsplit(":", 1)
         info["image_repo"] = parts[0]
         info["image_tag"] = parts[1]
 
-    m_name = re.search(r"--name\s+([a-zA-Z0-9_\-]+)", cmd_str)
-    if m_name:
-        info["container_name"] = m_name.group(1)
+    m_name = re.search(r"-e\s+MODEL_NAME=([^\s]+)", cmd_str)
+    info["actual_model_name"] = m_name.group(1) if m_name else None
 
-    m_rt = re.search(r"--runtime=([a-zA-Z0-9_\-]+)", cmd_str)
+    m_rt = re.search(r"--runtime=?([a-zA-Z0-9_\-]+)", cmd_str)
     if m_rt:
         info["runtime"] = m_rt.group(1)
 
-    m_shm = re.search(r"--shm-size=([a-zA-Z0-9_\-]+)", cmd_str)
+    # 兼容等号与空格两种写法
+    m_shm = re.search(r"--shm-size[=\s]+([a-zA-Z0-9]+)", cmd_str)
     if m_shm:
         info["shm_size"] = m_shm.group(1)
 
-    m_port = re.search(r"--port\s+([0-9]+)", cmd_str)
+    m_port = re.search(r"--port[=\s]+([0-9]+)", cmd_str)
     if m_port:
         info["port"] = m_port.group(1)
     else:
@@ -350,53 +365,128 @@ def parse_full_docker_cmd(cmd_str: str) -> dict:
     for host_p, container_p in m_vols:
         info["volumes"].append({"host": host_p, "container": container_p, "mode": "RW"})
 
-    m_model = re.search(r"--model\s+([^\s]+)", cmd_str)
-    if m_model:
-        info["model_path"] = m_model.group(1)
+    info["model_path"] = "N/A"
+    if is_llama:
+        m_model = re.search(r"llama-server\s+-m\s+([^\s]+)", cmd_str) or re.search(r"-m\s+([^\s]+\.gguf)", cmd_str)
+        if m_model:
+            info["model_path"] = m_model.group(1)
+            info["llama_model_file"] = m_model.group(1).split("/")[-1]
+            # 从 gguf 文件名/路径推断量化与规模
+            fname = m_model.group(1)
+            for q in ("NK3", "Q8_0", "Q6_K", "Q5_K_M", "Q5_0", "Q4_K_M", "Q4_0", "IQ4_XS",
+                      "Q4_K_XL", "Q4_K_S", "Q3_K_M", "Q2_K", "NVFP4", "FP16", "BF16"):
+                if q in fname.upper():
+                    info["quantization"] = q
+                    break
+        m_ngl = re.search(r"-ngl[=\s]+([0-9]+)", cmd_str)
+        if m_ngl:
+            info["llama_cpp_gfl"] = m_ngl.group(1)
+            info["gpu_layers"] = f"全部 ({m_ngl.group(1)} 层) GPU 卸载" if m_ngl.group(1) == "999" else f"{m_ngl.group(1)} 层 GPU 卸载"
+        m_clen = re.search(r"llama-server\s+.*?-c\s+([0-9]+)", cmd_str) or re.search(r"-c\s+([0-9]+)", cmd_str)
+        if m_clen:
+            info["context_len"] = m_clen.group(1)
+            info["max_model_len"] = f"{m_clen.group(1)} tokens"
+        # llama.cpp 显存由 -ngl 控制，不适用 gpu-memory-utilization
+        info["gpu_memory_utilization"] = "由 -ngl 层数控制（llama.cpp）"
+    else:
+        m_model = re.search(r"--model\s+([^\s]+)", cmd_str)
+        if m_model:
+            info["model_path"] = m_model.group(1)
+            fname = m_model.group(1)
+            for q in ("NVFP4", "AWQ", "GPTQ", "W4A16", "W8A8", "FP16", "FP8", "BF16"):
+                if q in fname.upper():
+                    info["quantization"] = q
+                    break
 
-    m_sname = re.search(r"--served-model-name\s+([^\s]+)", cmd_str)
+    m_sname = re.search(r"--served-model-name[=\s]+([^\s]+)", cmd_str)
     if m_sname:
         info["served_model_name"] = m_sname.group(1)
 
-    m_len = re.search(r"--max-model-len\s+([0-9]+)", cmd_str)
-    if m_len:
-        info["max_model_len"] = f"{m_len.group(1)} tokens"
-    else:
-        m_c = re.search(r"-c\s+([0-9]+)", cmd_str)
-        if m_c:
-            info["max_model_len"] = f"{m_c.group(1)} tokens"
-
-    m_gpu = re.search(r"--gpu-memory-utilization\s+([0-9\.]+)", cmd_str)
-    if m_gpu:
-        val = float(m_gpu.group(1))
-        info["gpu_memory_utilization"] = f"{val * 100:.1f}% ({val})"
-
-    m_tp = re.search(r"--tensor-parallel-size\s+([0-9]+)", cmd_str)
-    if m_tp:
-        info["tp_size"] = m_tp.group(1)
-
-    m_dt = re.search(r"--dtype\s+([a-zA-Z0-9_\-]+)", cmd_str)
-    if m_dt:
-        info["dtype"] = m_dt.group(1)
-
-    m_rp = re.search(r"--reasoning-parser\s+([a-zA-Z0-9_\-]+)", cmd_str)
-    if m_rp:
-        info["reasoning_parser"] = m_rp.group(1)
-
-    m_tp_parser = re.search(r"--tool-call-parser\s+([a-zA-Z0-9_\-]+)", cmd_str)
-    if m_tp_parser:
-        info["tool_call_parser"] = m_tp_parser.group(1)
-
-    m_spec = re.search(r"--speculative-config\s+'([^']+)'", cmd_str)
-    if not m_spec:
-        m_spec = re.search(r'--speculative-config\s+"([^"]+)"', cmd_str)
-    if m_spec:
-        try:
-            info["speculative_config"] = json.loads(m_spec.group(1))
-        except Exception:
-            info["speculative_config"] = {"raw": m_spec.group(1)}
+    if not is_llama:
+        m_len = re.search(r"--max-model-len[=\s]+([0-9]+)", cmd_str)
+        if m_len:
+            info["max_model_len"] = f"{m_len.group(1)} tokens"
+        m_gpu = re.search(r"--gpu-memory-utilization[=\s]+([0-9\.]+)", cmd_str)
+        if m_gpu:
+            val = float(m_gpu.group(1))
+            info["gpu_memory_utilization"] = f"{val * 100:.1f}% ({val})"
+        m_tp = re.search(r"--tensor-parallel-size[=\s]+([0-9]+)", cmd_str)
+        if m_tp:
+            info["tp_size"] = m_tp.group(1)
+        m_dt = re.search(r"--dtype[=\s]+([a-zA-Z0-9_\-]+)", cmd_str)
+        if m_dt:
+            info["dtype"] = m_dt.group(1)
+        m_rp = re.search(r"--reasoning-parser[=\s]+([a-zA-Z0-9_\-]+)", cmd_str)
+        if m_rp:
+            info["reasoning_parser"] = m_rp.group(1)
+        m_tp_parser = re.search(r"--tool-call-parser[=\s]+([a-zA-Z0-9_\-]+)", cmd_str)
+        if m_tp_parser:
+            info["tool_call_parser"] = m_tp_parser.group(1)
+        m_spec = re.search(r"--speculative-config[=\s]+'([^']+)'", cmd_str)
+        if not m_spec:
+            m_spec = re.search(r'--speculative-config[=\s]+"([^"]+)"', cmd_str)
+        if m_spec:
+            try:
+                info["speculative_config"] = json.loads(m_spec.group(1))
+            except Exception:
+                info["speculative_config"] = {"raw": m_spec.group(1)}
 
     return info
+
+
+def _run_cmd_safe(args: list, timeout: int = 8) -> str:
+    """安全执行本地探测命令并返回 stdout+stderr 首行（失败返回空串）"""
+    import subprocess
+    try:
+        r = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return (r.stdout or "").strip() or (r.stderr or "").strip()
+    except Exception:
+        return ""
+
+
+def _probe_local_env() -> dict:
+    """探测宿主机与当前推理容器的真实软硬件环境（回退为 None，由调用方兜底）"""
+    env = {
+        "gpu_name": None, "gpu_total_mib": None, "driver_version": None,
+        "vllm_version": None, "python_version": None, "torch_version": None,
+        "cuda_version": None, "os_version": None,
+    }
+    # GPU / 驱动（nvidia-smi 对统一内存架构返回 N/A 显存，显存用设备表）
+    gpu_info = _run_cmd_safe(["nvidia-smi", "--query-gpu=name,memory.total,driver_version", "--format=csv,noheader,nounits"])
+    if gpu_info:
+        parts = [p.strip() for p in gpu_info.split(",")]
+        if len(parts) >= 3:
+            env["gpu_name"] = parts[0]
+            if parts[1].replace(".", "", 1).replace("N/A", "").strip().isdigit():
+                env["gpu_total_mib"] = float(parts[1]) if parts[1] != "N/A" else None
+            env["driver_version"] = parts[2]
+    # 操作系统
+    os_rel = _run_cmd_safe(["sh", "-c", ". /etc/os-release 2>/dev/null && echo \"$PRETTY_NAME\""])
+    env["os_version"] = os_rel or None
+    # 宿主 Python
+    py = _run_cmd_safe(["python3", "--version"])
+    if py.startswith("Python"):
+        env["python_version"] = py.split(" ", 1)[1]
+    # 推理容器内真实版本（若当前有运行中的 aoni 容器）
+    from backend.services.executor import CONTAINER_NAME
+    container_present = bool(_run_cmd_safe(["docker", "ps", "--format", "{{.Names}}"]).split("\n").__contains__(CONTAINER_NAME))
+    if container_present:
+        v = _run_cmd_safe(["docker", "exec", CONTAINER_NAME, "vllm", "--version"], timeout=45)
+        if v:
+            # 取包含版本号的行（vllm --version 可能带前缀/换行）
+            ver_line = next((ln.strip() for ln in v.split("\n") if ln.strip()), "")
+            if ver_line:
+                env["vllm_version"] = ver_line.split("version", 1)[-1].strip().lstrip("= ") if "version" in ver_line.lower() else ver_line
+            if not env.get("vllm_version"):
+                env["vllm_version"] = ver_line
+        ct = _run_cmd_safe(["docker", "exec", CONTAINER_NAME, "python3", "-c",
+                            "import torch;print(torch.__version__+','+torch.version.cuda)"], timeout=45)
+        if ct:
+            parts = ct.split(",")
+            if len(parts) == 2:
+                env["torch_version"] = parts[0].strip()
+                env["cuda_version"] = parts[1].strip()
+    return env
 
 
 @router.get("/{model_run_id}/download")
@@ -415,17 +505,33 @@ def api_download_report(
     dev = mr.device
     dev_name = mr.device_name or (dev.name if dev else "NVIDIA Jetson AGX Thor Developer Kit")
     dev_host = dev.host if dev else "127.0.0.1"
-    gpu_spec = (dev.gpu_info if dev and dev.gpu_info else "NVIDIA AGX Thor (64GB LPDDR5X 统一内存架构)")
+
+    # 动态探测宿主机与容器真实软硬件环境（探测不到时回退设备表真实值，最后才用默认）
+    env_probe = _probe_local_env()
+
+    if dev and dev.gpu_info:
+        gpu_spec = dev.gpu_info
+    elif env_probe.get("gpu_name"):
+        gpu_spec = env_probe["gpu_name"]
+        if env_probe.get("driver_version"):
+            gpu_spec += f" (驱动 {env_probe['driver_version']})"
+    else:
+        gpu_spec = "NVIDIA Jetson AGX Thor"
+
     cpu_spec = f"{dev.cpu_cores if (dev and dev.cpu_cores) else 14} 核 ARM aarch64"
-    mem_total_gb = dev.memory_gb if (dev and dev.memory_gb) else 122.0
-    
-    # 动态解析设备最近监控资源
-    mem_used_str = "约 90.0 GiB 已用"
+    mem_total_gb = dev.memory_gb if (dev and dev.memory_gb) else (122.0)
+
+    # GPU 显存（统一内存架构 nvidia-smi 为 N/A，采用设备登记的总内存；独立 GPU 用 nvidia-smi 实时值）
+    if env_probe.get("gpu_total_mib"):
+        mem_total_gb = env_probe["gpu_total_mib"] / 1024.0
+
+    # 动态解析设备最近监控资源；探测不到时回退为已登记的 Total（不再写死 90GiB）
+    mem_used_str = None
     if dev and dev.last_check_detail and isinstance(dev.last_check_detail, dict):
         mem_info = dev.last_check_detail.get("memory", {})
         if isinstance(mem_info, dict) and "used" in mem_info:
             mem_used_str = f"约 {mem_info['used']} 已用"
-    mem_spec = f"{mem_total_gb} GiB 总量，{mem_used_str}（vLLM 推理引擎 + 评测并发运行）"
+    mem_spec = f"{mem_total_gb:g} GiB 总量" + (f"，{mem_used_str}" if mem_used_str else "") + "（vLLM 推理引擎 + 评测并发运行）"
 
     docker_cmd = mr.docker_command or "vllm serve --port 8300 --max-model-len 40960 --gpu-memory-utilization 0.8"
     d_info = parse_full_docker_cmd(docker_cmd)
@@ -451,17 +557,54 @@ def api_download_report(
 
     test_date = (mr.completed_at or mr.started_at or datetime.datetime.utcnow()).strftime("%Y-%m-%d")
 
-    # 模型架构与量化方式动态判定
+    # 模型架构与量化方式动态判定（优先取 docker 命令/权重路径解析出的真实量化）
+    is_llama = d_info["engine"] == "llama_cpp"
     is_moe = "MoE" in mr.model_name or "A3B" in mr.model_name or "A14B" in mr.model_name or "mixtral" in mr.model_slug
     arch_desc = "MoE（Mixture-of-Experts 混合专家架构）" if is_moe else "Dense Transformer 密集自回归架构"
-    
-    quant_desc = "FP16 半精度"
-    if "NVFP4" in mr.model_name or "nvfp4" in mr.model_slug:
-        quant_desc = "NVFP4（NVIDIA 4-bit 浮点）"
-    elif "AWQ" in mr.model_name or "awq" in mr.model_slug:
-        quant_desc = "AWQ 4-bit 量化"
-    elif "GPTQ" in mr.model_name or "gptq" in mr.model_slug:
-        quant_desc = "GPTQ 4-bit 量化"
+
+    # 量化优先：从 docker 命令的模型路径/文件名真实解析；其次才是模型名推测
+    if d_info.get("quantization"):
+        q = d_info["quantization"]
+        quant_desc = f"{q} 量化"
+        if q == "NVFP4":
+            quant_desc = "NVFP4（NVIDIA 4-bit 浮点）"
+        elif q in ("FP16", "BF16"):
+            quant_desc = f"{q} 半精度"
+    else:
+        quant_desc = "FP16 半精度（默认推测，以实测权重为准）"
+        if "NVFP4" in mr.model_name or "nvfp4" in mr.model_slug:
+            quant_desc = "NVFP4（NVIDIA 4-bit 浮点）"
+        elif "AWQ" in mr.model_name or "awq" in mr.model_slug:
+            quant_desc = "AWQ 4-bit 量化"
+        elif "GPTQ" in mr.model_name or "gptq" in mr.model_slug:
+            quant_desc = "GPTQ 4-bit 量化"
+
+    # 完成率与可靠性结论（避免"失败率极高仍写良好"）
+    completion_ratio = (completed_tests / total_tests) if total_tests > 0 else 1.0
+    if not valid_perfs:
+        reliability_clause = "未获取到有效的性能数据，本次评估数据不足"
+    elif completion_ratio >= 0.9:
+        reliability_clause = "完成率较高，数据具备较好的参考价值"
+    elif completion_ratio >= 0.6:
+        reliability_clause = f"完成率 {pass_rate}，部分组合失败，结论仅供参考"
+    else:
+        reliability_clause = f"完成率仅 {pass_rate}，失败组合过多，结论不具备可靠性"
+
+    # P99 尾部延迟预警：高并发下首字延迟若远超均值(≥2.5x)则提示
+    p99_warning = None
+    if valid_perfs and total_tests >= 6:
+        flagged = []
+        for p in valid_perfs:
+            if p.concurrency and p.concurrency >= 8 and p.mean_ttft_ms and p.p99_ttft_ms:
+                if p.p99_ttft_ms >= 2.5 * p.mean_ttft_ms:
+                    flagged.append((p.concurrency, p.mean_ttft_ms, p.p99_ttft_ms))
+        if flagged:
+            concurrency_slots = sorted(set(c for c, _, _ in flagged))
+            worst = max(flagged, key=lambda x: x[2])
+            p99_warning = {
+                "concurr": worst[0], "p99": worst[2], "mean": worst[1],
+                "slots": ", ".join(map(str, concurrency_slots)),
+            }
 
     lines = []
     # 报告大标题与元信息
@@ -469,14 +612,25 @@ def api_download_report(
     lines.append("")
     lines.append(f"> 测试日期：{test_date}")
     lines.append(f"> 测试平台：{dev_name}")
-    lines.append(f"> 测试工具：vLLM Benchmark (`vllm bench serve`，OpenAI backend)")
+    if is_llama:
+        lines.append(f"> 测试工具：llama.cpp Benchmark（`llama-server` OpenAI 兼容 API 压测）")
+        lines.append(f"> 部署引擎：`llama.cpp`（`{d_info['image_repo']}:{d_info['image_tag']}`）")
+    else:
+        lines.append(f"> 测试工具：vLLM Benchmark（`vllm bench serve`，OpenAI backend）")
+        lines.append(f"> 部署引擎：`vLLM`（`{d_info['image_repo']}:{d_info['image_tag']}`）")
     lines.append("")
 
-    summary_text = (
-        f"在 **{dev_name}** 算力平台上，**{mr.model_name}** 模型在实测场景下最高输出吞吐达到 **{max_tput:.2f} tok/s**，"
-        f"最佳首字响应延迟 (TTFT) 控制在 **{min_ttft:.2f} ms**。"
-        f"在评测矩阵中完成 {completed_tests} 组测试，失败 {failed_tests} 组，完成率 {pass_rate}，具备良好的工程部署实用性。"
-    )
+    if not valid_perfs:
+        summary_text = (
+            f"**{mr.model_name}** 未获取到有效性能数据（完成 {completed_tests}/{total_tests} 组，完成率 {pass_rate}），"
+            "本报告不基于吞吐/延迟作出性能结论，仅记录部署与环境配置。"
+        )
+    else:
+        summary_text = (
+            f"在 **{dev_name}** 算力平台上，**{mr.model_name}** 模型在实测场景下最高输出吞吐达到 **{max_tput:.2f} tok/s**，"
+            f"最佳首字响应延迟 (TTFT) 控制在 **{min_ttft:.2f} ms**。"
+            f"在评测矩阵中完成 {completed_tests} 组测试，失败 {failed_tests} 组，完成率 {pass_rate}。{reliability_clause}。"
+        )
     lines.append(f"**一句话摘要**：{summary_text}")
     lines.append("")
     lines.append("---")
@@ -488,13 +642,19 @@ def api_download_report(
     lines.append("| 项目 | 内容 |")
     lines.append("|------|------|")
     lines.append(f"| 被测模型 | `{mr.model_name}`（Slug: `{mr.model_slug}`，架构: {arch_desc}，量化: {quant_desc}） |")
-    lines.append("| 服务框架 | vLLM（`vllm serve`，OpenAI 兼容 API） |")
-    lines.append("| 请求后端 | OpenAI (`--backend openai`) |")
-    lines.append("| 数据集 | random（随机生成，固定 input/output 长度） |")
+    if is_llama:
+        lines.append("| 服务框架 | llama.cpp（`llama-server`，OpenAI 兼容 API） |")
+        lines.append("| 请求后端 | OpenAI 兼容 (`/v1/chat/completions`) |")
+        lines.append("| 数据集 | random（随机生成，固定 input/output 长度） |")
+        lines.append("| 请求速率 | 流式逐请求压测 |")
+    else:
+        lines.append("| 服务框架 | vLLM（`vllm serve`，OpenAI 兼容 API） |")
+        lines.append("| 请求后端 | OpenAI (`--backend openai`) |")
+        lines.append("| 数据集 | random（随机生成，固定 input/output 长度） |")
+        lines.append("| 请求速率 | 无限（`request_rate=inf`） |")
     lines.append(f"| 采样规模 | 规范采样测试矩阵（任务 Task #{mr.task_id}） |")
     lines.append(f"| 并发度 | 梯度并发 `{', '.join(map(str, concurrencies)) if concurrencies else '1, 4, 8'}` |")
-    lines.append("| 请求速率 | 无限（`request_rate=inf`，burstiness=1.0） |")
-    lines.append(f"| 失败请求 | 全部 {failed_tests}（共 {total_tests} 组评测，completed={completed_tests}/failed={failed_tests}） |")
+    lines.append(f"| 失败请求 | {failed_tests}（共 {total_tests} 组评测，completed={completed_tests}/failed={failed_tests}） |")
     in_str = " / ".join(map(str, input_lens)) if input_lens else "128 / 512 / 1024"
     out_str = " / ".join(map(str, output_lens)) if output_lens else "128 / 512 / 2048"
     lines.append(f"| 测试矩阵 | {len(input_lens) if input_lens else 3} 种输入长度 ({in_str}) × {len(output_lens) if output_lens else 3} 种输出长度 ({out_str}) |")
@@ -533,45 +693,74 @@ def api_download_report(
     lines.append(docker_cmd)
     lines.append("```")
     lines.append("")
-    lines.append("> 该命令对应模型部署进程 PID 实际运行时命令行，与容器 inspect 配置核对一致。")
+    lines.append("> 该命令为该模型测试任务实际下发的容器启动命令行。")
     lines.append("")
     lines.append("---")
     lines.append("")
 
-    # 3. vLLM 服务配置
-    lines.append("## 3. vLLM 服务配置")
-    lines.append("")
-    lines.append("### 3.1 服务参数")
-    lines.append("")
-    lines.append("| 参数 | 值 | 说明 |")
-    lines.append("|------|-----|------|")
-    lines.append(f"| `--model` | `{d_info['model_path'] if d_info['model_path'] != 'N/A' else '/models/' + mr.model_slug}` | 模型本地路径 |")
-    lines.append(f"| `--served-model-name` | `{mr.model_name}` | 对外暴露的模型名 |")
-    lines.append(f"| `--port` | `{mr.port or d_info['port']}` | 监听端口 |")
-    lines.append(f"| `--max-model-len` | `{d_info['max_model_len']}` | 最大上下文长度 |")
-    lines.append(f"| `--gpu-memory-utilization` | `{d_info['gpu_memory_utilization']}` | GPU 显存预分配比例 |")
-    lines.append(f"| `--gpu-layers` | `{d_info['gpu_layers']}` | 算力卡卸载图层数 |")
-    lines.append(f"| `--tensor-parallel-size` | `{d_info['tp_size']}` | 张量并行度 |")
-    lines.append(f"| `--dtype` | `{d_info['dtype']}` | 推理计算数据类型 |")
-    if d_info["reasoning_parser"] != "N/A":
-        lines.append(f"| `--reasoning-parser` | `{d_info['reasoning_parser']}` | 推理思考解析器 |")
-    if d_info["tool_call_parser"] != "N/A":
-        lines.append(f"| `--tool-call-parser` | `{d_info['tool_call_parser']}` | 工具调用 XML/JSON 解析器 |")
-    lines.append("")
-
-    lines.append("### 3.2 投机解码（Speculative Decoding）配置")
-    lines.append("")
-    if d_info["speculative_config"]:
-        lines.append("```json")
-        lines.append(json.dumps(d_info["speculative_config"], indent=2, ensure_ascii=False))
-        lines.append("```")
+    # 3. 服务配置（按部署引擎动态输出）
+    if is_llama:
+        lines.append("## 3. llama.cpp 服务配置")
         lines.append("")
-        lines.append(f"- **投机方法**：`{d_info['speculative_config'].get('method', 'MTP')}`")
-        lines.append(f"- **投机 Token 数**：`{d_info['speculative_config'].get('num_speculative_tokens', 3)}`")
-        lines.append(f"- **Backend 后端**：`{d_info['speculative_config'].get('moe_backend', 'triton')}`")
+        lines.append("### 3.1 服务参数")
+        lines.append("")
+        lines.append("| 参数 | 值 | 说明 |")
+        lines.append("|------|-----|------|")
+        lines.append(f"| `-m` | `{d_info.get('model_path', 'N/A')}` | 加载的 GGUF 模型权重文件 |")
+        if d_info.get("llama_model_file"):
+            lines.append(f"| 权重文件 | `{d_info['llama_model_file']}` | llama.cpp 加载的具体 .gguf 分片 |")
+        if d_info.get("quantization"):
+            lines.append(f"| 量化格式 | `{d_info['quantization']}` | 权重量化（从文件名解析） |")
+        ml2 = d_info.get("max_model_len") or f"{d_info.get('context_len','4096')} tokens"
+        lines.append(f"| `-c` / `--ctx-size` | `{d_info.get('context_len','4096')}` | 上下文长度（{ml2}） |")
+        gl = d_info.get("llama_cpp_gfl")
+        lines.append(f"| `-ngl` | `{gl if gl else '999'}` | 全量 GPU 卸载层数 |")
+        lines.append(f"| `--port` | `{mr.port or d_info['port']}` | 监听端口 |")
+        mmproj = re.search(r"--mmproj\s+([^\s]+)", docker_cmd)
+        if mmproj:
+            lines.append(f"| `--mmproj` | `{mmproj.group(1)}` | 多模态视觉投影权重 |")
+        lines.append("")
+        lines.append("> 说明：llama.cpp 的显存占用由 `-ngl`（GPU 卸载层数）控制，不适用 `--gpu-memory-utilization` 参数。")
+        lines.append("")
+        lines.append("### 3.2 采样与推理行为")
+        lines.append("")
+        if d_info.get("gpu_layers") and d_info["gpu_layers"] != "N/A":
+            lines.append(f"- **GPU 卸载**：`{d_info['gpu_layers']}`")
+        lines.append("- **Decode 策略**：原生自回归逐 Token 生成。")
+        lines.append("")
     else:
-        lines.append("未开启投机解码（Speculative Decoding），采用原生自回归 Decode 策略，预分配 KV Cache。")
-    lines.append("")
+        lines.append("## 3. vLLM 服务配置")
+        lines.append("")
+        lines.append("### 3.1 服务参数")
+        lines.append("")
+        lines.append("| 参数 | 值 | 说明 |")
+        lines.append("|------|-----|------|")
+        lines.append(f"| `--model` | `{d_info['model_path'] if d_info['model_path'] != 'N/A' else '/models/' + mr.model_slug}` | 模型本地路径 |")
+        lines.append(f"| `--served-model-name` | `{mr.model_name}` | 对外暴露的模型名 |")
+        lines.append(f"| `--port` | `{mr.port or d_info['port']}` | 监听端口 |")
+        lines.append(f"| `--max-model-len` | `{d_info['max_model_len']}` | 最大上下文长度 |")
+        lines.append(f"| `--gpu-memory-utilization` | `{d_info['gpu_memory_utilization']}` | GPU 显存预分配比例 |")
+        lines.append(f"| `--gpu-layers` | `{d_info['gpu_layers']}` | 算力卡卸载图层数 |")
+        lines.append(f"| `--tensor-parallel-size` | `{d_info['tp_size']}` | 张量并行度 |")
+        lines.append(f"| `--dtype` | `{d_info['dtype']}` | 推理计算数据类型 |")
+        if d_info["reasoning_parser"] != "N/A":
+            lines.append(f"| `--reasoning-parser` | `{d_info['reasoning_parser']}` | 推理思考解析器 |")
+        if d_info["tool_call_parser"] != "N/A":
+            lines.append(f"| `--tool-call-parser` | `{d_info['tool_call_parser']}` | 工具调用 XML/JSON 解析器 |")
+        lines.append("")
+        lines.append("### 3.2 投机解码（Speculative Decoding）配置")
+        lines.append("")
+        if d_info["speculative_config"]:
+            lines.append("```json")
+            lines.append(json.dumps(d_info["speculative_config"], indent=2, ensure_ascii=False))
+            lines.append("```")
+            lines.append("")
+            lines.append(f"- **投机方法**：`{d_info['speculative_config'].get('method', 'MTP')}`")
+            lines.append(f"- **投机 Token 数**：`{d_info['speculative_config'].get('num_speculative_tokens', 3)}`")
+            lines.append(f"- **Backend 后端**：`{d_info['speculative_config'].get('moe_backend', 'triton')}`")
+        else:
+            lines.append("未开启投机解码（Speculative Decoding），采用原生自回归 Decode 策略，预分配 KV Cache。")
+        lines.append("")
     lines.append("---")
     lines.append("")
 
@@ -582,17 +771,24 @@ def api_download_report(
     lines.append("")
     lines.append("| 组件 | 版本 |")
     lines.append("|------|------|")
-    lines.append("| vLLM | `0.26.1 / Standard Nightly` |")
+    vllm_ver = env_probe.get("vllm_version") or "Nightingly (探测失败)"
+    py_ver = env_probe.get("python_version") or "不可用"
+    torch_ver = env_probe.get("torch_version") or "?"
+    cuda_ver = env_probe.get("cuda_version") or "?"
+    lines.append(f"| vLLM | `{vllm_ver}` |")
     lines.append(f"| 容器镜像 | `{d_info['image_repo']}:{d_info['image_tag']}` |")
-    lines.append("| Python | `3.12 / 3.10` |")
-    lines.append("| PyTorch | `2.x (CUDA Enabled)` |")
-    lines.append("| CUDA（容器） | `CUDA 12.x / 13.x` |")
+    lines.append(f"| Python | `{py_ver}` |")
+    lines.append(f"| PyTorch | `{torch_ver}` |")
+    if cuda_ver != "?":
+        lines.append(f"| CUDA（容器） | `CUDA {cuda_ver}` |")
+    else:
+        lines.append("| CUDA（容器） | 探测失败 |")
     lines.append("")
     lines.append("### 4.2 宿主机系统环境")
     lines.append("")
     lines.append("| 项目 | 值 |")
     lines.append("|------|-----|")
-    lines.append("| 操作系统 | Ubuntu 24.04 LTS / Linux Tegra |")
+    lines.append(f"| 操作系统 | `{env_probe.get('os_version') or 'Linux'}` |")
     lines.append(f"| 硬件平台 | `{dev_name}` (`{dev_host}`) |")
     lines.append(f"| GPU / NPU 规格 | `{gpu_spec}` |")
     lines.append(f"| CPU 核心数 | `{cpu_spec}` |")
@@ -649,12 +845,19 @@ def api_download_report(
             lines.append("| `config.json` | 58 KB | 主配置 |")
             lines.append("| `model.safetensors` | 动态规模 | 模型权重分片 |")
     else:
-        lines.append("| 文件 | 大小 | 说明 |")
-        lines.append("|------|------|------|")
-        lines.append("| `config.json` | ~58 KB | 主配置（含架构与量化参数） |")
-        lines.append("| `model.safetensors` | 分片文件 | 模型物理权重分片 |")
-        lines.append("| `tokenizer.json` | ~12 MB | 分词器 Vocab |")
-        lines.append("| `chat_template.jinja` | ~7 KB | 对话模版 |")
+        # 本地既无对应模型目录，也未找到物理权重文件时，如实说明（不虚构一份文件清单）
+        lines.append("*未在本地检测到该模型的权重目录。*")
+        lines.append("")
+        lines.append("该模型通过 **TOS / 云端对象存储（`MODEL_OSS=True`）** 在容器启动时动态拉取，物理权重文件不常驻宿主机。")
+        if d_info.get("llama_model_file"):
+            lines.append("")
+            lines.append(f"实际加载权重文件：`{d_info['llama_model_file']}`")
+            if d_info.get("quantization"):
+                lines.append(f"量化格式：`{d_info['quantization']}`")
+        if is_llama and not d_info.get("llama_model_file"):
+            lines.append("")
+            lines.append("> 提示：本模型以 GGUF（llama.cpp）权重加载，具体 .gguf 分片请以容器启动命令 `-m` 参数为准。")
+        lines.append("")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -772,51 +975,93 @@ def api_download_report(
     lines.append("## 8. 结论与建议")
     lines.append("")
     
-    # 动态判定 1：整体吞吐与部署评估
-    spec_clause = "借助 MTP 投机解码" if d_info["speculative_config"] else "基于标准 KV Cache 预分配模式"
+    # ---- 结论整体尽可能基于真实数据；数据不足时如实声明，不做臆断 ----
     max_len_val = d_info.get("max_model_len", "40960 tokens")
     gpu_util_val = d_info.get("gpu_memory_utilization", "80.0%")
-    lines.append(
-        f"1. **整体部署与吞吐表现**：在 `{dev_name}` 算力节点上，模型 `{mr.model_name}` {spec_clause} 运行稳定。"
-        + (f"实测峰值输出吞吐达 **{max_tput:.2f} tok/s**，" if max_tput > 0 else "")
-        + f"最佳首字延迟控制在 **{min_ttft:.2f} ms**。当前配置 `--max-model-len` 为 `{max_len_val}`，显存预分配比例为 `{gpu_util_val}`，具备良好的工程落地方案可行性。"
-    )
+    max_c = max(concurrencies, default=4)
+    n = 1
 
-    # 动态判定 2：Prefill 与长上下文瓶颈分析
-    if valid_perfs and len(valid_perfs) > 1:
-        max_ttft_row = max(valid_perfs, key=lambda x: x.mean_ttft_ms if x.mean_ttft_ms is not None else 0)
+    if not valid_perfs:
+        # 无有效性能数据：不作吞吐/延迟结论，仅给部署与配置说明（问题 3）
         lines.append(
-            f"2. **Prefill / Decode 开销瓶颈**：当输入 Token 增加至 {max_ttft_row.input_len} 时，首字响应延迟 (Mean TTFT) 上升至 **{max_ttft_row.mean_ttft_ms:.2f} ms**。"
-            " Prefill 阶段为长 Prompt 场景的主要时延瓶颈。对于 TTFT 敏感的高并发业务，建议配置 Chunked Prefill 优化或针对长 Prompt 场景设置独立队列限流。"
+            f"{n}. **部署与数据说明**：在 `{dev_name}` 算力节点上完成 `{mr.model_name}` 的容器部署（引擎：{'llama.cpp（GGUF）' if is_llama else 'vLLM'}）。"
+            f"本次评测未获取到有效性能数据（完成率 {pass_rate}），因此**不对吞吐/延迟作出结论**。{reliability_clause}，建议定位压测失败原因后复测。"
         )
+        n += 1
+        lines.append(
+            f"{n}. **配置记录**：已登记部署参数 `--max-model-len` 为 `{max_len_val}`，显存分配方式为 `{gpu_util_val}`。"
+            "由于缺乏有效性能样本，暂不输出 Prefill/并发调度等基于实测的优化结论。"
+        )
+        n += 1
     else:
-        lines.append(
-            "2. **Prefill / Decode 开销瓶颈**：Prefill 阶段预处理为长 Prompt 场景的主要开销瓶颈，建议生产部署时结合业务 SLA 配置 Chunked Prefill 或调整 KV Cache 预分配比例。"
-        )
+        spec_clause = "基于标准 KV Cache 预分配模式"
+        if d_info["speculative_config"]:
+            spec_clause = "借助 MTP 投机解码"
 
-    # 动态判定 3：准确率与 API 协议规范校验
+        # 动态判定 1：整体部署与吞吐表现（数据真实时给出，并依据完成率/可靠性修正措辞）
+        if max_tput > 0:
+            throughput_clause = f"实测峰值输出吞吐达 **{max_tput:.2f} tok/s**，"
+        else:
+            throughput_clause = ""
+        lines.append(
+            f"{n}. **整体部署与吞吐表现**：在 `{dev_name}` 算力节点上，模型 `{mr.model_name}` {spec_clause} 运行。"
+            f"{throughput_clause}最佳首字延迟控制在 **{min_ttft:.2f} ms**。当前配置 `--max-model-len` 为 `{max_len_val}`，"
+            f"显存分配方式为 `{gpu_util_val}`。{reliability_clause}。"
+            + ("因此本次结论**仅供参考，不作为最终选型依据**。" if completion_ratio < 0.9 else "")
+        )
+        n += 1
+
+        # 动态判定 2：Prefill 与长上下文瓶颈分析
+        if len(valid_perfs) > 1:
+            max_ttft_row = max(valid_perfs, key=lambda x: x.mean_ttft_ms if x.mean_ttft_ms is not None else 0)
+            lines.append(
+                f"{n}. **Prefill / Decode 开销瓶颈**：当输入 Token 增加至 {max_ttft_row.input_len} 时，首字响应延迟 (Mean TTFT) 上升至 **{max_ttft_row.mean_ttft_ms:.2f} ms**。"
+                " Prefill 阶段为长 Prompt 场景的主要时延瓶颈。对于 TTFT 敏感的高并发业务，建议配置 Chunked Prefill 优化或针对长 Prompt 场景设置独立队列限流。"
+            )
+            n += 1
+        else:
+            lines.append(
+                f"{n}. **Prefill / Decode 开销瓶颈**：Prefill 阶段预处理为长 Prompt 场景的主要开销瓶颈，建议生产部署时结合业务 SLA 配置 Chunked Prefill 或调整 KV Cache 预分配比例。"
+            )
+            n += 1
+
+    # 动态判定 3：P99 尾部延迟预警（问题 7）
+    if p99_warning:
+        ratio = (p99_warning["p99"] / p99_warning["mean"]) if p99_warning["mean"] else 0
+        lines.append(
+            f"{n}. **⚠️ P99 尾部延迟预警**：高并发（并发 ≥ {p99_warning['slots']}）下出现大量请求 P99 首字延迟远超均值（最高 **{p99_warning['p99']:.2f} ms**，约为并发 {p99_warning['concurr']} 下均值 **{p99_warning['mean']:.2f} ms** 的 {ratio:.1f} 倍），"
+            "尾部抖动明显，存在排队拥塞。**对首字延迟敏感的生产业务（如实时对话、流式交互），建议将并发限制在更低档位或引入请求优先级/限流机制。**"
+        )
+        n += 1
+
+    # 动态判定 4：准确率与 API 协议规范校验
     if mr.acc_results:
         acc_list = [f"{ar.dataset.upper()}: {ar.accuracy * 100:.1f}%" for ar in mr.acc_results if ar.accuracy is not None]
         acc_summary = "，".join(acc_list) if acc_list else "准确率校验完成"
-        lines.append(f"3. **准确率评测完成度**：模型已完成基准数据集评测（{acc_summary}），模型理解与推理能力满足预期，无异常退化。")
+        lines.append(f"{n}. **准确率评测完成度**：模型已完成基准数据集评测（{acc_summary}），模型理解与推理能力满足预期，无异常退化。")
+        n += 1
     elif mr.gateway_results:
         pass_gw = sum(1 for gr in mr.gateway_results if gr.status == "PASS")
-        lines.append(f"3. **API 协议规范校验**：通过 {pass_gw}/{len(mr.gateway_results)} 项 OpenAI API 兼容规范校验，可直接对接上层应用及 API 网关。")
+        lines.append(f"{n}. **API 协议规范校验**：通过 {pass_gw}/{len(mr.gateway_results)} 项 OpenAI API 兼容规范校验，可直接对接上层应用及 API 网关。")
+        n += 1
     else:
-        lines.append("3. **负载吞吐连贯性**：自回归生成阶段 TPOT 指标表现稳定，字间 Token 生成连贯，适合流式输出交互场景。")
+        lines.append(f"{n}. **准确率/协议校验**：本报告未附带准确率或 API 协议校验数据，仅反映性能实测。")
+        n += 1
 
-    # 动态判定 4：算力节点与系统加速建议
+    # 动态判定 5：算力节点与系统加速建议
     lines.append(
-        f"4. **算力节点调优建议**：建议在算力设备 `{dev_name}` 宿主机上开启 GPU/NPU 持久化加速模式，"
+        f"{n}. **算力节点调优建议**：建议在算力设备 `{dev_name}` 宿主机上开启 GPU/NPU 持久化加速模式，"
         "并确保推理容器分配足够的共享内存 (`--shm-size`) 与算力直通权限 (`--runtime=nvidia`)，以发挥芯片最高计算效率。"
     )
+    n += 1
 
-    # 动态判定 5：生产部署与并发调度
-    max_c = max(concurrencies, default=4)
-    lines.append(
-        f"5. **生产并发调度建议**：在实测梯度并发（1 ~ {max_c}）表现下，推荐根据 SLA 目标将单节点并发控制在最佳吞吐区间内，"
-        "既可获得最高 Token 产出效率，又能维持 P99 延迟处于受控水平。"
-    )
+    # 动态判定 6：生产部署与并发调度（仅在有有效数据时给出实测结论）
+    if valid_perfs:
+        lines.append(
+            f"{n}. **生产并发调度建议**：在实测梯度并发（1 ~ {max_c}）表现下，推荐根据 SLA 目标将单节点并发控制在最佳吞吐区间内，"
+            "既可获得最高 Token 产出效率，又能维持 P99 延迟处于受控水平。"
+        )
+        n += 1
     lines.append("")
     lines.append("---")
     lines.append("")
