@@ -485,7 +485,7 @@ def _execute_task_pipeline(task_id: int):
                 # 清理容器，释放 GPU/内存，保证下一个模型能正常启动
                 try:
                     from backend.services.executor import _stop_container
-                    from backend.services.runner import RemoteRunner
+                    from backend.services.executor import RemoteRunner
                     _runner = RemoteRunner(model_run.task.device if model_run.task else None)
                     _stop_container(_runner)
                     _add_log(db, task_id, "INFO", model_run.model_slug, "异常后容器已清理，继续下一个模型", "system")

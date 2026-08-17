@@ -144,12 +144,13 @@ def deploy_image_to_device(img_id: int, data: DeployImageRequest, db: Session = 
     dev.bound_image_id = img.id
     db.commit()
 
-    # 异步/同步在目标节点上拉取 docker 镜像
-    runner = RemoteRunner(device=dev, db=db)
+    # 在目标节点上拉取 docker 镜像（RemoteRunner 构造器只接收 device，命令同步在目标节点执行）
+    runner = RemoteRunner(device=dev)
     pull_cmd = f"docker pull {img.image_tag}"
-    res = runner.run_cmd(pull_cmd)
+    res = runner.run_shell(pull_cmd, timeout=1800)
+    pull_output = (res.stdout or "") or (res.stderr or "") or "镜像拉取命令已下发"
 
     return {
         "message": f"镜像 {img.name} ({img.image_tag}) 已部署绑定到设备 {dev.name} ({dev.host})",
-        "pull_output": res.get("stdout", "") or res.get("stderr", "") or "镜像拉取命令已下发",
+        "pull_output": pull_output,
     }

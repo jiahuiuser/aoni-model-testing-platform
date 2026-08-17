@@ -1,6 +1,7 @@
 import io
 import json
 import datetime
+import threading
 import zipfile
 from fastapi import APIRouter, Depends, HTTPException, Body
 from fastapi.responses import PlainTextResponse, StreamingResponse
@@ -444,6 +445,32 @@ def _run_cmd_safe(args: list, timeout: int = 8) -> str:
         return ""
 
 
+# 环境探测结果缓存：避免每次生成报告都对运行中的推理容器做高延时 docker exec 探测
+# （压测容器繁忙时 docker exec vllm --version 可阻塞 ~13s，重复探测会让批量 ZIP 打包极慢）
+_env_probe_cache: dict = {"ts": 0.0, "data": None}
+_ENV_PROBE_TTL = 120.0
+_env_probe_lock = threading.Lock()
+
+
+def _probe_local_env_cached() -> dict:
+    """带 TTL 缓存的环境探测：单进程内最多每 120s 真实探测一次，其余复用上次结果"""
+    now = _now_ts()
+    cache = _env_probe_cache
+    if cache["data"] is not None and (now - cache["ts"]) <= _ENV_PROBE_TTL:
+        return cache["data"]
+    with _env_probe_lock:
+        if cache["data"] is not None and (now - cache["ts"]) <= _ENV_PROBE_TTL:
+            return cache["data"]
+        cache["data"] = _probe_local_env()
+        cache["ts"] = _now_ts()
+    return cache["data"]
+
+
+def _now_ts() -> float:
+    import time
+    return time.time()
+
+
 def _probe_local_env() -> dict:
     """探测宿主机与当前推理容器的真实软硬件环境（回退为 None，由调用方兜底）"""
     env = {
@@ -471,7 +498,7 @@ def _probe_local_env() -> dict:
     from backend.services.executor import CONTAINER_NAME
     container_present = bool(_run_cmd_safe(["docker", "ps", "--format", "{{.Names}}"]).split("\n").__contains__(CONTAINER_NAME))
     if container_present:
-        v = _run_cmd_safe(["docker", "exec", CONTAINER_NAME, "vllm", "--version"], timeout=45)
+        v = _run_cmd_safe(["docker", "exec", CONTAINER_NAME, "vllm", "--version"], timeout=8)
         if v:
             # 取包含版本号的行（vllm --version 可能带前缀/换行）
             ver_line = next((ln.strip() for ln in v.split("\n") if ln.strip()), "")
@@ -480,7 +507,7 @@ def _probe_local_env() -> dict:
             if not env.get("vllm_version"):
                 env["vllm_version"] = ver_line
         ct = _run_cmd_safe(["docker", "exec", CONTAINER_NAME, "python3", "-c",
-                            "import torch;print(torch.__version__+','+torch.version.cuda)"], timeout=45)
+                            "import torch;print(torch.__version__+','+torch.version.cuda)"], timeout=8)
         if ct:
             parts = ct.split(",")
             if len(parts) == 2:
@@ -507,7 +534,7 @@ def api_download_report(
     dev_host = dev.host if dev else "127.0.0.1"
 
     # 动态探测宿主机与容器真实软硬件环境（探测不到时回退设备表真实值，最后才用默认）
-    env_probe = _probe_local_env()
+    env_probe = _probe_local_env_cached()
 
     if dev and dev.gpu_info:
         gpu_spec = dev.gpu_info
