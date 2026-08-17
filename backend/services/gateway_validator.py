@@ -412,7 +412,6 @@ class GatewayValidator:
                 "message": f"服务端未开启 /v1/responses 端点 (HTTP {code})"
             })
         return results
-        return results
 
     # ── Layer 2 实现: Anthropic Messages ──
     def check_anthropic_messages(self) -> List[Dict[str, Any]]:

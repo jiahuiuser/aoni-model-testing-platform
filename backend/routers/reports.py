@@ -562,7 +562,6 @@ def api_download_report(
 
     docker_cmd = mr.docker_command or "vllm serve --port 8300 --max-model-len 40960 --gpu-memory-utilization 0.8"
     d_info = parse_full_docker_cmd(docker_cmd)
-    engine_label = "llama.cpp 推理引擎" if d_info["engine"] == "llama_cpp" else "vLLM 推理引擎"
 
     # 动态解析设备最近监控资源；探测不到时回退为已登记的 Total（不再写死 90GiB）
     mem_used_str = None
@@ -570,7 +569,6 @@ def api_download_report(
         mem_info = dev.last_check_detail.get("memory", {})
         if isinstance(mem_info, dict) and "used" in mem_info:
             mem_used_str = f"约 {mem_info['used']} 已用"
-    mem_spec = f"{mem_total_gb:g} GiB 总量" + (f"，{mem_used_str}" if mem_used_str else "") + f"（{engine_label} + 评测并发运行）"
 
     # 性能指标统计
     perf_list = mr.perf_results or []
@@ -657,6 +655,7 @@ def api_download_report(
     lines.append("")
 
     if not valid_perfs:
+        _top = []
         summary_text = (
             f"**{mr.model_name}** 未获取到有效性能数据（完成 {completed_tests}/{total_tests} 组，完成率 {pass_rate}），"
             "本报告不基于吞吐/延迟作出性能结论，仅记录部署与环境配置。"
@@ -676,61 +675,77 @@ def api_download_report(
             else:
                 _conc_clause = (f"该峰值出现在 **{_peak_conc} 路并发**（输入 {_peak_il} / 输出 {_peak_ol}），"
                                 f"为多请求批量叠加下的**聚合吞吐**。")
-        summary_text = (
-            f"在 **{dev_name}** 算力平台上，**{mr.model_name}** 模型在实测场景下最高输出吞吐达到 **{max_tput:.2f} tok/s**，"
-            f"最佳首字响应延迟 (TTFT) 控制在 **{min_ttft:.2f} ms**。"
-            + (f"{_conc_clause} " if _conc_clause else "")
-            + f"在评测矩阵中完成 {completed_tests} 组测试，失败 {failed_tests} 组，完成率 {pass_rate}。{reliability_clause}。"
-        )
+
+        # 场景化推荐：规则自动生成，仅基于本报告自身数据；用于让结论以"场景主导"而非"峰值主导"
+        _top = []
+        if max_tput > 0 and completion_ratio >= 0.9:
+            _peak = max_tput
+            _is_large = (mr.size_category or "") == "medium_large"
+            _nb = re.search(r"(\d{2,})\s*b\b", (mr.model_slug or "").lower()) or re.search(r"(\d{2,})\s*b\b", (mr.model_name or "").lower())
+            if _nb and int(_nb.group(1)) >= 20:
+                _is_large = True
+            _single_thr = 0.15 if _is_large else 0.25
+            _cand = []
+            _rows = [p for p in valid_perfs if p.input_len and p.input_len >= 1433 and p.throughput_tok_s and p.throughput_tok_s > _peak * 0.40]
+            if _rows:
+                _r = max(_rows, key=lambda x: x.throughput_tok_s)
+                _cand.append((_r.throughput_tok_s / _peak, _r, "lc"))
+            _rows = [p for p in valid_perfs if p.concurrency and p.concurrency >= 16 and p.p99_ttft_ms is not None and p.p99_ttft_ms < 1000 and p.throughput_tok_s and p.throughput_tok_s > _peak * 0.60]
+            if _rows:
+                _r = max(_rows, key=lambda x: x.throughput_tok_s)
+                _cand.append((_r.throughput_tok_s / _peak, _r, "hc"))
+            _rows = [p for p in valid_perfs if p.concurrency == 1 and p.throughput_tok_s and p.throughput_tok_s > _peak * _single_thr]
+            if _rows:
+                _r = max(_rows, key=lambda x: x.throughput_tok_s)
+                _cand.append((_r.throughput_tok_s / _peak, _r, "sd"))
+            _rows = [p for p in valid_perfs if p.output_len and p.output_len >= 4096 and p.throughput_tok_s and p.throughput_tok_s > _peak * 0.30]
+            if _rows:
+                _r = max(_rows, key=lambda x: x.throughput_tok_s)
+                _cand.append((_r.throughput_tok_s / _peak, _r, "lo"))
+            _cand.sort(key=lambda x: x[0], reverse=True)
+            _top = _cand[:2]
+
+        if _top:
+            # 摘要以业务场景推荐为主导，峰值仅作参考，弱化"单一峰值吞吐"
+            _briefs = []
+            for _s, _r, _k in _top:
+                if _k == "hc":
+                    _briefs.append(f"高并发实时交互 → `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.1f} tok/s，P99 {_r.p99_ttft_ms:.0f} ms")
+                elif _k == "lc":
+                    _briefs.append(f"长上下文理解 → `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.1f} tok/s")
+                elif _k == "sd":
+                    _tpot = f"{_r.mean_tpot_ms:.1f}" if _r.mean_tpot_ms is not None else "-"
+                    _briefs.append(f"单路解码 → `Input={_r.input_len}/Output={_r.output_len}/C=1`，单流 {_r.throughput_tok_s:.1f} tok/s（TPOT {_tpot} ms）")
+                elif _k == "lo":
+                    _briefs.append(f"长输出 → `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.1f} tok/s")
+            summary_text = (
+                f"在 **{dev_name}** 算力平台上，**{mr.model_name}** 评测完成 {completed_tests} 组（完成率 {pass_rate}，{reliability_clause}）。"
+                f"按**业务场景**推荐最佳配置：{'；'.join(_briefs)}。"
+                + (f"作为参考，多路聚合的峰值吞吐约 {max_tput:.1f} tok/s（{_conc_clause.rstrip('。')}）。" if _conc_clause else "")
+            )
+        else:
+            summary_text = (
+                f"在 **{dev_name}** 算力平台上，**{mr.model_name}** 实测最高输出吞吐 **{max_tput:.2f} tok/s**，"
+                f"最佳首字响应延迟 (TTFT) **{min_ttft:.2f} ms**。"
+                + (f"{_conc_clause} " if _conc_clause else "")
+                + f"完成 {completed_tests} 组，失败 {failed_tests} 组，完成率 {pass_rate}。{reliability_clause}。"
+            )
     lines.append(f"**一句话摘要**：{summary_text}")
 
-    # 场景化推荐：规则自动生成，仅基于本报告自身数据；数据不可靠(完成率<0.9)或无有效数据时不追加
-    if valid_perfs and max_tput > 0 and completion_ratio >= 0.9:
-        _peak = max_tput
-        # 大模型判定（≥20B）：从 slug/name 解析"NB"数字，或参数量级为 medium_large
-        _is_large = (mr.size_category or "") == "medium_large"
-        _nb = re.search(r"(\d{2,})\s*b\b", (mr.model_slug or "").lower()) or re.search(r"(\d{2,})\s*b\b", (mr.model_name or "").lower())
-        if _nb and int(_nb.group(1)) >= 20:
-            _is_large = True
-        _single_thr = 0.15 if _is_large else 0.25
-
-        _cand = []
-        # 1) 长上下文：Input ≥ 1433 且吞吐 > 峰值×0.4
-        _rows = [p for p in valid_perfs if p.input_len and p.input_len >= 1433 and p.throughput_tok_s and p.throughput_tok_s > _peak * 0.40]
-        if _rows:
-            _r = max(_rows, key=lambda x: x.throughput_tok_s)
-            _cand.append((_r.throughput_tok_s / _peak, _r, "lc"))
-        # 2) 高并发：并发 ≥ 16 且 P99 TTFT < 1000ms 且吞吐 > 峰值×0.6
-        _rows = [p for p in valid_perfs if p.concurrency and p.concurrency >= 16 and p.p99_ttft_ms is not None and p.p99_ttft_ms < 1000 and p.throughput_tok_s and p.throughput_tok_s > _peak * 0.60]
-        if _rows:
-            _r = max(_rows, key=lambda x: x.throughput_tok_s)
-            _cand.append((_r.throughput_tok_s / _peak, _r, "hc"))
-        # 3) 单路解码：Concurrency=1 且吞吐 > 峰值×(0.25 小模型 / 0.15 大模型)
-        _rows = [p for p in valid_perfs if p.concurrency == 1 and p.throughput_tok_s and p.throughput_tok_s > _peak * _single_thr]
-        if _rows:
-            _r = max(_rows, key=lambda x: x.throughput_tok_s)
-            _cand.append((_r.throughput_tok_s / _peak, _r, "sd"))
-        # 4) 长输出：Output ≥ 4096 且吞吐 > 峰值×0.3
-        _rows = [p for p in valid_perfs if p.output_len and p.output_len >= 4096 and p.throughput_tok_s and p.throughput_tok_s > _peak * 0.30]
-        if _rows:
-            _r = max(_rows, key=lambda x: x.throughput_tok_s)
-            _cand.append((_r.throughput_tok_s / _peak, _r, "lo"))
-
-        _cand.sort(key=lambda x: x[0], reverse=True)
-        _top = _cand[:2]
-        if _top:
-            lines.append("**场景化推荐**：")
-            for _score, _r, _kind in _top:
-                if _kind == "hc":
-                    lines.append(f"- **高并发实时交互**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.2f} tok/s，P99 TTFT 仅 {_r.p99_ttft_ms:.1f} ms，适合实时交互/客服场景。")
-                elif _kind == "lc":
-                    lines.append(f"- **长上下文理解**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.2f} tok/s，适合文档解析/RAG场景。")
-                elif _kind == "sd":
-                    _tpot = f"{_r.mean_tpot_ms:.1f}" if _r.mean_tpot_ms is not None else "-"
-                    lines.append(f"- **单路解码**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency=1`，单流吞吐 {_r.throughput_tok_s:.2f} tok/s（TPOT {_tpot} ms），适合单用户高体验场景。")
-                elif _kind == "lo":
-                    lines.append(f"- **长输出**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.2f} tok/s，适合内容生成/代码创作场景。")
-            lines.append("")
+    # 场景化推荐明细（紧随摘要），数据可靠且存在突出维度时输出
+    if _top:
+        lines.append("**场景化推荐**：")
+        for _s, _r, _k in _top:
+            if _k == "hc":
+                lines.append(f"- **高并发实时交互**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.2f} tok/s，P99 TTFT 仅 {_r.p99_ttft_ms:.1f} ms，适合实时交互/客服场景。")
+            elif _k == "lc":
+                lines.append(f"- **长上下文理解**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.2f} tok/s，适合文档解析/RAG场景。")
+            elif _k == "sd":
+                _tpot = f"{_r.mean_tpot_ms:.1f}" if _r.mean_tpot_ms is not None else "-"
+                lines.append(f"- **单路解码**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency=1`，单流吞吐 {_r.throughput_tok_s:.2f} tok/s（TPOT {_tpot} ms），适合单用户高体验场景。")
+            elif _k == "lo":
+                lines.append(f"- **长输出**：推荐 `Input={_r.input_len}, Output={_r.output_len}, Concurrency={_r.concurrency}`，吞吐 {_r.throughput_tok_s:.2f} tok/s，适合内容生成/代码创作场景。")
+        lines.append("")
 
     lines.append("")
     lines.append("---")
@@ -769,9 +784,13 @@ def api_download_report(
     # 每组合 Prompt 数：优先取真实落的 raw_report（vLLM 有该字段）；
     # llama.cpp HTTP 压测 raw 无此字段，则按 output 长度回填任务配置 perf_rounds_config 的 num_prompts。
     _cfg_np_map = {}
+    _cfg_rounds = []  # [(config_input_len, num_prompts)]，用于裁剪后 input 就近匹配
     for _rd in (task_cfg.get("perf_rounds_config") or []):
         try:
             _npv = int(_rd.get("num_prompts") or 0)
+            _c_in = int(_rd.get("input_len") or 0)
+            if _npv and _c_in:
+                _cfg_rounds.append((_c_in, _npv))
             for _ol in (_rd.get("output_lens_str") or "").split(","):
                 _ol_s = _ol.strip()
                 if _npv and _ol_s.isdigit():
@@ -794,6 +813,18 @@ def api_download_report(
                 pass
         if combos[_key]["num_prompts"] is None and (_p.output_len in _cfg_np_map):
             combos[_key]["num_prompts"] = _cfg_np_map[_p.output_len]
+        if combos[_key]["num_prompts"] is None and _cfg_rounds:
+            # 输出长度被引擎裁剪后无法精确匹配配置，改按"配置轮次 input 及其 0.4×/0.8× 裁剪倍数"就近匹配（num_prompts 属整轮）
+            _best_d = None
+            _best_np = None
+            for _c_il, _c_np in _cfg_rounds:
+                for _m in (1.0, 0.4, 0.8):
+                    _d = abs(_c_il * _m - _p.input_len)
+                    if _best_d is None or _d < _best_d:
+                        _best_d = _d
+                        _best_np = _c_np
+            if _best_np is not None and _best_d <= max(128, int(min(_c_il for _c_il, _ in _cfg_rounds) * 0.5)):
+                combos[_key]["num_prompts"] = _best_np
     _n2 += 1
     lines.append(f"### 2.{_n2} 性能压测用例矩阵")
     lines.append("")
@@ -1221,20 +1252,38 @@ def api_download_report(
         if d_info["speculative_config"]:
             spec_clause = "借助 MTP 投机解码"
 
-        # 动态判定 1：整体部署与吞吐表现（数据真实时给出，并依据完成率/可靠性修正措辞）
-        if max_tput > 0:
-            throughput_clause = f"实测峰值输出吞吐达 **{max_tput:.2f} tok/s**，"
+        # 动态判定 1：结论先给"场景化选型"，弱化单一峰值（存在场景推荐时）
+        if _top:
+            _c_briefs = []
+            for _s, _r, _k in _top:
+                if _k == "hc":
+                    _c_briefs.append(f"「高并发实时交互」推荐 `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`（吞吐 {_r.throughput_tok_s:.1f} tok/s，P99 {_r.p99_ttft_ms:.0f} ms）")
+                elif _k == "lc":
+                    _c_briefs.append(f"「长上下文理解」推荐 `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`（吞吐 {_r.throughput_tok_s:.1f} tok/s）")
+                elif _k == "sd":
+                    _c_briefs.append(f"「单路解码」推荐 `Input={_r.input_len}/Output={_r.output_len}/C=1`（单流 {_r.throughput_tok_s:.1f} tok/s）")
+                elif _k == "lo":
+                    _c_briefs.append(f"「长输出」推荐 `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`（吞吐 {_r.throughput_tok_s:.1f} tok/s）")
+            lines.append(
+                f"{n}. **场景化选型结论**：在 `{dev_name}` 算力节点上，`{mr.model_name}`（{spec_clause}）评测完成率 {pass_rate}，{reliability_clause}。"
+                f"针对不同业务场景推荐最佳配置：{'；'.join(_c_briefs)}。"
+                + (f"可作为参考的多路聚合峰值吞吐约 {max_tput:.1f} tok/s（{_conc_clause.rstrip('。')}）。" if _conc_clause else "")
+            )
+            n += 1
         else:
-            throughput_clause = ""
-        lines.append(
-            f"{n}. **整体部署与吞吐表现**：在 `{dev_name}` 算力节点上，模型 `{mr.model_name}` {spec_clause} 运行。"
-            f"{throughput_clause}"
-            + (f"{_conc_clause} " if _conc_clause else "")
-            + f"最佳首字延迟控制在 **{min_ttft:.2f} ms**。当前配置 `--max-model-len` 为 `{max_len_val}`，"
-            f"显存分配方式为 `{gpu_util_val}`。{reliability_clause}。"
-            + ("因此本次结论**仅供参考，不作为最终选型依据**。" if completion_ratio < 0.9 else "")
-        )
-        n += 1
+            if max_tput > 0:
+                throughput_clause = f"实测峰值输出吞吐达 **{max_tput:.2f} tok/s**，"
+            else:
+                throughput_clause = ""
+            lines.append(
+                f"{n}. **整体部署与吞吐表现**：在 `{dev_name}` 算力节点上，模型 `{mr.model_name}` {spec_clause} 运行。"
+                f"{throughput_clause}"
+                + (f"{_conc_clause} " if _conc_clause else "")
+                + f"最佳首字延迟控制在 **{min_ttft:.2f} ms**。当前配置 `--max-model-len` 为 `{max_len_val}`，"
+                f"显存分配方式为 `{gpu_util_val}`。{reliability_clause}。"
+                + ("因此本次结论**仅供参考，不作为最终选型依据**。" if completion_ratio < 0.9 else "")
+            )
+            n += 1
 
         # 动态判定 2：Prefill 与长上下文瓶颈分析
         if len(valid_perfs) > 1:
