@@ -33,3 +33,7 @@ Thumbs.db
 # Local runtime artifacts
 frontend/frontend.log
 outputs/
+
+# Backup files
+*.bak
+*.bak_*

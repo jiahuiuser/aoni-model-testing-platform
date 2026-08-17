@@ -22,6 +22,8 @@ from backend.services.pipeline import get_concurrency_for_category
 
 log = logging.getLogger(__name__)
 CONTAINER_NAME = "aoni_benchmark_runner"
+# 全局串行化容器“清理+创建”，防止多路并发(含单模型重试)抢同一容器名导致 Conflict/token=0
+_container_launch_lock = threading.Lock()
 
 
 def _format_duration(seconds: float) -> str:
@@ -267,126 +269,128 @@ def _stop_container(runner: RemoteRunner, log_callback=None):
 
 
 def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callback) -> tuple[bool, str]:
-    """启动容器并返回 (成功, container_id)"""
-    # 强制无条件清空同名冲突容器，确保 docker run 绝不报 Conflict 错
-    runner.run_shell(f"sudo docker rm -f {CONTAINER_NAME} 2>/dev/null || docker rm -f {CONTAINER_NAME} 2>/dev/null", timeout=5)
-    time.sleep(1)
+    """启动容器并返回 (成功, container_id)。用全局锁串行化‘清理+创建’，避免并发抢同一容器名导致 Conflict/token=0。"""
+    with _container_launch_lock:
+        # 强制无条件清空同名冲突容器，确保 docker run 绝不报 Conflict 错
+        runner.run_shell(f"sudo docker rm -f {CONTAINER_NAME} 2>/dev/null || docker rm -f {CONTAINER_NAME} 2>/dev/null", timeout=5)
+        time.sleep(1)
 
-    cmd = docker_cmd.strip()
-    cmd = cmd.replace("&quot;", '"').replace("&amp;", "&")
-    cmd = cmd.replace("\\\n", " ").replace("\\", " ")
-    cmd = re.sub(r"\s+-([it]{1,2})\b", "", cmd)
-    cmd = re.sub(r"\s+--rm\b", "", cmd)
+        cmd = docker_cmd.strip()
+        cmd = cmd.replace("&quot;", '"').replace("&amp;", "&")
+        cmd = cmd.replace("\\\n", " ").replace("\\", " ")
+        cmd = re.sub(r"\s+-([it]{1,2})\b", "", cmd)
+        cmd = re.sub(r"\s+--rm\b", "", cmd)
 
-    # ── 本地模型优先策略 ────────────────────────────────────────────────────────
-    # 若本地 MODEL_ROOT/MODEL_NAME 目录已存在，直接使用本地权重，跳过 TOS 下载
-    _model_name_m = re.search(r"-e\s+MODEL_NAME=(\S+)", cmd)
-    _model_root_m = re.search(r"-e\s+MODEL_ROOT=(\S+)", cmd)
-    if _model_name_m and _model_root_m:
-        _model_name = _model_name_m.group(1)
-        _model_root_container = _model_root_m.group(1)  # 容器内路径, e.g. /models
-        # 找 volume 挂载：-v <host_path>:<container_root>
-        _vol_m = re.search(rf"-v\s+(\S+):{re.escape(_model_root_container)}", cmd)
-        _host_root = _vol_m.group(1) if _vol_m else None
-        if _host_root:
-            # 展开 ~
-            _host_root = os.path.expanduser(_host_root)
-            _local_model_path = os.path.join(_host_root, _model_name)
-            # 容器内的模型路径（挂载后）
-            _container_model_path = f"{_model_root_container}/{_model_name}"
-            if os.path.isdir(_local_model_path):
-                # 本地已有完整模型目录 → 强制禁用 TOS 下载
-                cmd = re.sub(r"-e\s+MODEL_OSS=\S+", "-e MODEL_OSS=False", cmd)
-                # 关键：vllm_monkey 在 MODEL_OSS=False 时不会自动传 --model 参数
-                # 必须在命令行里显式追加 --model <容器内路径>，否则 vLLM 使用默认模型
-                if "--model " not in cmd and "-m " not in cmd:
-                    # 在镜像名之后、其他 vllm 参数之前插入 --model
-                    cmd = re.sub(
-                        r"(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:[^\s]+|aoni/vllm/vllm-openai:\S+)\s*",
-                        rf"\1 --model {_container_model_path} ",
-                        cmd,
-                        count=1,
-                    )
-                if log_callback:
-                    log_callback("INFO", "", f"  [本地优先] 检测到本地模型: {_local_model_path}，已跳过 TOS 下载 (MODEL_OSS=False, --model {_container_model_path})", "container")
+        # ── 本地模型优先策略 ────────────────────────────────────────────────────────
+        # 若本地 MODEL_ROOT/MODEL_NAME 目录已存在，直接使用本地权重，跳过 TOS 下载
+        _model_name_m = re.search(r"-e\s+MODEL_NAME=(\S+)", cmd)
+        _model_root_m = re.search(r"-e\s+MODEL_ROOT=(\S+)", cmd)
+        if _model_name_m and _model_root_m:
+            _model_name = _model_name_m.group(1)
+            _model_root_container = _model_root_m.group(1)  # 容器内路径, e.g. /models
+            # 找 volume 挂载：-v <host_path>:<container_root>
+            _vol_m = re.search(rf"-v\s+(\S+):{re.escape(_model_root_container)}", cmd)
+            _host_root = _vol_m.group(1) if _vol_m else None
+            if _host_root:
+                # 展开 ~
+                _host_root = os.path.expanduser(_host_root)
+                _local_model_path = os.path.join(_host_root, _model_name)
+                # 容器内的模型路径（挂载后）
+                _container_model_path = f"{_model_root_container}/{_model_name}"
+                if os.path.isdir(_local_model_path):
+                    # 本地已有完整模型目录 → 强制禁用 TOS 下载
+                    cmd = re.sub(r"-e\s+MODEL_OSS=\S+", "-e MODEL_OSS=False", cmd)
+                    # 关键：vllm_monkey 在 MODEL_OSS=False 时不会自动传 --model 参数
+                    # 必须在命令行里显式追加 --model <容器内路径>，否则 vLLM 使用默认模型
+                    if "--model " not in cmd and "-m " not in cmd:
+                        # 在镜像名之后、其他 vllm 参数之前插入 --model
+                        cmd = re.sub(
+                            r"(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:[^\s]+|aoni/vllm/vllm-openai:\S+)\s*",
+                            rf"\1 --model {_container_model_path} ",
+                            cmd,
+                            count=1,
+                        )
+                    if log_callback:
+                        log_callback("INFO", "", f"  [本地优先] 检测到本地模型: {_local_model_path}，已跳过 TOS 下载 (MODEL_OSS=False, --model {_container_model_path})", "container")
+                else:
+                    if log_callback:
+                        log_callback("INFO", "", f"  [TOS 下载] 本地路径 {_local_model_path} 不存在，将从 TOS 拉取模型权重", "container")
+        # ───────────────────────────────────────────────────────────────────────────
+
+
+        if os.path.exists("/models/python_packages"):
+
+            if "-v /models/python_packages" not in cmd and "-v /models:" not in cmd:
+                cmd = re.sub(r"(docker run\b)", r"\1 -v /models/python_packages:/models/python_packages", cmd, count=1)
+            if "-e PYTHONPATH=" not in cmd:
+                cmd = re.sub(r"(docker run\b)", r"\1 -e PYTHONPATH=/models/python_packages:$PYTHONPATH", cmd, count=1)
+            if "-e PIP_FIND_LINKS=" not in cmd:
+                cmd = re.sub(r"(docker run\b)", r"\1 -e PIP_FIND_LINKS=file:///models/python_packages -e PIP_NO_INDEX=1", cmd, count=1)
+
+        if "-e VLLM_USE_V1=" not in cmd:
+            cmd = re.sub(r"(docker run\b)", r"\1 -e VLLM_USE_V1=0", cmd, count=1)
+
+        is_llama_cpp = "llama_cpp" in cmd or "llama-cpp" in cmd
+        if runner.is_remote:
+            cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "sudo docker run", cmd)
+            cmd = re.sub(r"\s+-d\b", "", cmd)
+            cmd = re.sub(r"\s+-it\b", "", cmd)
+            cmd = re.sub(r"\s+--rm\b", "", cmd)
+            cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
+            cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
+            if is_llama_cpp:
+                cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
             else:
-                if log_callback:
-                    log_callback("INFO", "", f"  [TOS 下载] 本地路径 {_local_model_path} 不存在，将从 TOS 拉取模型权重", "container")
-    # ───────────────────────────────────────────────────────────────────────────
-
-
-    if os.path.exists("/models/python_packages"):
-
-        if "-v /models/python_packages" not in cmd and "-v /models:" not in cmd:
-            cmd = re.sub(r"(docker run\b)", r"\1 -v /models/python_packages:/models/python_packages", cmd, count=1)
-        if "-e PYTHONPATH=" not in cmd:
-            cmd = re.sub(r"(docker run\b)", r"\1 -e PYTHONPATH=/models/python_packages:$PYTHONPATH", cmd, count=1)
-        if "-e PIP_FIND_LINKS=" not in cmd:
-            cmd = re.sub(r"(docker run\b)", r"\1 -e PIP_FIND_LINKS=file:///models/python_packages -e PIP_NO_INDEX=1", cmd, count=1)
-
-    if "-e VLLM_USE_V1=" not in cmd:
-        cmd = re.sub(r"(docker run\b)", r"\1 -e VLLM_USE_V1=0", cmd, count=1)
-
-    is_llama_cpp = "llama_cpp" in cmd or "llama-cpp" in cmd
-    if runner.is_remote:
-        cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "sudo docker run", cmd)
-        cmd = re.sub(r"\s+-d\b", "", cmd)
-        cmd = re.sub(r"\s+-it\b", "", cmd)
-        cmd = re.sub(r"\s+--rm\b", "", cmd)
-        cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
-        cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        if is_llama_cpp:
-            cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+                cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
+            # 清除重复的 --shm-size，然后统一追加一个
+            cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
+            cmd = re.sub(r"(sudo docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
         else:
-            cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
-        # 清除重复的 --shm-size，然后统一追加一个
-        cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
-        cmd = re.sub(r"(sudo docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
-    else:
-        cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "docker run", cmd)
-        cmd = re.sub(r"\s+-d\b", "", cmd)
-        cmd = re.sub(r"\s+-it\b", "", cmd)
-        cmd = re.sub(r"\s+--rm\b", "", cmd)
-        cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
-        cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-        if is_llama_cpp:
-            cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
-        else:
-            cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
-        # 清除重复的 --shm-size，然后统一追加一个
-        cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
-        cmd = re.sub(r"(docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
-    cmd = re.sub(r"--port\s+\d+", f"--port {port}", cmd)
-    if not is_llama_cpp:
-        if "--trust-remote-code" not in cmd:
-            cmd += " --trust-remote-code"
-        if ("-vl-" in cmd.lower() or "gemma-3" in cmd.lower() or "gemma-4" in cmd.lower()) and "--limit-mm-per-prompt" not in cmd:
-            cmd += ' --limit-mm-per-prompt \'{"image": 4}\''
-    if "nightly-aarch64" in cmd:
-        cmd = re.sub(r'(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:vllm-openai-nightly-aarch64|aoni/vllm/vllm-openai:nightly-aarch64)\s+vllm\s+serve(\s+[^-][^\s]*)?', r'\1', cmd)
+            cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "docker run", cmd)
+            cmd = re.sub(r"\s+-d\b", "", cmd)
+            cmd = re.sub(r"\s+-it\b", "", cmd)
+            cmd = re.sub(r"\s+--rm\b", "", cmd)
+            cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
+            cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
+            if is_llama_cpp:
+                cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
+            else:
+                cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
+            # 清除重复的 --shm-size，然后统一追加一个
+            cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
+            cmd = re.sub(r"(docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
+        cmd = re.sub(r"--port\s+\d+", f"--port {port}", cmd)
+        if not is_llama_cpp:
+            if "--trust-remote-code" not in cmd:
+                cmd += " --trust-remote-code"
+            if ("-vl-" in cmd.lower() or "gemma-3" in cmd.lower() or "gemma-4" in cmd.lower()) and "--limit-mm-per-prompt" not in cmd:
+                cmd += ' --limit-mm-per-prompt \'{"image": 4}\''
+        if "nightly-aarch64" in cmd:
+            cmd = re.sub(r'(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:vllm-openai-nightly-aarch64|aoni/vllm/vllm-openai:nightly-aarch64)\s+vllm\s+serve(\s+[^-][^\s]*)?', r'\1', cmd)
 
-    short_cmd = cmd[:300] + "..." if len(cmd) > 300 else cmd
-    log_callback("INFO", "", f"  [{runner.host_label}] docker run 命令: {short_cmd}", "container")
+        short_cmd = cmd[:300] + "..." if len(cmd) > 300 else cmd
+        log_callback("INFO", "", f"  [{runner.host_label}] docker run 命令: {short_cmd}", "container")
 
-    try:
-        res = runner.run_shell(cmd, timeout=10)
-        cid = res.stdout.strip()
-        if res.returncode == 0:
-            log_callback("INFO", "", f"  容器启动成功, ID: {cid[:12]}", "container")
-            time.sleep(2)
-            init_logs = runner.run_docker(["logs", "--tail", "30", CONTAINER_NAME], timeout=10)
-            if init_logs.stdout:
-                for line in init_logs.stdout.strip().split("\n"):
-                    if line.strip():
-                        log_callback("DEBUG", "", f"   [Container Log] {line.strip()[:200]}", "container")
-            return True, cid
-        else:
-            err_msg = (res.stderr or res.stdout or "").strip()
-            log_callback("ERROR", "", f"❌ 容器启动失败 (docker run returncode={res.returncode}): {err_msg[:300]}", "container")
+        try:
+            res = runner.run_shell(cmd, timeout=10)
+            cid = res.stdout.strip()
+            if res.returncode == 0:
+                log_callback("INFO", "", f"  容器启动成功, ID: {cid[:12]}", "container")
+                time.sleep(2)
+                init_logs = runner.run_docker(["logs", "--tail", "30", CONTAINER_NAME], timeout=10)
+                if init_logs.stdout:
+                    for line in init_logs.stdout.strip().split("\n"):
+                        if line.strip():
+                            log_callback("DEBUG", "", f"   [Container Log] {line.strip()[:200]}", "container")
+                return True, cid
+            else:
+                err_msg = (res.stderr or res.stdout or "").strip()
+                log_callback("ERROR", "", f"❌ 容器启动失败 (docker run returncode={res.returncode}): {err_msg[:300]}", "container")
+                return False, ""
+        except Exception as e:
+            log_callback("ERROR", "", f"❌ 容器启动异常: {e}", "container")
             return False, ""
-    except Exception as e:
-        log_callback("ERROR", "", f"❌ 容器启动异常: {e}", "container")
-        return False, ""
+
 
 
 def _save_container_logs_to_file(runner: RemoteRunner, task_id: int, model_slug: str):
@@ -1037,6 +1041,21 @@ def _run_vllm_bench_single(runner: RemoteRunner, port, concurrency, input_len, o
     if log_callback:
         log_callback("INFO", "", f"  ⚡ [{runner.host_label}] 执行原生压测指令:\n  ➜ {raw_cmd_str}", "perf")
 
+    # 重要修复: 每次压测前清空共享结果目录，保证只看到本次的结果文件
+    # (避免按 mtime 误读上一次组合的残留 JSON)
+    host_dir = "/tmp/vllm_bench_host"
+    subprocess.run(["mkdir", "-p", host_dir], capture_output=True)
+    for _f in Path(host_dir).glob("*.json"):
+        try:
+            _f.unlink()
+        except OSError:
+            pass
+    # 清空容器内的压测结果目录
+    try:
+        runner.run_shell(f"sudo docker exec {CONTAINER_NAME} sh -c 'rm -rf {result_dir}/* 2>/dev/null || true'", timeout=30)
+    except Exception:
+        pass
+
     try:
         res = runner.run(cmd, timeout=1800)
 
@@ -1078,16 +1097,42 @@ def _run_vllm_bench_single(runner: RemoteRunner, port, concurrency, input_len, o
                 ["sudo", "docker", "cp", f"{CONTAINER_NAME}:{result_dir}/.", host_dir],
                 capture_output=True, timeout=30)
 
-        # 查找最新的 JSON 文件
+        # 修复: 按组合匹配读取 JSON，不只看 mtime
+        # 优先按文件名（含 concurrency）匹配，并校验 max_concurrency 与本次目标一致
         host_path = Path(host_dir)
-        json_files = sorted(host_path.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+        json_files = list(host_path.glob("*.json"))
         raw_report = None
-        if json_files:
+
+        def _pick_report(file):
             try:
-                with open(json_files[0]) as f:
-                    raw_report = json.load(f)
+                with open(file, encoding="utf-8") as f:
+                    return json.load(f)
             except Exception:
-                pass
+                return None
+
+        if json_files:
+            # 1) 优先找文件名里包含本次并发数的
+            target = f"concurrency{concurrency}"
+            for f in json_files:
+                if target in f.name:
+                    cand = _pick_report(f)
+                    if cand is not None:
+                        raw_report = cand
+                        break
+            # 2) 备用：校验 JSON 内部 max_concurrency 匹配
+            if raw_report is None:
+                for f in sorted(json_files, key=lambda p: p.stat().st_mtime, reverse=True):
+                    cand = _pick_report(f)
+                    if cand is None:
+                        continue
+                    mc = cand.get("max_concurrency")
+                    if mc is not None and int(mc) == int(concurrency):
+                        raw_report = cand
+                        break
+                    # 允许但不支持直接配对回论过爬，不再用不匹配的
+            # 3) 如果按并发找不到，不复用更早的残留，返回无数据导致本组合失败
+            if raw_report is None:
+                log_callback("WARNING", "", f"  ⚠ 本组合 (c={concurrency},输出={output_len}) 未找到匹配的压测结果文件，不复用旧数据", "perf")
 
         # 从 JSON 提取关键指标
         metrics = {"concurrency": concurrency}

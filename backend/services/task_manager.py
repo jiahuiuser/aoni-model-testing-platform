@@ -163,7 +163,33 @@ def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) ->
 
 
 def start_task(task_id: int):
-    """后台线程启动任务，并登记该任务对其设备的占用"""
+    """后台线程启动任务，并登记该任务对其设备的占用。
+
+    设备串行保护：若目标设备已被其他任务以 RUNNING 占用，则本任务
+    不启动，而是转为 QUEUED 并加入该设备的串行队列等待，确保同一设备
+    同一时间只允许一个任务在真正执行性能测试（防止容器/GPU 资源争抢）。
+    """
+    # 设备忙检查：若设备已被其他任务占用，入队等待而不是并发抢占
+    try:
+        with session_factory() as db:
+            t = db.get(Task, task_id)
+            dev_id = _device_of_task(t)
+            if dev_id is not None:
+                with _device_queue_lock:
+                    current = _device_running.get(dev_id)
+                if current is not None and current != task_id:
+                    # 设备忙 → 本任务排队，不启动线程
+                    t.status = TaskStatus.QUEUED
+                    db.commit()
+                    with _device_queue_lock:
+                        if task_id not in _device_queue.setdefault(dev_id, []):
+                            _device_queue[dev_id].append(task_id)
+                    _add_log(db, task_id, "INFO", None,
+                             f"设备 #{dev_id} 正在运行任务 #{current}，本任务加入串行队列排队等待（QUEUED）", "system")
+                    return
+    except Exception:
+        pass
+
     _pause_flags[task_id] = False
     _cancel_flags[task_id] = False
     # 登记设备占用
@@ -546,15 +572,11 @@ def recover_running_tasks():
         # 清空旧的运行态占用，重新登记
         _device_running.clear()
         _device_queue.clear()
-        # 1. 恢复运行态任务线程
+        # 1. 恢复运行态任务线程 (start_task 内含设备串行保护：设备已被占用时自动入队等待)
         running_tasks = db.query(Task).filter(Task.status == TaskStatus.RUNNING).all()
         for t in running_tasks:
             if t.id not in _running_tasks:
                 start_task(t.id)
-            dev = _device_of_task(t)
-            if dev is not None:
-                with _device_queue_lock:
-                    _device_running.setdefault(dev, t.id)
 
         # 2. 恢复定时等待态/排队态任务线程 (若定时时间已到或即将到期，自动拉起下发)
         scheduled_tasks = db.query(Task).filter(
