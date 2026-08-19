@@ -814,7 +814,12 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
         if m_len:
             max_model_len = int(m_len.group(1))
 
-    rounds_config = config.get("perf_rounds_config", [])
+    _pm_ov = (config.get("per_model_config") or {}).get(model_run.model_slug) or {}
+    _pm_rounds = _pm_ov.get("perf_rounds_config") if isinstance(_pm_ov, dict) else None
+    if isinstance(_pm_rounds, list) and _pm_rounds:
+        rounds_config = _pm_rounds
+    else:
+        rounds_config = config.get("perf_rounds_config", [])
 
     if not rounds_config:
         # 根据模型的 max_model_len 智能构建 5 档上下文压测矩阵 (从 128 到 128K)
@@ -846,6 +851,34 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
         fallback_id = m.group(1).strip() if m else model_run.model_name
         vllm_model_name = _resolve_verified_model_id(api_cfg, fallback_id, log_callback, model_run.model_slug)
         use_fallback = is_llama_cpp or not _check_vllm_bench(runner)
+
+    # 任务级显式选择压测框架，覆盖自动判定：auto(默认) / custom / native；模型级覆盖优先
+    task_cfg = (model_run.task.config or {}) if getattr(model_run, "task", None) else {}
+    _pm = (task_cfg.get("per_model_config") or {}).get(model_run.model_slug) or {}
+    if isinstance(_pm, dict) and _pm.get("benchmark_framework"):
+        bench_framework = _pm.get("benchmark_framework")
+    else:
+        bench_framework = task_cfg.get("benchmark_framework", "auto")
+    if bench_framework == "custom":
+        if not use_fallback:
+            log_callback("INFO", model_run.model_slug, "  ⚙ 已选择【自定义 HTTP 压测】", "perf")
+        use_fallback = True
+    elif bench_framework == "native":
+        if is_external:
+            log_callback("WARNING", model_run.model_slug,
+                         "  ⚠ 选择了原生压测，但为外部 API 模型（无法在容器内跑 vllm bench），改用自定义 HTTP 压测", "perf")
+            use_fallback = True
+        elif is_llama_cpp:
+            log_callback("WARNING", model_run.model_slug,
+                         "  ⚠ 选择了原生压测，但为 GGUF(llama.cpp) 模型（不支持 vLLM bench），改用自定义 HTTP 压测", "perf")
+            use_fallback = True
+        elif not _check_vllm_bench(runner):
+            log_callback("WARNING", model_run.model_slug,
+                         "  ⚠ 选择了原生压测，但容器内无可用 vllm bench，改用自定义 HTTP 压测", "perf")
+            use_fallback = True
+        else:
+            log_callback("INFO", model_run.model_slug, "  ⚙ 已选择【原生 vLLM 压测】", "perf")
+            use_fallback = False
 
     # 预先计算并解析总压测项数
     parsed_rounds = []
@@ -935,6 +968,10 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
                     result = _run_http_benchmark(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, api_cfg=api_cfg)
                 else:
                     result = _run_vllm_bench_single(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, log_callback)
+                    if result and result.get("error") == "native_bench_unavailable":
+                        log_callback("WARNING", model_run.model_slug,
+                                     "  ⚠ 原生 bench 在当前容器不可用，回退到自定义 HTTP 压测", "perf")
+                        result = _run_http_benchmark(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, api_cfg=None)
 
                 completed_steps += 1
                 elapsed_sec = time.time() - perf_start_time
@@ -996,50 +1033,81 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
     return True
 
 
-def _check_vllm_bench(runner: RemoteRunner) -> bool:
-    """检查容器内是否有 vllm 原生基准测试工具 (支持多种 vllm 入口)。
+# 每个容器探测到的可用原生压测入口做缓存，避免对每个组合重复探测。
+# key: (device id | local, CONTAINER_NAME)；value: (sub_cmd_list, kind) 或 None
+_BENCH_CMD_CACHE: dict = {}
+_BENCH_CMD_CACHE_LOCK = threading.Lock()
 
-    注意：容器在压测时段 GPU 繁忙，docker exec 启动子进程可能较慢，
-    因此使用足够的探测超时（首次 8s，重试 20s），避免把"探测超时"
-    误判为"无 vllm bench"而错误回退到低效的 HTTP 压测。
+
+def _probe_bench_cmd(runner: RemoteRunner):
+    """探测容器内真实可用的原生压测入口，返回 (入口命令子列表, 种类) 或 None。
+
+    探测结果会被缓存。顺序:
+      1. 新版 vllm 的 `vllm bench serve`（当前 aarch64 nightly 用的入口，输出含 ITL）
+      2. 旧版 vllm 的 `python3 -m vllm.entrypoints.openai.bench_serving`
+
+    注意：GPU 繁忙时 docker exec 启动子进程可能较慢，因此加大探测超时，
+    避免把"探测超时"误判为"无 vllm bench"而错误回退到低效的 HTTP 压测。
     """
+    cache_key = (id(runner.device) if runner.device else "local", CONTAINER_NAME)
+    with _BENCH_CMD_CACHE_LOCK:
+        if cache_key in _BENCH_CMD_CACHE:
+            return _BENCH_CMD_CACHE[cache_key]
+
     checks = [
-        ["vllm", "--help"],
-        ["python3", "-m", "vllm.entrypoints.openai.bench_serving", "--help"],
-        ["vllm", "bench", "serve", "--help"],
+        (["vllm", "bench", "serve"], "vllm_bench"),
+        (["python3", "-m", "vllm.entrypoints.openai.bench_serving"], "legacy_serving"),
     ]
-    for attempt_timeout in (8, 20):
-        for sub in checks:
-            try:
-                res1 = runner.run_docker(["exec", CONTAINER_NAME] + sub, timeout=attempt_timeout)
-                if res1 and res1.returncode == 0:
-                    return True
-            except Exception:
-                continue
-    return False
+    result = None
+    for sub, kind in checks:
+        try:
+            res1 = runner.run_docker(["exec", CONTAINER_NAME] + sub + ["--help"], timeout=30)
+            if res1 and res1.returncode == 0:
+                result = (sub, kind)
+                break
+        except Exception:
+            continue
+        time.sleep(0.2)
+
+    with _BENCH_CMD_CACHE_LOCK:
+        _BENCH_CMD_CACHE[cache_key] = result
+    return result
+
+
+def _check_vllm_bench(runner: RemoteRunner) -> bool:
+    """检查容器内是否有 vllm 原生基准测试工具 (支持多种 vllm 入口)。"""
+    return _probe_bench_cmd(runner) is not None
 
 
 def _run_vllm_bench_single(runner: RemoteRunner, port, concurrency, input_len, output_len,
                            num_prompts, model_name, log_callback=None) -> dict | None:
-    """调用原生 vllm bench serve 压测工具，实时打字机刷出完整 Shell 压测命令"""
+    """调用容器内可用的原生 vllm bench 压测工具（自动适配新版/旧版入口），实时打字机刷出完整 Shell 压测命令"""
     import os as _os
 
-    result_dir = "/tmp/vllm_bench_results"
-    cmd = ["sudo", "docker", "exec", CONTAINER_NAME, "vllm", "bench", "serve",
-           "--host", "127.0.0.1", "--port", str(port),
-           "--dataset-name", "random",
-           "--random-input-len", str(input_len),
-           "--random-output-len", str(output_len),
-           "--num-prompts", str(num_prompts),
-           "--max-concurrency", str(concurrency),
-           "--request-rate", "inf", "--ignore-eos",
-           "--save-result",
-           "--result-dir", result_dir]
+    probed = _probe_bench_cmd(runner)
+    if probed is None:
+        if log_callback:
+            log_callback("WARNING", "", f"  ⚠ [{runner.host_label}] 容器内未探测到可用的原生 vllm bench，本组合将按自定义 HTTP 压测兜底", "perf")
+        return {"concurrency": concurrency, "error": "native_bench_unavailable"}
 
-    raw_cmd_str = f"vllm bench serve --host 127.0.0.1 --port {port} --dataset-name random --random-input-len {input_len} --random-output-len {output_len} --num-prompts {num_prompts} --max-concurrency {concurrency} --request-rate inf"
+    bench_sub, bench_kind = probed
+    result_dir = "/tmp/vllm_bench_results"
+    cmd = (["sudo", "docker", "exec", CONTAINER_NAME] + bench_sub +
+           ["--host", "127.0.0.1", "--port", str(port),
+            "--dataset-name", "random",
+            "--random-input-len", str(input_len),
+            "--random-output-len", str(output_len),
+            "--num-prompts", str(num_prompts),
+            "--max-concurrency", str(concurrency),
+            "--request-rate", "inf", "--ignore-eos",
+            "--save-result",
+            "--result-dir", result_dir])
+
+    raw_cmd_str = f"{' '.join(bench_sub)} --host 127.0.0.1 --port {port} --dataset-name random --random-input-len {input_len} --random-output-len {output_len} --num-prompts {num_prompts} --max-concurrency {concurrency} --request-rate inf"
+    bench_display = "vllm bench serve" if bench_kind == "vllm_bench" else "bench_serving(旧版入口)"
 
     if log_callback:
-        log_callback("INFO", "", f"  ⚡ [{runner.host_label}] 执行原生压测指令:\n  ➜ {raw_cmd_str}", "perf")
+        log_callback("INFO", "", f"  ⚡ [{runner.host_label}] 执行原生压测({bench_display}):\n  ➜ {raw_cmd_str}", "perf")
 
     # 重要修复: 每次压测前清空共享结果目录，保证只看到本次的结果文件
     # (避免按 mtime 误读上一次组合的残留 JSON)
@@ -1168,9 +1236,13 @@ def _run_vllm_bench_single(runner: RemoteRunner, port, concurrency, input_len, o
 
 def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, output_len,
                         num_prompts, model_name, api_cfg: dict = None) -> dict | None:
-    """HTTP API 压测（fallback / 外部 API 端点）"""
-    import requests
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """HTTP API 压测（fallback / 外部 API 端点）— aiohttp 异步并发版。
+
+    参考 model-testing-tool 的异步实现：用 asyncio + Semaphore 控并发，
+    逐 token 记录 TTFT / ITL，并用 usage.completion_tokens 取精确输出 token 数。
+    """
+    import asyncio
+    import aiohttp
 
     if api_cfg:
         url = api_cfg["chat_url"]
@@ -1181,92 +1253,14 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
         ping_url = f"http://{runner.api_host}:{port}/v1/models"
         api_key = "EMPTY"
 
-    headers = {}
+    headers = {"Content-Type": "application/json"}
     if api_key and api_key != "EMPTY":
         headers["Authorization"] = f"Bearer {api_key}"
 
-    # 1. 快速检查端口连通性，并动态尝试获取 vLLM 实际注册的服务模型名称
-    try:
-        resp = requests.get(ping_url, headers=headers, timeout=5)
-        if resp.status_code == 200:
-            m_data = resp.json()
-            if isinstance(m_data, dict) and "data" in m_data and len(m_data["data"]) > 0:
-                served_model_id = m_data["data"][0].get("id")
-                if served_model_id:
-                    model_name = served_model_id
-    except Exception as ping_err:
-        try:
-            requests.options(url, headers=headers, timeout=5)
-        except Exception:
-            return {
-                "concurrency": concurrency,
-                "error": f"目标模型 API 端点 ({url}) 无法连接: Connection refused",
-                "request_throughput": 0.0,
-                "output_throughput": 0.0,
-                "mean_ttft_ms": 0.0,
-                "median_ttft_ms": 0.0,
-                "p99_ttft_ms": 0.0,
-                "mean_tpot_ms": 0.0,
-                "median_tpot_ms": 0.0,
-                "p99_tpot_ms": 0.0,
-            }
-
-    # 生成与 input_len 匹配的输入：不再用 2000 词硬截断，按目标 token 数近似构造
-    word_count = max(1, input_len)  # 近似：每个 "hello " 约 1 token；数字穿插提升分词粒度
-    parts = []
-    for i in range(word_count):
-        parts.append(str(i % 10000) if i % 17 == 0 else "hello")
-    prompt_text = " ".join(parts)
-
-    def send_request():
-        t_start = time.time()
-        payload = {"model": model_name, "messages": [{"role": "user", "content": prompt_text}],
-                   "max_tokens": output_len, "temperature": 0, "stream": True}
-        try:
-            r = requests.post(url, json=payload, headers=headers, timeout=30, stream=True)
-            if r.status_code != 200:
-                return {"success": False, "error_msg": f"HTTP {r.status_code}: {(r.text or '')[:120]}"}
-            first_token_ts = None; token_count = 0; last_ts = t_start
-            for line in r.iter_lines():
-                if not line: continue
-                line = line.decode("utf-8")
-                if line.startswith("data: "):
-                    if line[6:] in ("[DONE]", ""): break
-                    if first_token_ts is None: first_token_ts = time.time()
-                    token_count += 1; last_ts = time.time()
-            total = time.time() - t_start
-            ttft = (first_token_ts - t_start) if first_token_ts else total
-            tpot = ((last_ts - first_token_ts) / token_count) if first_token_ts and token_count > 0 else 0
-            return {"ttft": ttft, "tpot": tpot, "output_tokens": token_count, "success": token_count > 0}
-        except Exception as err:
-            return {"success": False, "error_msg": str(err)}
-
-    import threading as _threading
-    t0 = time.time()
-    results = []
-    sem = _threading.Semaphore(max(1, concurrency))  # 真正限制同时运行的请求数 = 目标并发
-    done_cnt = [0]
-    lock = _threading.Lock()
-
-    def _wrapped_send():
-        with sem:
-            res = send_request()
-        with lock:
-            done_cnt[0] += 1
-        return res
-
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as ex:
-        futures = [ex.submit(_wrapped_send) for _ in range(num_prompts)]
-        for f in as_completed(futures):
-            results.append(f.result())
-    total_time = time.time() - t0
-
-    successes = [r for r in results if r.get("success")]
-    if not successes:
-        first_err = results[0].get("error_msg") if results else "未收到响应"
+    def _err_dict(err_msg, err_key="error"):
         return {
             "concurrency": concurrency,
-            "error": f"目标模型 API 服务未正常响应: {first_err}",
+            err_key: err_msg,
             "request_throughput": 0.0,
             "output_throughput": 0.0,
             "mean_ttft_ms": 0.0,
@@ -1275,22 +1269,140 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
             "mean_tpot_ms": 0.0,
             "median_tpot_ms": 0.0,
             "p99_tpot_ms": 0.0,
+            "mean_itl_ms": 0.0,
+            "median_itl_ms": 0.0,
+            "p99_itl_ms": 0.0,
         }
 
-    ttfts = sorted([r["ttft"] for r in successes])
-    tpots = sorted([r["tpot"] for r in successes])
+    # 1. 快速检查端口连通性，并动态尝试获取实际注册的服务模型名称（aiohttp 异步）
+    try:
+        async def _ping():
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession() as s:
+                async with s.get(ping_url, headers=headers, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        d = await resp.json()
+                        data = d.get("data") or []
+                        if data and data[0].get("id"):
+                            return data[0]["id"]
+            return None
+        served = asyncio.run(_ping())
+        if served:
+            model_name = served
+    except Exception:
+        # 无法 ping 通也尝试直接压（由 send 阶段兜底报错）
+        pass
+
+    # 生成与 input_len 匹配的输入：按目标 token 数近似构造
+    word_count = max(1, input_len)
+    parts = []
+    for i in range(word_count):
+        parts.append(str(i % 10000) if i % 17 == 0 else "hello")
+    prompt_text = " ".join(parts)
+
+    # 宽松超时：输出越长给越多时间（含慢模型）
+    timeout_sec = max(300, int(output_len * 0.20) + 60)
+    client_timeout = aiohttp.ClientTimeout(total=timeout_sec)
+
+    async def _send(session, sem):
+        async with sem:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": prompt_text}],
+                "max_tokens": output_len, "temperature": 0,
+                "stream": True, "stream_options": {"include_usage": True},
+            }
+            st = time.perf_counter()
+            token_ts = []
+            usage_tokens = 0
+            try:
+                async with session.post(url, json=payload, headers=headers,
+                                        timeout=client_timeout) as resp:
+                    if resp.status != 200:
+                        body = (await resp.text())[:120]
+                        return {"success": False, "error_msg": f"HTTP {resp.status}: {body}"}
+                    async for line_bytes in resp.content:
+                        line = line_bytes.decode("utf-8").strip()
+                        if not line or line.startswith(":"):
+                            continue
+                        if not line.startswith("data: "):
+                            continue
+                        part = line[6:].strip()
+                        if part in ("[DONE]", ""):
+                            break
+                        try:
+                            chunk = json.loads(part)
+                        except Exception:
+                            continue
+                        now = time.perf_counter()
+                        if chunk.get("usage"):
+                            usage_tokens = chunk["usage"].get("completion_tokens") or 0
+                        choices = chunk.get("choices") or []
+                        if choices:
+                            delta = choices[0].get("delta") or {}
+                            if delta.get("content"):
+                                token_ts.append(now)
+                    if not token_ts:
+                        return {"success": False, "error_msg": "未收到任何输出 token"}
+                    n = len(token_ts)
+                    ttft = token_ts[0] - st
+                    latency = token_ts[-1] - st
+                    # 逐 token 到达间隔 ITL
+                    itl_vals = [token_ts[i] - token_ts[i - 1] for i in range(1, n)] if n > 1 else []
+                    itl_mean = (sum(itl_vals) / len(itl_vals)) if itl_vals else 0.0
+                    # TPOT = (端到端 − TTFT) ÷ (输出token数 − 1)
+                    tpot = ((latency - ttft) / (n - 1)) if n > 1 else 0.0
+                    return {"success": True, "error_msg": "",
+                            "ttft": ttft, "itl": itl_mean, "itl_vals": itl_vals,
+                            "tpot": tpot,
+                            "output_tokens": usage_tokens if usage_tokens > 0 else n}
+            except Exception as err:
+                return {"success": False, "error_msg": str(err)}
+
+    async def _main():
+        connector = aiohttp.TCPConnector(limit=max(1, concurrency) + 10)
+        sem = asyncio.Semaphore(max(1, concurrency))
+        async with aiohttp.ClientSession(connector=connector, timeout=client_timeout) as session:
+            tasks = [_send(session, sem) for _ in range(max(1, num_prompts))]
+            return await asyncio.gather(*tasks, return_exceptions=True)
+
+    t0 = time.time()
+    try:
+        results = asyncio.run(_main())
+    except Exception as e:
+        return _err_dict(f"目标模型 API 端点 ({url}) 无法连接: {e}", err_key="error")
+
+    results = [r for r in results if isinstance(r, dict)]
+    total_time = time.time() - t0
+
+    successes = [r for r in results if r.get("success")]
+    if not successes:
+        first_err = results[0].get("error_msg") if results else "未收到响应"
+        return _err_dict(f"目标模型 API 服务未正常响应: {first_err}")
+
+    def _pq(vals, q):
+        vals = sorted(vals)
+        i = min(int(len(vals) * q), len(vals) - 1)
+        return vals[i]
+
+    ttfts = [r["ttft"] for r in successes]
+    tpots = [r["tpot"] for r in successes]
+    itls = [r["itl"] for r in successes]
     total_out = sum(r.get("output_tokens", 0) for r in successes)
 
     return {
         "concurrency": concurrency,
-        "request_throughput": len(results) / total_time,
+        "request_throughput": len(successes) / total_time,
         "output_throughput": total_out / total_time,
-        "mean_ttft_ms": sum(ttfts) / len(ttfts) * 1000,
-        "median_ttft_ms": ttfts[len(ttfts) // 2] * 1000,
-        "p99_ttft_ms": ttfts[min(int(len(ttfts) * 0.99), len(ttfts) - 1)] * 1000,
-        "mean_tpot_ms": sum(tpots) / len(tpots) * 1000,
-        "median_tpot_ms": tpots[len(tpots) // 2] * 1000,
-        "p99_tpot_ms": tpots[min(int(len(tpots) * 0.99), len(tpots) - 1)] * 1000,
+        "mean_ttft_ms": (sum(ttfts) / len(ttfts)) * 1000,
+        "median_ttft_ms": _pq(ttfts, 0.5) * 1000,
+        "p99_ttft_ms": _pq(ttfts, 0.99) * 1000,
+        "mean_tpot_ms": (sum(tpots) / len(tpots)) * 1000,
+        "median_tpot_ms": _pq(tpots, 0.5) * 1000,
+        "p99_tpot_ms": _pq(tpots, 0.99) * 1000,
+        "mean_itl_ms": (sum(itls) / len(itls)) * 1000,
+        "median_itl_ms": _pq(itls, 0.5) * 1000,
+        "p99_itl_ms": _pq(itls, 0.99) * 1000,
     }
 
 

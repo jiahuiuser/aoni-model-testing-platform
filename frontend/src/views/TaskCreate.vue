@@ -204,19 +204,25 @@
                 <!-- 已选模型配置查看 -->
                 <div v-if="selectedContainerModels.length > 0" class="selected-model-detail-box" style="margin-top: 12px">
                   <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px">
-                    <span style="font-weight: 600; font-size: 13px; color: #1f2937">已选模型配置速览 ({{ selectedContainerModels.length }})</span>
-                    <span style="font-size: 12px; color: #6b7280">点击查看模型部署与上下文配置</span>
+                    <span style="font-weight: 600; font-size: 13px; color: #1f2937">
+                      已选模型配置速览 ({{ selectedContainerModels.length }})
+                    </span>
+                    <el-button size="small" text type="primary" @click="pmListCollapsed = !pmListCollapsed">
+                      {{ pmListCollapsed ? '展开全部' : '收起' }}
+                    </el-button>
                   </div>
-                  <div v-for="m in selectedContainerModels" :key="m.slug" class="selected-model-item"
-                       @click="openModelConfig(m)" style="display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border: 1px solid #e5e7eb; border-radius: 6px; cursor: pointer; background: #f9fafb; margin-bottom: 6px">
-                    <div style="display: flex; align-items: center; gap: 8px; overflow: hidden">
-                      <el-tag size="small" type="info" effect="plain">#{{ m.idx }}</el-tag>
-                      <b style="font-size: 13px; color: #1f2937; white-space: nowrap">{{ m.name }}</b>
-                      <el-tag v-if="m.max_context_length" size="small" type="warning">{{ m.max_context_length }}</el-tag>
-                      <el-tag size="small" type="info">{{ m.engine }}</el-tag>
+                  <div v-show="!pmListCollapsed" class="pm-chip-wrap">
+                    <div v-for="m in selectedContainerModels" :key="m.slug" class="pm-chip"
+                         :class="{ 'pm-chip-configured': isPmConfigured(m.slug) }">
+                      <span class="pm-chip-name" :title="m.name">#{{ m.idx }} {{ m.name }}</span>
+                      <el-tag v-if="isPmConfigured(m.slug)" size="small" type="success" effect="dark">单独配置</el-tag>
+                      <div class="pm-chip-actions">
+                        <el-button size="small" text type="primary" @click.stop="openPmConfig(m)">用例</el-button>
+                        <el-button size="small" text @click.stop="openModelConfig(m)">详情</el-button>
+                      </div>
                     </div>
-                    <el-button size="small" type="primary" plain @click.stop="openModelConfig(m)">查看配置</el-button>
                   </div>
+                  <div style="font-size:12px;color:#909399;margin-top:6px">点击【用例】可单独设置该模型的矩阵与压测框架；【详情】查看部署与上下文。</div>
                 </div>
               </el-form-item>
             </el-card>
@@ -301,6 +307,19 @@
                 </el-alert>
               </template>
               <template v-else-if="form.config.perf_enabled">
+                <el-form-item label="压测框架">
+                  <el-radio-group v-model="form.config.benchmark_framework">
+                    <el-radio label="auto">自动</el-radio>
+                    <el-radio label="native">原生 vLLM</el-radio>
+                    <el-radio label="custom">自定义 HTTP</el-radio>
+                  </el-radio-group>
+                  <div class="form-tip">
+                    自动：GGUF(llama.cpp)/外部 → 自定义 HTTP，其余 → 原生 vLLM。<br>
+                    原生 vLLM：容器内执行 <code>vllm bench serve</code>，最准确，推荐。<br>
+                    自定义 HTTP：aiohttp 异步流式压测（fallback/GGUF/外部路径，同样输出 ITL/TPOT）。
+                  </div>
+                </el-form-item>
+
                 <div v-for="(round, index) in form.config.perf_rounds_config" :key="index" style="margin-bottom: 10px">
                   <div class="round-box">
                     <div class="round-header">
@@ -566,6 +585,52 @@
         </template>
       </template>
     </el-dialog>
+
+    <!-- 单模型单独配置弹窗 -->
+    <el-dialog v-model="pmDialogVisible" :title="`单独配置 — ${pmDialogModel?.name || ''}`" width="640px" append-to-body>
+      <el-form label-width="90px" label-position="left">
+        <el-form-item label="压测框架">
+          <el-radio-group v-model="pmForm.benchmark_framework">
+            <el-radio label="auto">跟随任务</el-radio>
+            <el-radio label="native">原生 vLLM</el-radio>
+            <el-radio label="custom">自定义 HTTP</el-radio>
+          </el-radio-group>
+        </el-form-item>
+
+        <el-form-item label="单独用例矩阵">
+          <div style="width: 100%">
+            <div v-for="(round, index) in pmForm.perf_rounds_config" :key="index" class="round-box" style="margin-bottom: 8px">
+              <div class="round-header">
+                <span><b>第 {{ index + 1 }} 轮</b></span>
+                <el-button
+                  v-if="pmForm.perf_rounds_config.length > 1"
+                  type="danger" size="small" text @click="removePmRound(index)">删除</el-button>
+              </div>
+              <el-row :gutter="10">
+                <el-col :span="8"><el-form-item label="输入" label-width="50px">
+                  <el-input v-model.number="round.input_len" size="small" placeholder="512" /></el-form-item>
+                </el-col>
+                <el-col :span="8"><el-form-item label="输出" label-width="50px">
+                  <el-input v-model="round.output_lens_str" size="small" placeholder="128,512" /></el-form-item>
+                </el-col>
+                <el-col :span="8"><el-form-item label="并发" label-width="50px">
+                  <el-input v-model="round.concurrencies_str" size="small" placeholder="1,4,8" /></el-form-item>
+                </el-col>
+              </el-row>
+              <el-form-item label="请求数"><el-input v-model.number="round.num_prompts" size="small" placeholder="100" /></el-form-item>
+            </div>
+            <el-button type="primary" plain size="small" @click="addPmRound">
+              <el-icon><Plus /></el-icon> 添加轮次
+            </el-button>
+          </div>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="pmDialogVisible = false">取消</el-button>
+        <el-button v-if="isPmConfigured(pmDialogModel?.slug)" @click="removePmConfig">清除单独配置</el-button>
+        <el-button type="primary" @click="savePmConfig">保存</el-button>
+      </template>
+    </el-dialog>
   </div>
 </template>
 
@@ -659,7 +724,9 @@ const form = reactive({
     gateway_protocols: ['openai', 'anthropic', 'responses'],
     test_longctx: false,
     perf_enabled: true,
+    benchmark_framework: 'auto',
     perf_rounds_config: [makeDefaultRound()],
+    per_model_config: {},
     acc_enabled: true,
     acc_datasets: ['mmlu', 'ceval', 'gsm8k', 'arc'],
     acc_limit: 200,
@@ -755,6 +822,62 @@ const configDialogModel = ref(null)
 const openModelConfig = (m) => {
   configDialogModel.value = m
   configDialogVisible.value = true
+}
+
+/* ---------- 单模型单独配置 ---------- */
+const pmDialogVisible = ref(false)
+const pmDialogModel = ref(null)
+const pmListCollapsed = ref(false)
+const pmForm = reactive({
+  benchmark_framework: 'auto',
+  perf_rounds_config: [makeDefaultRound()],
+})
+
+const isPmConfigured = (slug) => {
+  return Boolean(form.config.per_model_config && form.config.per_model_config[slug])
+}
+
+const openPmConfig = (m) => {
+  pmDialogModel.value = m
+  const exist = form.config.per_model_config && form.config.per_model_config[m.slug]
+  if (exist) {
+    pmForm.benchmark_framework = exist.benchmark_framework || 'auto'
+    pmForm.perf_rounds_config = exist.perf_rounds_config && exist.perf_rounds_config.length
+      ? exist.perf_rounds_config.map((r) => ({ ...r }))
+      : [makeDefaultRound()]
+  } else {
+    pmForm.benchmark_framework = 'auto'
+    pmForm.perf_rounds_config = [makeDefaultRound()]
+  }
+  pmDialogVisible.value = true
+}
+
+function addPmRound() {
+  pmForm.perf_rounds_config.push(makeDefaultRound())
+}
+
+function removePmRound(index) {
+  pmForm.perf_rounds_config.splice(index, 1)
+}
+
+const savePmConfig = () => {
+  if (!pmDialogModel.value) return
+  if (!form.config.per_model_config) form.config.per_model_config = {}
+  form.config.per_model_config[pmDialogModel.value.slug] = {
+    benchmark_framework: pmForm.benchmark_framework,
+    perf_rounds_config: pmForm.perf_rounds_config.map((r) => ({ ...r })),
+  }
+  ElMessage.success(`已为 ${pmDialogModel.value.name} 单独配置`)
+  pmDialogVisible.value = false
+}
+
+const removePmConfig = () => {
+  if (!pmDialogModel.value) return
+  if (form.config.per_model_config) {
+    delete form.config.per_model_config[pmDialogModel.value.slug]
+  }
+  ElMessage.success('已清除该模型的单独配置')
+  pmDialogVisible.value = false
 }
 
 const isExternalModelSelected = computed(() => {
@@ -942,6 +1065,9 @@ onMounted(async () => {
         const cfg = task.config || {}
         form.config.model_slugs = cfg.model_slugs || []
         form.config.perf_enabled = cfg.perf_enabled ?? true
+        form.config.benchmark_framework = cfg.benchmark_framework || 'auto'
+        form.config.per_model_config = (cfg.per_model_config && typeof cfg.per_model_config === 'object')
+          ? cfg.per_model_config : {}
         form.config.perf_rounds_config =
           cfg.perf_rounds_config && cfg.perf_rounds_config.length
             ? cfg.perf_rounds_config
@@ -1099,6 +1225,49 @@ onMounted(async () => {
   font-style: italic;
   padding: 12px 0;
   text-align: center;
+}
+
+/* 已选模型：紧凑标签流 */
+.pm-chip-wrap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  padding: 4px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #fafafa;
+}
+.pm-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  border: 1px solid #e5e7eb;
+  border-radius: 6px;
+  background: #ffffff;
+}
+.pm-chip-configured {
+  border-color: #67c23a;
+  background: #f0f9eb;
+}
+.pm-chip-name {
+  font-size: 12px;
+  font-weight: 600;
+  color: #1f2937;
+  white-space: nowrap;
+  max-width: 150px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.pm-chip-actions {
+  display: flex;
+  gap: 2px;
+}
+.pm-chip-actions .el-button {
+  padding: 0 4px;
+  font-size: 12px;
 }
 
 /* 底部固定吸底操作栏 */

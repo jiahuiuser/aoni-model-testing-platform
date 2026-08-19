@@ -219,6 +219,27 @@ class ModelRun(Base):
     acc_results = relationship("AccResult", back_populates="model_run", cascade="all, delete-orphan")
 
 
+# ---------- 镜像版本（离线采集, 报告直接查库） ----------
+
+class ImageVersion(Base):
+    """部署镜像的运行时版本快照，按 (image_repo, image_tag) 唯一。
+    由 scripts/capture_image_versions.py 离线采集写入；报告生成时据此展示真实 vLLM/llama.cpp 版本。"""
+    __tablename__ = "image_versions"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_repo = Column(String(500), nullable=False)
+    image_tag = Column(String(255), nullable=False)
+    engine = Column(String(50), default="vllm")          # vllm / llama_cpp
+    vllm_version = Column(String(100), nullable=True)     # 语义版号, 如 v0.22.1 / 0.8.3
+    llama_cpp_build = Column(String(100), nullable=True)  # llama.cpp build 号
+    python_version = Column(String(100), nullable=True)
+    torch_version = Column(String(100), nullable=True)
+    cuda_version = Column(String(100), nullable=True)
+    build_commit = Column(String(100), nullable=True)
+    source = Column(String(255), default="image")         # image-run / image-label
+    captured_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 # ---------- 性能测试结果 ----------
 
 class PerfResult(Base):

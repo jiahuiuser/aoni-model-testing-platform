@@ -112,6 +112,11 @@ def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) ->
     if not pass_models:
         raise ValueError("所选模型在目标设备节点上尚未完成部署验证（状态非 PASS），无法创建任务。请先在【模型管理】中为该设备绑定配置并验证 PASS。")
 
+    # 严格按 config.model_slugs 传入顺序排定模型运行次序（实现"指定模型优先跑"）
+    if data.config.model_slugs:
+        _order = {s: i for i, s in enumerate(data.config.model_slugs)}
+        pass_models.sort(key=lambda m: _order.get(m.slug, len(_order)))
+
     task = Task(
         name=data.name,
         status=TaskStatus.QUEUED,
@@ -452,7 +457,9 @@ def _execute_task_pipeline(task_id: int):
         db.commit()
         _add_log(db, task_id, "INFO", None, f"任务开始: {task.name}", "system")
 
-        model_runs = sorted(task.model_runs, key=lambda m: m.model_idx)
+        # 修复: 按创建顺序(id)执行, 保持 config.model_slugs 的优先顺序
+        # (之前按 model_idx 排序会覆盖创建时已排定的 Qwen 优先顺序, 导致 Qwen 反被排后)
+        model_runs = sorted(task.model_runs, key=lambda m: m.id)
         for model_run in model_runs:
             try:
                 _check_pause(task_id)

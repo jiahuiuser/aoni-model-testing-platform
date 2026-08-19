@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from backend.database import get_db
 from backend.auth import get_current_user
-from backend.models import Task, ModelRun, PerfResult, AccResult
+from backend.models import Task, ModelRun, PerfResult, AccResult, ImageVersion, ModelInfo
 from backend.models.user import User
 
 router = APIRouter(prefix="/api/reports", tags=["reports"])
@@ -432,6 +432,14 @@ def parse_full_docker_cmd(cmd_str: str) -> dict:
             except Exception:
                 info["speculative_config"] = {"raw": m_spec.group(1)}
 
+    # 缺失 --model 时，从 MODEL_NAME / 实际模型名（含量化目录名）兜底解析量化
+    if info["quantization"] is None and info["actual_model_name"]:
+        _n = info["actual_model_name"].upper()
+        for q in ("NVFP4", "AWQ", "GPTQ", "W4A16", "W8A8", "FP8", "FP16", "BF16", "GGUF", "Q4_K_M", "Q8_0", "IQ4_XS"):
+            if q in _n:
+                info["quantization"] = q
+                break
+
     # 有 --rm 时容器结束自动删除，无从谈及 unless-stopped 重启策略（修正矛盾）
     if "--rm" in cmd_str:
         info["restart_policy"] = "--rm（容器运行结束即自动删除）"
@@ -563,12 +571,27 @@ def api_download_report(
     docker_cmd = mr.docker_command or "vllm serve --port 8300 --max-model-len 40960 --gpu-memory-utilization 0.8"
     d_info = parse_full_docker_cmd(docker_cmd)
 
-    # 动态解析设备最近监控资源；探测不到时回退为已登记的 Total（不再写死 90GiB）
-    mem_used_str = None
-    if dev and dev.last_check_detail and isinstance(dev.last_check_detail, dict):
-        mem_info = dev.last_check_detail.get("memory", {})
-        if isinstance(mem_info, dict) and "used" in mem_info:
-            mem_used_str = f"约 {mem_info['used']} 已用"
+    # 镜像版本：优先查 image_versions（脚本离线采集的真值），没有再回退 env_probe / 以镜像为准
+    _iv = None
+    try:
+        _iv = db.query(ImageVersion).filter_by(
+            image_repo=d_info["image_repo"], image_tag=d_info["image_tag"]).first()
+    except Exception:
+        _iv = None
+    iv = {
+        "vllm": _iv.vllm_version if _iv else None,
+        "llama": _iv.llama_cpp_build if _iv else None,
+        "python": _iv.python_version if _iv else None,
+        "torch": _iv.torch_version if _iv else None,
+        "cuda": _iv.cuda_version if _iv else None,
+    }
+
+    # ---- 权重来源的统一判定（供 §3.3 命令重写 / §6.2 文件清单 / 附录 实际权重来源 共用，避免三者口径不一致） ----
+    # 与 executor 本地优先逻辑一致：仅当 run 的 MODEL_NAME 目录在本地真实存在时才判为"本地加载"；
+    # 否则（如历史任务指向已删除的旧全精度目录）如实按 "TOS 动态拉取" 处理。
+    _actual = d_info.get("actual_model_name")
+    _local_dir = os.path.expanduser(f"~/models/{_actual}") if _actual else None
+    _local_exists = bool(_local_dir and (os.path.isdir(_local_dir) or os.path.islink(_local_dir)))
 
     # 性能指标统计
     perf_list = mr.perf_results or []
@@ -587,7 +610,37 @@ def api_download_report(
     total_tests = len(perf_list)
     failed_tests = sum(1 for p in perf_list if p.error)
     completed_tests = total_tests - failed_tests
-    pass_rate = f"{(completed_tests / total_tests * 100):.1f}%" if total_tests > 0 else "100.0%"
+    pass_rate = f"{(completed_tests / total_tests * 100):.1f}%" if total_tests > 0 else "无实测数据"
+
+    # ---- 生效压测框架（模型级优先 → 任务级 → auto）与实际执行组合 ----
+    _task_cfg = (mr.task.config if mr.task and mr.task.config else {})
+    _pm_ov = (_task_cfg.get("per_model_config") or {}).get(mr.model_slug) or {}
+    _pm_bf = _pm_ov.get("benchmark_framework") if isinstance(_pm_ov, dict) else None
+    _eff_bf = (_pm_bf or _task_cfg.get("benchmark_framework") or "auto")
+    _exec_combos = sorted(set((p.input_len, p.output_len)
+                              for p in perf_list if p.input_len is not None and p.output_len is not None))
+    # 外部 API 接入模型：无本地容器与本地压测，绝不虚构 vLLM bench / request_rate=inf 等表述
+    _mi_q = None
+    try:
+        _mi_q = db.query(ModelInfo).filter_by(slug=mr.model_slug).first()
+    except Exception:
+        _mi_q = None
+    _is_ext = bool(_mi_q and (_mi_q.is_external or _mi_q.api_base)) or not (mr.docker_command or "").strip()
+    if d_info["engine"] == "llama_cpp" and not _is_ext:
+        _bench_tool = "llama.cpp 推理引擎（HTTP OpenAI 兼容压测）"
+        _req_mode = "多路并发流式压测（固定长度随机 Prompt）"
+    elif _is_ext:
+        _bench_tool = "外部 API 接入"
+        _req_mode = "外部 API 接入（未在本地容器执行压测，无本地基准数据）"
+    elif _eff_bf == "custom":
+        _bench_tool = "vLLM 自研 HTTP 压测（OpenAI 兼容，逐组合按并发档位）"
+        _req_mode = "按各并发档位并发发送固定长度随机 Prompt（非 request_rate=inf）"
+    elif _eff_bf == "native":
+        _bench_tool = "vLLM 原生 Benchmark（vllm bench serve）"
+        _req_mode = "无限满载（`request_rate=inf`，`--dataset-name random` 固定长度）"
+    else:
+        _bench_tool = "vLLM 原生 Benchmark（vllm bench serve）"
+        _req_mode = "采用 vLLM 原生 `vllm bench serve`（`--request-rate inf`）满载压测"
 
     test_date = (mr.completed_at or mr.started_at or datetime.datetime.utcnow()).strftime("%Y-%m-%d")
 
@@ -646,11 +699,14 @@ def api_download_report(
     lines.append("")
     lines.append(f"> 测试日期：{test_date}")
     lines.append(f"> 测试平台：{dev_name}")
-    if is_llama:
+    if _is_ext:
+        lines.append(f"> 测试工具：外部 API 接入（未在本地容器执行压测）")
+        lines.append(f"> 部署方式：外部 API 接入")
+    elif is_llama:
         lines.append(f"> 测试工具：llama.cpp Benchmark（`llama-server` OpenAI 兼容 API 压测）")
         lines.append(f"> 部署引擎：`llama.cpp`（`{d_info['image_repo']}:{d_info['image_tag']}`）")
     else:
-        lines.append(f"> 测试工具：vLLM Benchmark（`vllm bench serve`，OpenAI backend）")
+        lines.append(f"> 测试工具：{_req_mode}")
         lines.append(f"> 部署引擎：`vLLM`（`{d_info['image_repo']}:{d_info['image_tag']}`）")
     lines.append("")
 
@@ -671,7 +727,7 @@ def api_download_report(
         if _peak_conc is not None and _peak_conc >= 8:
             if _single_tput:
                 _conc_clause = (f"该峰值出现在 **{_peak_conc} 路并发**（输入 {_peak_il} / 输出 {_peak_ol}），"
-                                f"为多请求批量叠加下的**聚合吞吐**；折算单路流式吞吐约 **{_single_tput:.1f} tok/s**（对应 TPOT≈{_best.mean_tpot_ms:.0f}ms/Token）。")
+                                f"为多请求批量叠加下的**聚合吞吐**；折算单路流式吞吐约 **{_single_tput:.1f} tok/s**（由 TPOT 按 `1000/TPOT` 测算的理论单流值，**非 峰值÷并发数 的算术平均**；多路并发存在调度与 KV-Cache 争用，聚合吞吐必然小于理论并发倍数）。")
             else:
                 _conc_clause = (f"该峰值出现在 **{_peak_conc} 路并发**（输入 {_peak_il} / 输出 {_peak_ol}），"
                                 f"为多请求批量叠加下的**聚合吞吐**。")
@@ -759,16 +815,17 @@ def api_download_report(
     lines.append(f"| 被测模型 | `{mr.model_name}`（Slug: `{mr.model_slug}`，架构: {arch_desc}，量化: {quant_desc}） |")
     if is_llama:
         lines.append("| 服务框架 | llama.cpp（`llama-server`，OpenAI 兼容 API） |")
-        lines.append("| 请求速率 | 多路并发流式压测（每组合 Prompt 数与并发见 §2.1 用例表） |")
     else:
         lines.append("| 服务框架 | vLLM（`vllm serve`，OpenAI 兼容 API） |")
-        lines.append("| 请求速率 | 无限满载（`request_rate=inf`，每组合 Prompt 数与并发见 §2.1） |")
-    lines.append(f"| 采样规模 | 按任务配置矩阵采样（Task #{mr.task_id}），随机 Prompt 固定 input/output 长度 |")
+    lines.append(f"| 压测方式 | {_req_mode}（每组合 Prompt 数与并发见 §2.1） |")
+    lines.append(f"| 采样规模 | 按任务配置矩阵采样，随机 Prompt 固定 input/output 长度 |")
     lines.append(f"| 并发度 | 梯度并发 `{', '.join(map(str, concurrencies)) if concurrencies else '1, 4, 8'}` |")
     lines.append(f"| 失败请求 | {failed_tests}（共 {total_tests} 组评测，completed={completed_tests}/failed={failed_tests}） |")
-    in_str = " / ".join(map(str, input_lens)) if input_lens else "128 / 512 / 1024"
-    out_str = " / ".join(map(str, output_lens)) if output_lens else "128 / 512 / 2048"
-    lines.append(f"| 测试矩阵 | {len(input_lens) if input_lens else 3} 种输入长度 ({in_str}) × {len(output_lens) if output_lens else 3} 种输出长度 ({out_str}) |")
+    if _exec_combos:
+        _cstr = "、".join(f"{a}×{b}" for a, b in _exec_combos)
+        lines.append(f"| 实际执行组合 | {len(_exec_combos)} 组（输入×输出）：{_cstr} |")
+    else:
+        lines.append(f"| 实际执行组合 | 无已执行组合（无有效性能数据） |")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -777,7 +834,7 @@ def api_download_report(
     lines.append("## 2. 测试方案与测试方法")
     lines.append("")
     task_cfg = (mr.task.config if mr.task and mr.task.config else {})
-    bench_tool = "llama.cpp 推理引擎（HTTP OpenAI 兼容压测）" if is_llama else "vLLM 原生 Benchmark（vllm bench serve）"
+    bench_tool = _bench_tool
     _n2 = 0
 
     # 2.1 性能压测用例矩阵（基于真实已执行的组合，按 input×output 聚合）
@@ -785,7 +842,11 @@ def api_download_report(
     # llama.cpp HTTP 压测 raw 无此字段，则按 output 长度回填任务配置 perf_rounds_config 的 num_prompts。
     _cfg_np_map = {}
     _cfg_rounds = []  # [(config_input_len, num_prompts)]，用于裁剪后 input 就近匹配
-    for _rd in (task_cfg.get("perf_rounds_config") or []):
+    # 模型级单独矩阵优先，其次全局矩阵（与执行器一致）
+    _pm_ov = (task_cfg.get("per_model_config") or {}).get(mr.model_slug) or {}
+    _pm_rounds = _pm_ov.get("perf_rounds_config") if isinstance(_pm_ov, dict) else None
+    _rd_source = _pm_rounds if (isinstance(_pm_rounds, list) and _pm_rounds) else (task_cfg.get("perf_rounds_config") or [])
+    for _rd in _rd_source:
         try:
             _npv = int(_rd.get("num_prompts") or 0)
             _c_in = int(_rd.get("input_len") or 0)
@@ -837,12 +898,22 @@ def api_download_report(
             lines.append(f"| P{_idx} | {_il} | {_ol} | {_concs} | {_np} |")
         lines.append("")
         lines.append(
-            f"> 注：以上为实测执行过的性能用例组合。每组合以 `{bench_tool}` "
-            + ("使用 random 数据集（固定 input/output 长度）、满载无限请求率（`--request-rate inf`）压测。"
-               if is_llama is False
-               else "通过 OpenAI 兼容接口并发发送固定长度随机 Prompt 压测。")
+            f"> 注：以上为实测执行过的性能用例组合。每组合以 `{_bench_tool}` 执行；压测方式：{_req_mode}。"
         )
         lines.append("")
+        if not is_llama:
+            lines.append("**压测命令示意**（以 输入=512/输出=256/并发=8 组合为例，其余组合仅替换对应参数）：")
+            lines.append("")
+            lines.append("```bash")
+            lines.append(f"vllm bench serve --host 127.0.0.1 --port {d_info['port']} \\")
+            lines.append("    --dataset-name random \\")
+            lines.append("    --random-input-len 512 \\")
+            lines.append("    --random-output-len 256 \\")
+            lines.append("    --num-prompts 60 \\")
+            lines.append("    --max-concurrency 8 \\")
+            lines.append("    --request-rate inf --ignore-eos")
+            lines.append("```")
+            lines.append("")
     else:
         lines.append("*本次未收集到已完成的性能压测用例（无有效性能数据）。*")
         lines.append("")
@@ -878,9 +949,9 @@ def api_download_report(
     lines.append(f"### 2.{_n2} 测试方法说明")
     lines.append("")
     if is_llama:
-        lines.append("- **部署与压测工具**：使用 llama.cpp（`llama-server` OpenAI 兼容 API）加载 GGUF 权重；llama.cpp 无原生 benchmark，故采用自研 HTTP 压测——通过 OpenAI 兼容 `/v1/chat/completions` 并发发送固定 input/output 长度的随机 Prompt，测量各并发档位下的吞吐与延迟。")
+        lines.append("- **部署与压测工具**：使用 llama.cpp（`llama-server` OpenAI 兼容 API）加载 GGUF 权重；通过 OpenAI 兼容 `/v1/chat/completions` 并发发送固定 input/output 长度的随机 Prompt，测量各并发档位下的吞吐与延迟。")
     else:
-        lines.append("- **部署与压测工具**：使用 vLLM（`vllm serve`）提供 OpenAI 兼容服务；采用 vLLM 官方 `vllm bench serve` 压测工具（`--dataset-name random`，固定 input/output 长度），请求率无限（`--request-rate inf`，满载压测）。")
+        lines.append(f"- **部署与压测工具**：使用 vLLM（`vllm serve`）提供 OpenAI 兼容服务；{_req_mode}，测量各并发档位下的吞吐与延迟。")
     lines.append("- **压测矩阵**：按任务配置的（输入长度 × 输出长度 × 并发梯度）组合逐个执行，每组合使用固定数量的随机 Prompt（见上方用例表 num_prompts 列）。")
     lines.append("- **核心指标**：Output Token 吞吐（tok/s）、请求吞吐（req/s）、首字延迟（TTFT：mean/median/p99）、逐 Token 时延（TPOT：mean/p99）、Token 间隔（ITL：mean/p99）。大模型单流解码受显存/内存带宽限制，低并发数据反映该硬件上的真实单流能力。")
     if mr.acc_results:
@@ -916,14 +987,42 @@ def api_download_report(
     else:
         lines.append(f"| `~/models` | `/models` | RW |")
     lines.append("")
+    # 3.3 容器启动命令（实际执行）: 若本地已存在对应权重目录，执行器会置 MODEL_OSS=False 并注入 --model（与 executor 本地优先逻辑一致）
+    _disp_cmd = docker_cmd
+    try:
+        _mn = re.search(r"-e\s+MODEL_NAME=(\S+)", docker_cmd)
+        _mr = re.search(r"-e\s+MODEL_ROOT=(\S+)", docker_cmd)
+        _mv = re.search(rf"-v\s+(\S+):{re.escape(_mr.group(1))}", docker_cmd) if _mr else None
+        if _mn and _mr and _mv and _local_exists:
+            _disp_cmd = re.sub(r"-e\s+MODEL_OSS=\S+", "-e MODEL_OSS=False", _disp_cmd)
+            if "--model " not in _disp_cmd and "-m " not in _disp_cmd:
+                _mimg = re.search(r"(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:[^\s]+|aoni/vllm/vllm-openai:\S+)", _disp_cmd)
+                if _mimg:
+                    _disp_cmd = _disp_cmd.replace(_mimg.group(1), _mimg.group(1) + f" --model /models/{_mn.group(1)} ", 1)
+    except Exception:
+        pass
+    # 精简：隐藏内部调度平台的环境变量（MODEL_OSS / MODEL_ROOT / ENGINE_URI / MODEL_NAME），
+    # 仅保留对读者有意义的镜像、数据卷与 vLLM 加载/服务参数（--model / --port / --max-model-len 等）。
+    # 适配"单行命令"(如 Qwen3-8B) 与"多行反斜杠续行"两种写法：只移除 env token 本身，而非整行。
+    _disp_lines = []
+    for _ln in _disp_cmd.splitlines():
+        _ln2 = re.sub(r"-e\s+(?:MODEL_OSS|MODEL_ROOT|ENGINE_URI|MODEL_NAME)=[^\s\\]+\s*(?:\\\s*)?", "", _ln)
+        _ln2 = _ln2.rstrip()
+        if _ln2.strip() in ("", "\\"):
+            continue
+        _disp_lines.append(_ln2)
+    _disp_cmd_clean = "\n".join(_disp_lines).strip()
     lines.append("### 3.3 容器启动命令（实际执行）")
     lines.append("")
-    lines.append("```bash")
-    lines.append(docker_cmd)
-    lines.append("```")
-    lines.append("")
-    lines.append("> 该命令为该模型测试任务实际下发的容器启动命令行。")
-    lines.append("")
+    if _is_ext or not _disp_cmd_clean:
+        lines.append("*外部 API 接入模型，无本地容器部署命令。*")
+    else:
+        lines.append("```bash")
+        lines.append(_disp_cmd_clean)
+        lines.append("```")
+        lines.append("")
+        lines.append("> 上述为容器实际加载与服务参数（`--model` 加载权重路径、`--port` 服务端口等）；内部调度平台的环境变量（`MODEL_OSS`/`ENGINE_URI` 等 TOS 拉取/本地切换开关）已省略。")
+    lines.append("   ")
     lines.append("---")
     lines.append("")
 
@@ -972,7 +1071,9 @@ def api_download_report(
             _model_path_disp = f"/models/{d_info['actual_model_name']}"
         if _model_path_disp:
             lines.append(f"| `--model`（实际加载） | `{_model_path_disp}` | 模型权重路径 |")
-        lines.append(f"| `--served-model-name` | `{mr.model_name}` | 对外暴露的模型名 |")
+        _sname = d_info.get("served_model_name")
+        _sname_disp = _sname if _sname and _sname != "N/A" else mr.model_name
+        lines.append(f"| `--served-model-name` | `{_sname_disp}` | 对外暴露的模型名（未显式指定时默认取模型名） |")
         lines.append(f"| `--port` | `{mr.port or d_info['port']}` | 监听端口 |")
         lines.append(f"| `--max-model-len` | `{d_info['max_model_len']}` | 最大上下文长度 |")
         if "--gpu-memory-utilization" in docker_cmd:
@@ -1011,12 +1112,17 @@ def api_download_report(
     lines.append("")
     lines.append("| 组件 | 版本 |")
     lines.append("|------|------|")
-    vllm_ver = env_probe.get("vllm_version") or (f"Nightly（以镜像 {d_info['image_tag']} 为准）" if d_info.get('image_tag') else "-")
-    py_ver = env_probe.get("python_version") or "-"
-    torch_ver = env_probe.get("torch_version") or "-"
-    cuda_ver = env_probe.get("cuda_version") or "-"
+    def _ver_clean(v):
+        """去掉 git commit / CUDA build 后缀这类碎片，只保留语义版本（如 0.26.1rc1.dev403 / 2.13.0）。"""
+        if not v:
+            return v
+        return str(v).split("+", 1)[0].strip()
+    vllm_ver = _ver_clean(iv["vllm"] or env_probe.get("vllm_version") or (f"Nightly（以镜像 {d_info['image_tag']} 为准）" if d_info.get('image_tag') else "-"))
+    py_ver = _ver_clean(iv["python"] or env_probe.get("python_version") or "-")
+    torch_ver = _ver_clean(iv["torch"] or env_probe.get("torch_version") or "-")
+    cuda_ver = _ver_clean(iv["cuda"] or env_probe.get("cuda_version") or "-")
     if is_llama:
-        lines.append(f"| llama.cpp | `Nightly（以镜像 {d_info['image_tag']} 为准）` |")
+        lines.append(f"| llama.cpp | `{iv['llama'] or ('以镜像 ' + str(d_info.get('image_tag', '')) + ' 为准')}` |")
     else:
         lines.append(f"| vLLM | `{vllm_ver}` |")
     lines.append(f"| 容器镜像 | `{d_info['image_repo']}:{d_info['image_tag']}` |")
@@ -1024,6 +1130,8 @@ def api_download_report(
     lines.append(f"| PyTorch | `{torch_ver}` |")
     if cuda_ver != "-":
         lines.append(f"| CUDA（容器） | `CUDA {cuda_ver}` |")
+    lines.append("")
+    lines.append("> 说明：上表 vLLM/llama.cpp、Python、PyTorch、CUDA 版本为从**对应部署镜像**（见『容器镜像』行）读取/采集的运行时版本快照。")
     lines.append("")
     lines.append("### 5.2 宿主机系统环境")
     lines.append("")
@@ -1034,13 +1142,6 @@ def api_download_report(
     lines.append(f"| GPU / NPU 规格 | `{gpu_spec}` |")
     lines.append(f"| CPU 核心数 | `{cpu_spec}` |")
     lines.append(f"| 物理内存 | `{mem_total_gb} GB 统一内存` |")
-    lines.append("")
-    lines.append("### 5.3 资源占用（测试时段）")
-    lines.append("")
-    lines.append("| 资源 | 状态 |")
-    lines.append("|------|------|")
-    lines.append(f"| 内存占用（已用） | `{mem_used_str or '未采集到监控快照'}` |")
-    lines.append("| GPU 功耗/显存 | 受电源模式限制及统一内存共享架构调度 |")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -1059,48 +1160,37 @@ def api_download_report(
     lines.append(f"| 参数规模分类 | `{mr.size_category or 'small_medium'}` |")
     lines.append(f"| 运行阶段状态 | `{mr.status}` |")
     lines.append(f"| 本地存放路径 | `{'/models/' + d_info['actual_model_name'] if d_info.get('actual_model_name') else '/models/' + mr.model_slug}` |")
-    lines.append(f"| 测试任务 | `Task #{mr.task_id}` (`{mr.task.name if mr.task else 'N/A'}`) |")
+    lines.append(f"| 测试任务 | `{mr.task.name if mr.task else 'N/A'}` |")
     lines.append(f"| 执行账号 | `{mr.task.user.username if (mr.task and mr.task.user) else 'admin'}` |")
     lines.append("")
     lines.append("### 6.2 关键模型文件")
     lines.append("")
     
-    # 动态检测本地物理文件
-    local_model_dir = f"/models/{mr.model_slug}"
-    if not os.path.exists(local_model_dir):
-        local_model_dir = os.path.expanduser(f"~/models/{mr.model_slug}")
-    
-    if os.path.exists(local_model_dir) and os.path.isdir(local_model_dir):
-        lines.append("| 文件 | 大小 | 说明 |")
-        lines.append("|------|------|------|")
+    # 动态检测本地物理文件（与 §3.3/附录 的权重来源判定一致：优先 actual_model_name 目录，其次 slug 符号链接）
+    local_model_dir = _local_dir
+    if not _local_exists:
+        local_model_dir = None
+
+    if local_model_dir and (os.path.isdir(local_model_dir) or os.path.islink(local_model_dir)):
+        # 只概括权重规模：总大小 + 分片数，不再罗列逐文件清单
         try:
-            # 仅列出对加载有用的核心文件，过滤 README/LICENSE/隐藏文件/图片等杂项，避免报告杂乱
-            def _is_core_model_file(fname: str) -> bool:
-                base = fname.lower()
-                if base.startswith(".") or base.startswith("readme") or base.startswith("license") \
-                   or base.startswith("notice") or base.startswith("sample"):
-                    return False
-                if base.endswith((".png", ".jpg", ".jpeg", ".svg", ".gif", ".webp", ".msc", ".mv", ".md", ".html", ".py", ".h5")):
-                    return False
-                if base.endswith((".safetensors", ".bin", ".gguf", ".json", ".txt", ".model", ".onnx", ".tokenizer", ".tiktoken", ".merges")):
-                    return True
-                return base in ("config.json", "tokenizer_config.json", "generation_config.json")
-            core_files = [f for f in sorted(os.listdir(local_model_dir)) if _is_core_model_file(f)][:12]
-            if core_files:
-                for fname in core_files:
-                    fpath = os.path.join(local_model_dir, fname)
-                    size_mb = os.path.getsize(fpath) / (1024 * 1024)
-                    size_str = f"{size_mb / 1024:.2f} GB" if size_mb > 1024 else f"{size_mb:.1f} MB"
-                    desc = "权重分片" if fname.endswith((".safetensors", ".bin", ".gguf")) else ("主配置" if fname == "config.json" else "分词器/关联配置")
-                    lines.append(f"| `{fname}` | {size_str} | {desc} |")
-            else:
-                lines.append("| `config.json` | - | 主配置 |")
-                lines.append("| `model.safetensors` | 动态规模 | 模型权重分片 |")
+            _total_b = 0
+            _wt = 0
+            for _dp, _dn, _fns in os.walk(local_model_dir):
+                for _fn in _fns:
+                    if _fn.endswith((".safetensors", ".bin", ".gguf")):
+                        try:
+                            _total_b += os.path.getsize(os.path.join(_dp, _fn))
+                        except Exception:
+                            pass
+                        _wt += 1
+            lines.append(f"本地权重总大小约 **{_total_b / (2**30):.1f} GB**，共 **{_wt}** 个权重分片（safetensors / gguf）。")
+            if is_llama and d_info.get("llama_model_file"):
+                lines.append(f"实际加载权重文件：`{d_info['llama_model_file']}`")
         except Exception:
-            lines.append("| `config.json` | 58 KB | 主配置 |")
-            lines.append("| `model.safetensors` | 动态规模 | 模型权重分片 |")
+            lines.append("本地权重已就绪（详见容器命令 `--model /models/<MODEL_NAME>`）。")
     else:
-        # 本地既无对应模型目录，也未找到物理权重文件时，如实说明（不虚构一份文件清单）
+        # 本地既无对应模型目录，也未找到物理权重文件时，如实说明（不虚构文件清单）
         lines.append("*未在本地检测到该模型的权重目录。*")
         lines.append("")
         lines.append("该模型通过 **TOS / 云端对象存储（`MODEL_OSS=True`）** 在容器启动时动态拉取，物理权重文件不常驻宿主机。")
@@ -1134,6 +1224,10 @@ def api_download_report(
             except Exception:
                 _raw = {}
             _total = _raw.get("total_token_throughput")
+            if _total is None:
+                # raw 缺失(如 llama.cpp HTTP 压测)时按公式推算: Total tok/s = 输出吞吐 + 输入长度 × 请求吞吐(每prompt固定input_len)
+                _in_r = (pr.input_len or 0) * (pr.request_throughput or 0)
+                _total = (pr.throughput_tok_s or 0) + _in_r
             st_tag = "❌ FAIL" if pr.error else "✅ PASS"
             _tp = _f(pr.throughput_tok_s, 2)
             _tp_cell = f"**{_tp}**" if pr.throughput_tok_s is not None else "-"
@@ -1161,9 +1255,9 @@ def api_download_report(
         lines.append("- **口径说明**：指标按 vLLM `vllm bench serve` 的测量点与公式给出；不同基准工具对指标命名不统一，跨工具横向对比请以**测量点 / 公式**为准，而非仅看指标名称。")
     lines.append("")
 
-    lines.append("### 7.3 准确率测试与 API 协议校验结果")
-    lines.append("")
     if mr.acc_results or mr.gateway_results:
+        lines.append("### 7.3 准确率测试与 API 协议校验结果")
+        lines.append("")
         if mr.acc_results:
             lines.append("#### 准确率测试结果 (Accuracy Evaluation)")
             lines.append("| 基准数据集 (Dataset) | 抽取样本数 | 实际测得准确率 (Accuracy) | 评测状态 |")
@@ -1183,9 +1277,6 @@ def api_download_report(
                 lat = f"{gr.latency_ms:.1f}" if gr.latency_ms else "-"
                 lines.append(f"| {gr.test_item} | {gr.protocol.upper()} | {st} | {lat} | {gr.message or '-'} |")
             lines.append("")
-    else:
-        lines.append("*无准确率或协议校验数据*")
-        lines.append("")
 
     lines.append("---")
     lines.append("")
@@ -1196,18 +1287,52 @@ def api_download_report(
     lines.append("### 8.1 吞吐规律")
     if valid_perfs and best_row and worst_row:
         lines.append(f"- **吞吐上限与规模表现**：在最高并发与输入输出组合下，输出 Token 吞吐最高达到 **{best_row.throughput_tok_s:.2f} tok/s** (输入={best_row.input_len}, 输出={best_row.output_len}, 并发={best_row.concurrency})。")
-        lines.append(f"- **Prefill 阶段延迟**：平均首字响应延迟 (TTFT) 随着输入 Prompt 长度增加而上升，最小 TTFT 为 **{min_ttft:.2f} ms**。")
+        _ttft_vals = [p.mean_ttft_ms for p in valid_perfs if p.mean_ttft_ms is not None]
+        if _ttft_vals:
+            _minT = min(_ttft_vals)
+            _maxT = max(_ttft_vals)
+            _mn_row = min(valid_perfs, key=lambda p: p.mean_ttft_ms if p.mean_ttft_ms is not None else float("inf"))
+            # 取一个同并发下"短输入 TTFT 反而高于长输入"的真实反例，把结论落到本报告可核对的数据上
+            _inv = None
+            for _p in valid_perfs:
+                if _p.mean_ttft_ms is None or _p.concurrency is None or not _p.input_len:
+                    continue
+                for _q in valid_perfs:
+                    if _q is _p or _q.mean_ttft_ms is None or _q.concurrency != _p.concurrency or not _q.input_len:
+                        continue
+                    if _q.input_len > _p.input_len and _q.mean_ttft_ms < _p.mean_ttft_ms:
+                        _inv = (_p, _q)
+                        break
+                if _inv:
+                    break
+            # 归因口径：conc>1 可用"并发排队"解释；conc=1 属串行无排队，只能用"随机采样/系统瞬时波动/冷启动"解释
+            if _inv and (_inv[0].concurrency or 1) > 1:
+                _p, _q = _inv
+                _ex = (f"例如 input={_p.input_len}（conc={_p.concurrency}）的实测 TTFT 约 **{_p.mean_ttft_ms:.0f} ms**，"
+                       f"反而高于 input={_q.input_len}（conc={_q.concurrency}）的 **{_q.mean_ttft_ms:.0f} ms**；"
+                       "在满载压测下并发越高请求注入越密、瞬时排队越易堆积，从而抬升短路径请求的首字延迟。")
+            elif _inv:
+                _p, _q = _inv
+                _ex = (f"例如 input={_p.input_len}（conc={_p.concurrency}）的实测 TTFT 约 **{_p.mean_ttft_ms:.0f} ms**，"
+                       f"略高于 input={_q.input_len}（conc={_q.concurrency}）的 **{_q.mean_ttft_ms:.0f} ms**；"
+                       "单路(conc=1)串行无排队，此类差异多来自随机采样、冷启动/缓存等系统瞬时状态波动，跨组合对比时应结合测量噪声看待。")
+            else:
+                _ex = "该指标在不同输入长度间受并发、随机采样与系统瞬时状态影响，并非严格单调。"
+            lines.append(
+                f"- **首字延迟 (TTFT)**：各组合实测范围约 **{_minT:.1f}–{_maxT:.1f} ms**；"
+                f"最低 **{_minT:.1f} ms**（于 input={_mn_row.input_len}/output={_mn_row.output_len}/conc={_mn_row.concurrency} 测得）。"
+                f" TTFT **并非随输入长度单调上升**：{_ex}（数据详见 §7.1）。")
         lines.append(f"- **单流基准吞吐**：`Input={worst_row.input_len}, Output={worst_row.output_len}` 在**单路并发（conc=1）**时吞吐为 **{worst_row.throughput_tok_s:.2f} tok/s**，反映该模型的单路流式解码能力（见下方口径）；Prefill 在长输入下占较大部分开销。")
     else:
-        lines.append("- 输出吞吐随输出长度增加而提升，长输出摊薄了固定 TTFT 开销。")
-        lines.append("- 输入 Prompt 越长，Prefill 阶段耗时上升，首 Token 延迟（TTFT）显著升高。")
+        lines.append("- 无有效吞吐数据，未做组合间对比结论。")
+        lines.append("- 延迟与输入长度/并发的具体关系以实测数据（见 §7.1）为准。")
     lines.append("")
     
     lines.append("### 8.2 延迟开销分析 (TTFT vs TPOT)")
     if valid_perfs:
         mean_tpot = sum(p.mean_tpot_ms for p in valid_perfs if p.mean_tpot_ms)/len(valid_perfs) if valid_perfs else 0.0
         lines.append(f"- **首字延迟 (TTFT)**：实测最佳首字延迟 **{min_ttft:.2f} ms**，反映了预分配 KV Cache 与推理引擎 Prefill 阶段效率。")
-        lines.append(f"- **字间延迟 (TPOT)**：平均字间 Token 生成耗时约为 **{mean_tpot:.2f} ms/tok**，维持了流畅自回归生成。")
+        lines.append(f"- **字间延迟 (TPOT)**：平均字间 Token 生成耗时约为 **{mean_tpot:.2f} ms/tok**（TPOT 均值，逐 Token 解码耗时）。")
     else:
         lines.append("- 延迟表现稳定，维持了流畅的自回归 Token 生成。")
     lines.append("")
@@ -1217,10 +1342,17 @@ def api_download_report(
         lines.append(f"- **最佳吞吐配置**：`input={best_row.input_len}, output={best_row.output_len}, concurrency={best_row.concurrency}` → **{best_row.throughput_tok_s:.2f} tok/s**。")
     else:
         lines.append("- **最佳吞吐配置**：视压测矩阵组合而定。")
+    # 单流基准：优先取实际最低并发(conc=1)行；无则取最低吞吐组合。两者都如实标注其并发
+    single_row = None
+    if valid_perfs:
+        single_row = min([p for p in valid_perfs if p.concurrency in (1, None)], default=None,
+                         key=lambda p: p.throughput_tok_s or 0) or worst_row
     if worst_row:
-        lines.append(f"- **单流基准配置**：`input={worst_row.input_len}, output={worst_row.output_len}, concurrency={worst_row.concurrency}` → **{worst_row.throughput_tok_s:.2f} tok/s**（最低档并发的单流解码能力，非故障）。")
-    else:
-        lines.append("- **单流基准配置**：以并发度最低档为准。")
+        lines.append(f"- **最低吞吐组合**：`input={worst_row.input_len}, output={worst_row.output_len}, concurrency={worst_row.concurrency}` → **{worst_row.throughput_tok_s:.2f} tok/s**（为各组合中吞吐最低者，非故障）。")
+    if single_row:
+        lines.append(f"- **单流性能基线（conc=1，最低单流吞吐）**：`input={single_row.input_len}, output={single_row.output_len}, concurrency={single_row.concurrency}` → **{single_row.throughput_tok_s:.2f} tok/s**，作为该硬件单路流式解码能力的下限参考。")
+    lines.append("")
+    lines.append("> 口径说明：此处给出的是**性能基线**（最低单流吞吐，反映硬件下限）；§9 的「单路解码」等**场景化推荐**为针对该业务场景选出的**最佳配置**，二者口径不同（推荐值可能高于基线），请勿混淆。")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -1237,8 +1369,12 @@ def api_download_report(
 
     if not valid_perfs:
         # 无有效性能数据：不作吞吐/延迟结论，仅给部署与配置说明（问题 3）
+        if _is_ext:
+            deploy_clause = f"该模型通过**外部 API 接入**（未做本地容器部署与本地压测）"
+        else:
+            deploy_clause = f"在 `{dev_name}` 算力节点上完成 `{mr.model_name}` 的容器部署（引擎：{'llama.cpp（GGUF）' if is_llama else 'vLLM'}）"
         lines.append(
-            f"{n}. **部署与数据说明**：在 `{dev_name}` 算力节点上完成 `{mr.model_name}` 的容器部署（引擎：{'llama.cpp（GGUF）' if is_llama else 'vLLM'}）。"
+            f"{n}. **部署与数据说明**：{deploy_clause}。"
             f"本次评测未获取到有效性能数据（完成率 {pass_rate}），因此**不对吞吐/延迟作出结论**。{reliability_clause}，建议定位压测失败原因后复测。"
         )
         n += 1
@@ -1289,8 +1425,8 @@ def api_download_report(
         if len(valid_perfs) > 1:
             max_ttft_row = max(valid_perfs, key=lambda x: x.mean_ttft_ms if x.mean_ttft_ms is not None else 0)
             lines.append(
-                f"{n}. **Prefill / Decode 开销瓶颈**：当输入 Token 增加至 {max_ttft_row.input_len} 时，首字响应延迟 (Mean TTFT) 上升至 **{max_ttft_row.mean_ttft_ms:.2f} ms**。"
-                " Prefill 阶段为长 Prompt 场景的主要时延瓶颈。对于 TTFT 敏感的高并发业务，建议配置 Chunked Prefill 优化或针对长 Prompt 场景设置独立队列限流。"
+                f"{n}. **首字延迟 (TTFT) 观察**：实测最大 Mean TTFT 为 **{max_ttft_row.mean_ttft_ms:.2f} ms**（出现于 input={max_ttft_row.input_len}/output={max_ttft_row.output_len}/conc={max_ttft_row.concurrency}）。"
+                " 长输入通常伴随较高 Prefill 开销，但实测中并发排队同样会大幅抬升首字延迟；对 TTFT 敏感的高并发业务，建议配置 Chunked Prefill 或针对高并发/长输入场景设置独立队列限流。"
             )
             n += 1
         else:
@@ -1318,16 +1454,6 @@ def api_download_report(
         pass_gw = sum(1 for gr in mr.gateway_results if gr.status == "PASS")
         lines.append(f"{n}. **API 协议规范校验**：通过 {pass_gw}/{len(mr.gateway_results)} 项 OpenAI API 兼容规范校验，可直接对接上层应用及 API 网关。")
         n += 1
-    else:
-        lines.append(f"{n}. **准确率/协议校验**：本报告未附带准确率或 API 协议校验数据，仅反映性能实测。")
-        n += 1
-
-    # 动态判定 5：算力节点与系统加速建议
-    lines.append(
-        f"{n}. **算力节点调优建议**：建议在算力设备 `{dev_name}` 宿主机上开启 GPU/NPU 持久化加速模式，"
-        "并确保推理容器分配足够的共享内存 (`--shm-size`) 与算力直通权限 (`--runtime=nvidia`)，以发挥芯片最高计算效率。"
-    )
-    n += 1
 
     # 动态判定 6：生产部署与并发选型（仅在有有效数据时给出实测定量建议）
     if valid_perfs:
@@ -1378,19 +1504,8 @@ def api_download_report(
     lines.append("---")
     lines.append("")
 
-    # 附录：数据来源
-    lines.append("## 附录：数据来源")
-    lines.append("")
-    lines.append("| 资源标识 | 数据类型 | 描述与用途 |")
-    lines.append("|----------|----------|------------|")
-    lines.append(f"| `ModelRun #{mr.id}` | 数据库评测主记录 | 关联任务 `Task #{mr.task_id}` (`{mr.task.name if mr.task else 'N/A'}`) |")
-    lines.append(f"| `PerfResults` | 性能矩阵表 | 累计 {len(perf_list)} 组并发与 Token 组合实测记录 |")
-    lines.append(f"| `AccResults` | 准确率测评表 | 累计 {len(mr.acc_results or [])} 组基准数据集测评记录 |")
-    lines.append(f"| `GatewayResults` | 协议校验表 | 累计 {len(mr.gateway_results or [])} 组 API 协议规范校验记录 |")
-    lines.append(f"| `Container #{mr.container_name or 'N/A'}` | 部署容器 | 对应容器标识与部署启动命令行 |")
-    lines.append(f"| 模型存储路径 | `/models/{mr.model_slug}` | 模型配置与物理权重文件目录 |")
-    lines.append("")
-    lines.append("### 可复现性说明")
+    # 附录：可复现性说明（已移除内部数据库主键/容器哈希等系统足迹，仅保留可复现所需信息）
+    lines.append("## 附录：可复现性说明")
     lines.append("")
     _eng_uri = ""
     _m = re.search(r"-e\s+ENGINE_URI=([^\s\\]+)", docker_cmd or "")
@@ -1399,13 +1514,18 @@ def api_download_report(
     lines.append("| 项目 | 值 |")
     lines.append("|------|-----|")
     lines.append(f"| 测试日期 | {test_date} |")
-    lines.append(f"| 部署引擎 | {'llama.cpp (GGUF)' if is_llama else 'vLLM'} |")
-    lines.append(f"| 容器镜像 | `{d_info['image_repo']}:{d_info['image_tag']}` |")
-    if _eng_uri:
-        lines.append(f"| 权重来源（TOS） | `{_eng_uri}` |")
-    if d_info.get("actual_model_name"):
-        lines.append(f"| 加载模型 | `{d_info['actual_model_name']}` |")
-    lines.append(f"| 软件栈（容器） | {'llama.cpp（Nightly，以镜像为准）' if is_llama else ('vLLM ' + vllm_ver)} / Python {py_ver} / PyTorch {torch_ver} / CUDA {cuda_ver} |")
+    if _is_ext:
+        lines.append("| 部署方式 | 外部 API 接入（未做本地容器部署） |")
+        lines.append("| 接入地址 | `外部 API`（见模型 `.api_base`） |")
+    else:
+        lines.append(f"| 部署引擎 | {'llama.cpp (GGUF)' if is_llama else 'vLLM'} |")
+        lines.append(f"| 容器镜像 | `{d_info['image_repo']}:{d_info['image_tag']}` |")
+        if _eng_uri:
+            lines.append(f"| 引擎 TOS 拉取地址 | `{_eng_uri}`（本地已具备对应权重时由执行器切换为本地加载，见下） |")
+        if d_info.get("actual_model_name"):
+            _src = "本地权重（已就绪，直接加载）" if _local_exists else "TOS 动态拉取（本地无对应目录）"
+            lines.append(f"| 实际权重来源 | `{d_info['actual_model_name']}`（{_src}） |")
+        lines.append(f"| 软件栈（容器） | {'llama.cpp ' + (iv['llama'] or '(以镜像为准)') if is_llama else ('vLLM ' + vllm_ver)} / Python {py_ver} / PyTorch {torch_ver} / CUDA {cuda_ver} |")
     lines.append("")
 
     content = "\n".join(lines)
