@@ -1,5 +1,5 @@
 """
-AONI 自动化测试套件 — 测试报告模块 (Reports)
+大模型测试平台 自动化测试套件 — 测试报告模块 (Reports)
 包含设备筛选、对比吞吐量/准确率及下载 Markdown 报告测试
 """
 import requests

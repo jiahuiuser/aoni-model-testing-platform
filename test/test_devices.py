@@ -1,5 +1,5 @@
 """
-AONI 自动化测试套件 — 设备管理模块 (Device Management)
+大模型测试平台 自动化测试套件 — 设备管理模块 (Device Management)
 """
 import requests
 import unittest

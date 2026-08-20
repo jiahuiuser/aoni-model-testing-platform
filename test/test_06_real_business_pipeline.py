@@ -1,5 +1,5 @@
 """
-AONI 真实业务链路测试 — 跨设备跑模型性能测试、准确率测试及 Docker Run 启动
+大模型测试平台 真实业务链路测试 — 跨设备跑模型性能测试、准确率测试及 Docker Run 启动
 """
 import time
 import requests

@@ -1,5 +1,5 @@
 """
-AONI 模型测试平台 — FastAPI 后端配置
+大模型测试平台 — FastAPI 后端配置
 """
 import os
 from pathlib import Path

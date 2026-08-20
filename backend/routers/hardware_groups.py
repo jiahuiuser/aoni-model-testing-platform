@@ -1,5 +1,5 @@
 """
-AONI 模型测试平台 — 硬件组管理路由 (硬件组自定义增删改查)
+大模型测试平台 — 硬件组管理路由 (硬件组自定义增删改查)
 """
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status

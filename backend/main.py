@@ -1,5 +1,5 @@
 """
-AONI 模型测试平台 — FastAPI 后端入口 (同步版)
+大模型测试平台 — FastAPI 后端入口 (同步版)
 """
 import sys
 from pathlib import Path
@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="AONI 模型测试平台",
+    title="大模型测试平台",
     version="2.0.0",
     lifespan=lifespan,
 )

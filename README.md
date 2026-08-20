@@ -1,4 +1,4 @@
-# AONI 智能体模型平台
+# 大模型测试平台
 
 NVIDIA Jetson AGX Thor (T5000) 多设备模型运维与测试平台。支持 43 款 LLM/VLM 的自动化部署、vLLM 矩阵性能测试、EvalScope 准确率评测，并提供高颜值 Vue 3 Web 管理界面与多设备远程 SSH 调度管理。
 
@@ -9,7 +9,7 @@ NVIDIA Jetson AGX Thor (T5000) 多设备模型运维与测试平台。支持 43 
 - **多设备 SSH 远程调度**：支持本机与远程 Jetson Thor 节点调度，集成基于 SSH (sshpass/密钥) 的远程 Docker 部署与健康度深度检测（GPU/CPU/内存/磁盘/vLLM）。
 - **TOS 云端模型扫描与勾选导入**：集成火山引擎 TOS 存储，支持一键目录前缀扫描、模型文件预览与批量增量导入。
 - **高阶性能矩阵与测试看板**：基于 vLLM Bench，支持不同并发梯度（1~64）、输入/输出 Token 长度等级（短/中/长）的吞吐量 (tok/s)、TTFT、TPOT、ITL 均值及 P99 折线图联动对比。
-- **用户权限与酷炫交互**：支持 JWT 身份认证、用户管理 (Admin/User)、多套动态科技主题皮肤（Cyber Nebula, Neon Aurora, Sunset Gold, Glacier Crystal）及 Aoni 矢量青蛙 Mascot 交互动画。
+- **用户权限与酷炫交互**：支持 JWT 身份认证、用户管理 (Admin/User)、多套动态科技主题皮肤（Cyber Nebula, Neon Aurora, Sunset Gold, Glacier Crystal）及矢量青蛙 Mascot 交互动画。
 - **并发稳定与自愈机制**：后端升级 SQLite WAL 模式、自动展开 `~` 绝对路径、无死锁非交互 Shell 调度及任务自愈检测。
 
 ---

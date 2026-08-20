@@ -1,6 +1,6 @@
 # 本地模型 vs 官网 —— 精度对比与量化权重下载对照
 
-> 本文档记录 AONI 平台本地 43 个模型与 NVIDIA Jetson AI Lab 官网（Thor 主线）的**版本/精度一致性**。
+> 本文档记录 大模型测试平台本地 43 个模型与 NVIDIA Jetson AI Lab 官网（Thor 主线）的**版本/精度一致性**。
 > 参考官网：[Jetson AI Lab Models](https://www.jetson-ai-lab.com/models/)
 > 说明：官网模型页默认展示的 GGUF 只是 API-model / llama.cpp 备选，**Thor vLLM 主线程实际 serve 的量化 repo 见下表**（来源：官网页面内嵌 `inference-panel-config` 的 `thor_t5000::vLLM`）。
 > 更新日期：2026-08-18

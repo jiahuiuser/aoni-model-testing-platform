@@ -1,5 +1,5 @@
 """
-AONI 认证路由 — 登录、获取当前用户信息、用户管理 (管理员)
+大模型测试平台 认证路由 — 登录、获取当前用户信息、用户管理 (管理员)
 """
 import datetime
 from fastapi import APIRouter, Depends, HTTPException, status

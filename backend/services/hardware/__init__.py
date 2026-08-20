@@ -1,5 +1,5 @@
 """
-AONI 平台 — 多芯片硬件抽象层 (Hardware Abstraction Layer - HAL)
+大模型测试平台 — 多芯片硬件抽象层 (Hardware Abstraction Layer - HAL)
 支持 NVIDIA Jetson AGX Thor, 沐曦 MetaX C500/N260, 服务器 RTX 5090, 摩尔线程 MUSA
 """
 from backend.services.hardware.base import BaseHardwareDriver

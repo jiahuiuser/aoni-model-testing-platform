@@ -30,7 +30,7 @@
             </svg>
           </div>
           <div class="brand-text">
-            <h2 class="title">AONI 模型测试平台</h2>
+            <h2 class="title">大模型测试平台</h2>
           </div>
         </div>
 

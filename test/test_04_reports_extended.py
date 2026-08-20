@@ -1,5 +1,5 @@
 """
-AONI 核心 QA 测试用例套件 — 04. 测试报告与多维度比对测试
+大模型测试平台 核心 QA 测试用例套件 — 04. 测试报告与多维度比对测试
 """
 import requests
 import unittest

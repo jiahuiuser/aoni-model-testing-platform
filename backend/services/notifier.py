@@ -1,5 +1,5 @@
 """
-AONI 平台 — 邮件 (SMTP Email) 消息通知服务
+大模型测试平台 — 邮件 (SMTP Email) 消息通知服务
 取代原企微 Webhook 方式
 """
 import os
@@ -50,12 +50,12 @@ def send_email_notification(
         status_text = f"ℹ️ 状态通知: {status}"
         badge_color = "#6b7280"
 
-    subject = f"[AONI 算力评测] 任务通知: {task_name} ({status_text})"
+    subject = f"[大模型测试平台 算力评测] 任务通知: {task_name} ({status_text})"
 
     html_content = f"""
     <div style="font-family: Arial, 'Microsoft YaHei', sans-serif; max-width: 600px; margin: 0 auto; border: 1px solid #e5e7eb; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1);">
         <div style="background-color: #1e293b; color: #ffffff; padding: 20px; text-align: center;">
-            <h2 style="margin: 0; font-size: 20px;">📊 AONI 算力测试平台评测通知</h2>
+            <h2 style="margin: 0; font-size: 20px;">📊 大模型测试平台评测通知</h2>
         </div>
         <div style="padding: 24px; background-color: #ffffff; color: #334155;">
             <div style="margin-bottom: 16px;">
@@ -81,7 +81,7 @@ def send_email_notification(
             {f'<div style="background-color: #f8fafc; border-left: 4px solid #94a3b8; padding: 12px; font-size: 13px; color: #475569; word-break: break-all;"><b>说明：</b> {detail_msg}</div>' if detail_msg else ''}
         </div>
         <div style="background-color: #f1f5f9; padding: 12px; text-align: center; font-size: 12px; color: #94a3b8;">
-            此邮件由 AONI 模型测试平台自动发送，请勿直接回复。
+            此邮件由 大模型测试平台自动发送，请勿直接回复。
         </div>
     </div>
     """
@@ -98,7 +98,7 @@ def send_email_notification(
 
     try:
         msg = MIMEMultipart()
-        msg["From"] = Header(f"AONI 测试平台 <{sender}>")
+        msg["From"] = Header(f"大模型测试平台 <{sender}>")
         msg["To"] = Header(to_email)
         msg["Subject"] = Header(subject, "utf-8")
         msg.attach(MIMEText(html_content, "html", "utf-8"))

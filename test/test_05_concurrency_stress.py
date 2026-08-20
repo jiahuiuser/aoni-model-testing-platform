@@ -1,5 +1,5 @@
 """
-AONI 核心 QA 测试用例套件 — 05. 并发高压与数据库鲁棒性测试
+大模型测试平台 核心 QA 测试用例套件 — 05. 并发高压与数据库鲁棒性测试
 """
 import requests
 import unittest

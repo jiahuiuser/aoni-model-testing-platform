@@ -337,7 +337,7 @@ const exportSummaryCSV = () => {
   const encodedUri = encodeURI(csvContent)
   const link = document.createElement("a")
   link.setAttribute("href", encodedUri)
-  link.setAttribute("download", `AONI_Reports_Summary_${new Date().toISOString().slice(0,10)}.csv`)
+  link.setAttribute("download", `Reports_Summary_${new Date().toISOString().slice(0,10)}.csv`)
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
@@ -359,7 +359,7 @@ const downloadSelectedReportsZip = async () => {
     const url = window.URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = taskId ? `Task_${taskId}_Benchmark_Reports.zip` : `AONI_Batch_Benchmark_Reports.zip`
+    link.download = taskId ? `Task_${taskId}_Benchmark_Reports.zip` : `Batch_Benchmark_Reports.zip`
     document.body.appendChild(link)
     link.click()
     document.body.removeChild(link)

@@ -1,5 +1,5 @@
 """
-AONI 模型测试平台 — 镜像管理路由 (Docker 镜像下载/拉取 & 设备一键部署)
+大模型测试平台 — 镜像管理路由 (Docker 镜像下载/拉取 & 设备一键部署)
 """
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -17,34 +17,34 @@ router = APIRouter(prefix="/api/images", tags=["ImageManagement"])
 
 DEFAULT_IMAGES = [
     {
-        "name": "aoni Jetson Thor 专属 vLLM 推理镜像",
+        "name": "Jetson Thor 专属 vLLM 推理镜像",
         "image_tag": "aoni/nvidia-ai-iot/vllm:latest-jetson-thor",
         "download_url": "http://10.10.250.214:5000/aoni/nvidia-ai-iot/vllm:latest-jetson-thor",
         "hardware_group": "NVIDIA_jetson_AGX_Thor",
         "status": "ready",
-        "description": "专为 NVIDIA Jetson AGX Thor (T5000) 优化的 aoni 专属 vLLM 高吞吐推理引擎镜像",
+        "description": "专为 NVIDIA Jetson AGX Thor (T5000) 优化的 vLLM 高吞吐推理引擎镜像",
     },
     {
-        "name": "aoni vLLM OpenAI 服务镜像 (v0.20.0 Ubuntu24.04)",
+        "name": "vLLM OpenAI 服务镜像 (v0.20.0 Ubuntu24.04)",
         "image_tag": "aoni/vllm/vllm-openai:v0.20.0-ubuntu2404",
         "download_url": "http://10.10.250.214:5000/aoni/vllm/vllm-openai:v0.20.0-ubuntu2404",
         "hardware_group": "NVIDIA_jetson_AGX_Thor",
         "status": "ready",
-        "description": "基于 Ubuntu 24.04 编译的 aoni 标准 vLLM OpenAI API 兼容推理服务镜像 (v0.20.0)",
+        "description": "基于 Ubuntu 24.04 编译的 vLLM OpenAI API 兼容推理服务镜像 (v0.20.0)",
     },
     {
-        "name": "aoni vLLM Nightly aarch64/ARM64 引擎镜像",
+        "name": "vLLM Nightly aarch64/ARM64 引擎镜像",
         "image_tag": "aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64",
         "download_url": "aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64",
         "hardware_group": "NVIDIA_jetson_AGX_Thor",
         "status": "ready",
-        "description": "针对 ARM64 / aarch64 架构发行的 aoni vLLM Nightly 版标准 OpenAI 评测引擎镜像",
+        "description": "针对 ARM64 / aarch64 架构发行的 vLLM Nightly 版标准 OpenAI 评测引擎镜像",
     },
 ]
 
 
 def _seed_images_if_needed(db: Session):
-    """同步与清理数据库，确保默认内置用户本地的 3 个 aoni 专属大模型推理镜像"""
+    """同步与清理数据库，确保默认内置用户本地的 3 个大模型推理镜像"""
     # 清理掉非 aoni 前缀的历史初始镜像
     db.query(DockerImage).filter(~DockerImage.image_tag.like('aoni/%')).delete(synchronize_session=False)
     db.commit()

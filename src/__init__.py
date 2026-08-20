@@ -1,1 +1,1 @@
-# AONI Model Platform Source Package
+# 大模型测试平台源代码包

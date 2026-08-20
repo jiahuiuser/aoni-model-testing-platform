@@ -1,5 +1,5 @@
 """
-AONI 核心 QA 测试用例套件 — 一键全量自动化测试引擎
+大模型测试平台 核心 QA 测试用例套件 — 一键全量自动化测试引擎
 涵盖 5 大维度：设备扩展、模型/DockerRun防卡死、任务隔离与生命周期、报告比对、高并发高压压测
 """
 import sys
@@ -20,7 +20,7 @@ from test_06_real_business_pipeline import TestRealBusinessPipeline
 
 def run_all_qa_suites():
     print("=" * 75)
-    print("🚀 AONI 模型测试平台 — 企业级 QA 自动化测试套件 (Test Suite)")
+    print("🚀 大模型测试平台 — 企业级 QA 自动化测试套件 (Test Suite)")
     print(f"🕒 执行时间: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 75)
 

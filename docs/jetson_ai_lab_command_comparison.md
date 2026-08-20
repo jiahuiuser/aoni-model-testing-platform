@@ -1,4 +1,4 @@
-# AONI 平台与 NVIDIA Jetson AI Lab 官网模型运行指令全量对比报告
+# 大模型测试平台与 NVIDIA Jetson AI Lab 官网模型运行指令全量对比报告
 
 > **测试设备**：NVIDIA Jetson AGX Thor Developer Kit (128GB 统一内存)  
 > **官网对比标准源**：[NVIDIA Jetson AI Lab Models Directory](https://www.jetson-ai-lab.com/models/)  
@@ -8,13 +8,13 @@
 
 ## 一、 整体对比概览与设计规范
 
-本报告对 AONI 模型测试平台中托管的全部 **44 款主流大语言模型与多模态模型**的 Docker 运行指令，与 NVIDIA 官方 **Jetson AI Lab** 的推荐部署指令进行了逐一比对。
+本报告对 大模型测试平台中托管的全部 **44 款主流大语言模型与多模态模型**的 Docker 运行指令，与 NVIDIA 官方 **Jetson AI Lab** 的推荐部署指令进行了逐一比对。
 
-总体而言，AONI 平台在**核心硬件运行时、推理容器引擎、显存利用率梯度分布、词表挂载**上与 Jetson AI Lab 官网规范 **100% 完全对齐**，并针对企业级自动化离线压测场景进行了生产级增强。
+总体而言，大模型测试平台在**核心硬件运行时、推理容器引擎、显存利用率梯度分布、词表挂载**上与 Jetson AI Lab 官网规范 **100% 完全对齐**，并针对企业级自动化离线压测场景进行了生产级增强。
 
 ### 1. 核心参数对齐一览表
 
-| 核心参数维度 | Jetson AI Lab 官网推荐规范 | AONI 平台配置 | 比对结果 | 生产级优化说明 |
+| 核心参数维度 | Jetson AI Lab 官网推荐规范 | 大模型测试平台配置 | 比对结果 | 生产级优化说明 |
 | :--- | :--- | :--- | :---: | :--- |
 | **容器 Runtime** | `--runtime=nvidia` | `--runtime=nvidia` | **100% 一致** | 共享 GPU 硬件算力与 Blackwell Tensor Core |
 | **网络模式** | `--network host` | `--network host` | **100% 一致** | 端口直连，消除容器桥接网络开销 |
@@ -49,7 +49,7 @@
 
 ## 三、 全量 44 款模型 Docker Run 指令详细对比
 
-以下为 AONI 平台当前运行指令与 Jetson AI Lab 官网标准的完整对照明细：
+以下为 大模型测试平台当前运行指令与 Jetson AI Lab 官网标准的完整对照明细：
 
 ### 1. `cosmos-reason-1-7b`
 * **官网推荐指令**：
@@ -60,7 +60,7 @@
     vllm/vllm-openai:latest \
     vllm serve nvidia/Cosmos-Reason-1-7B-NVFP4 --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -79,7 +79,7 @@
     ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor \
     llama-server -m /models/cosmos/Cosmos-Reason2-2B-GGUF/Cosmos-Reason2-2B-Q4_K_M.gguf --port 8300 -ngl 999
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -99,7 +99,7 @@
     ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor \
     llama-server -m /models/cosmos/Cosmos-Reason2-8B-GGUF/Cosmos-Reason2-8B-Q4_K_M.gguf --port 8300 -ngl 999
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -119,7 +119,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/functiongemma-270m-it --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -138,7 +138,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/gemma-3-12b --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -157,7 +157,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/gemma-3-1b --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -176,7 +176,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/gemma-3-270m --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -195,7 +195,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/gemma-3-27b --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -214,7 +214,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/gemma-3-4b --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -233,7 +233,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/Gemma-4-26B-A4B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -252,7 +252,7 @@
     vllm/vllm-openai:latest \
     vllm serve gemma/Gemma-4-31B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -271,7 +271,7 @@
     ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor \
     llama-server -m /models/google/Gemma-4-E2B-GGUF/gemma-4-E2B-it-Q8_0.gguf --port 8300 -ngl 999
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -291,7 +291,7 @@
     ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor \
     llama-server -m /models/google/Gemma-4-E4B-GGUF/gemma-4-E4B-it-Q4_K_M.gguf --port 8300 -ngl 999
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -313,7 +313,7 @@
     vllm/vllm-openai:latest \
     openai/gpt-oss-120b --port 8300 --gpu-memory-utilization 0.85
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -335,7 +335,7 @@
     vllm/vllm-openai:latest \
     openai/gpt-oss-20b --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -355,7 +355,7 @@
     vllm/vllm-openai:latest \
     vllm serve RedHatAI/Meta-Llama-3.1-70B-Instruct-quantized.w4a16 --port 8300 --gpu-memory-utilization 0.85
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -374,7 +374,7 @@
     vllm/vllm-openai:latest \
     vllm serve llama/Llama-3.1-8B --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -393,7 +393,7 @@
     vllm/vllm-openai:latest \
     vllm serve llama/Llama-3.2-3B --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -412,7 +412,7 @@
     ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor \
     llama-server -m /models/MiniMaxAI/MiniMax-M2.7 --port 8300 -ngl 999
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -431,7 +431,7 @@
     vllm/vllm-openai:latest \
     vllm serve mistral/Ministral-3-14B-Instruct --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -450,7 +450,7 @@
     vllm/vllm-openai:latest \
     vllm serve mistralai/Ministral-3-14B-Reasoning --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -469,7 +469,7 @@
     vllm/vllm-openai:latest \
     vllm serve mistralai/Ministral-3-3B-Instruct --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -488,7 +488,7 @@
     vllm/vllm-openai:latest \
     vllm serve mistralai/Ministral-3-3B-Reasoning --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -507,7 +507,7 @@
     vllm/vllm-openai:latest \
     vllm serve mistralai/Ministral-3-8B-Instruct --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -526,7 +526,7 @@
     vllm/vllm-openai:latest \
     vllm serve mistralai/Ministral-3-8B-Reasoning --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -545,7 +545,7 @@
     vllm/vllm-openai:latest \
     vllm serve nemotron/Nemotron-3-Nano-Omni --port 8300 --gpu-memory-utilization 0.70
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -564,7 +564,7 @@
     vllm/vllm-openai:latest \
     vllm serve nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-NVFP4-QAD --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -583,7 +583,7 @@
     vllm/vllm-openai:latest \
     vllm serve nemotron/Nemotron-Nano-9B-v2 --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -602,7 +602,7 @@
     vllm/vllm-openai:latest \
     vllm serve nvidia/Nemotron3-Nano-30B-A3B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -621,7 +621,7 @@
     ghcr.io/nvidia-ai-iot/llama_cpp:latest-jetson-thor \
     llama-server -m /models/nvidia/Nemotron3-Nano-4B/NVIDIA-Nemotron3-Nano-4B-Q4_K_M.gguf --port 8300 -ngl 999
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -641,7 +641,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3-30B-A3B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -660,7 +660,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3-32B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -679,7 +679,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3-4B --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -698,7 +698,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.5-0.6B --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -717,7 +717,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.5-27B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -736,7 +736,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.5-35B-A3B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -755,7 +755,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.5-4B --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -774,7 +774,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.5-9B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -793,7 +793,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.6-27B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -812,7 +812,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3.6-35B-A3B --port 8300 --gpu-memory-utilization 0.8
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -831,7 +831,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3-8B --port 8300 --gpu-memory-utilization 0.70
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -850,7 +850,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3-VL-4B-Instruct --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -870,7 +870,7 @@
     vllm/vllm-openai:latest \
     vllm serve qwen/Qwen3-VL-8B-Instruct --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -890,7 +890,7 @@
     vllm/vllm-openai:latest \
     vllm serve deepseek/DeepSeek-V4-Flash-DSpark --port 8300 --gpu-memory-utilization 0.7
   ```
-* **AONI 平台指令**：
+* **大模型测试平台指令**：
   ```bash
   sudo docker run --shm-size 16g -it --rm --runtime=nvidia --network host \
     -e MODEL_OSS=True -e MODEL_ROOT=/models \
@@ -904,7 +904,7 @@
 
 ## 四、 平台稳定性与诊断优化增强总结
 
-针对自动化连续压测过程中遇到的现实问题，AONI 平台相比官网原生脚本增加了以下 4 项生产级稳健保障：
+针对自动化连续压测过程中遇到的现实问题，大模型测试平台相比官网原生脚本增加了以下 4 项生产级稳健保障：
 
 1. **免密特权容器 Page Cache 自动清理 (`drop_caches`)**：
    在每次测试部署前，通过特权容器静默清空系统文件读取缓存，秒级恢复 **116 GB+** 物理纯空闲内存，彻底消除由于全量连续测试引发的显存校验异常。

@@ -74,7 +74,7 @@
         <!-- 流光微边框 -->
         <div class="shimmer-border"></div>
 
-        <!-- 🐸 核心企业标识：aoni 奥尼 互动科技萌蛙 (完全对称无缺块) -->
+        <!-- 🐸 核心企业标识：互动科技萌蛙 (完全对称无缺块) -->
         <div class="frog-mascot-wrapper" ref="frogRef">
           <!-- 对话气泡 (萌蛙提示) -->
           <transition name="pop">
@@ -84,9 +84,9 @@
             </div>
           </transition>
 
-          <!-- 奥尼青蛙头 SVG (眼睛跟随鼠标 & 密码遮眼保密 & 欢快眨眼) -->
+          <!-- 青蛙头 SVG (眼睛跟随鼠标 & 密码遮眼保密 & 欢快眨眼) -->
           <div class="frog-svg-container" :class="{ 'stealth-mode': isPasswordFocused, 'blinking': isBlinking }">
-            <svg viewBox="0 0 260 130" class="aoni-frog-svg" xmlns="http://www.w3.org/2000/svg">
+            <svg viewBox="0 0 260 130" class="frog-svg" xmlns="http://www.w3.org/2000/svg">
               <defs>
                 <linearGradient id="frogGlow" x1="0%" y1="0%" x2="100%" y2="100%">
                   <stop offset="0%" stop-color="#1e293b"/>
@@ -151,7 +151,7 @@
         </div>
 
         <!-- 统一洗练标题：消除文本重复 -->
-        <h1 class="login-title">AONI 模型测试平台</h1>
+        <h1 class="login-title">大模型测试平台</h1>
         <p class="login-subtitle">NVIDIA AGX Thor · 大模型性能与准确率评测矩阵</p>
 
         <el-form
@@ -208,7 +208,7 @@
         </el-form>
 
         <div class="login-footer">
-          <span>AONI System v2.5</span>
+          <span>System v2.5</span>
           <span>·</span>
           <span>智算中心专属平台</span>
         </div>
@@ -242,7 +242,7 @@ const pupilOffset = reactive({ x: 0, y: -4 })
 const isPasswordFocused = ref(false)
 const isBlinking = ref(false)
 const isBouncing = ref(false)
-const speechText = ref('你好！我是奥尼智能小蛙 🐸')
+const speechText = ref('你好！我是智能小蛙 🐸')
 
 let speechTimer = null
 
@@ -386,7 +386,7 @@ onMounted(() => {
     themeStore.setTheme(savedSkin)
   }
   initCanvas()
-  triggerSpeech('欢迎来到奥尼模型测试平台！🐸', 4000)
+  triggerSpeech('欢迎来到大模型测试平台！🐸', 4000)
 })
 
 onBeforeUnmount(() => {
@@ -722,7 +722,7 @@ const handleLogin = async () => {
   transition: transform 0.3s ease;
 }
 
-.aoni-frog-svg {
+.frog-svg {
   width: 100%;
   height: 100%;
   overflow: visible;

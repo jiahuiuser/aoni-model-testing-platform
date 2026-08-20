@@ -1,5 +1,5 @@
 """
-AONI 模型测试平台 — 数据库模型 (SQLAlchemy)
+大模型测试平台 — 数据库模型 (SQLAlchemy)
 """
 import datetime
 from sqlalchemy import Column, Integer, String, Float, Text, DateTime, JSON, ForeignKey, Enum as SAEnum

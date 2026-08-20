@@ -1,5 +1,5 @@
 """
-AONI 用户认证模块 — JWT 签发与验证、密码哈希
+大模型测试平台 用户认证模块 — JWT 签发与验证、密码哈希
 """
 import datetime
 from typing import Optional

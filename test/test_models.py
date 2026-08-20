@@ -1,5 +1,5 @@
 """
-AONI 自动化测试套件 — 模型管理模块 (Model Management)
+大模型测试平台 自动化测试套件 — 模型管理模块 (Model Management)
 包含 docker run 命令跑通验证及设备专属配置测试
 """
 import requests

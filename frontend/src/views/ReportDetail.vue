@@ -389,7 +389,7 @@ const exportCSV = () => {
   const encodedUri = encodeURI(csvContent)
   const link = document.createElement("a")
   link.setAttribute("href", encodedUri)
-  link.setAttribute("download", `AONI_Report_${report.value.model_slug}_${new Date().toISOString().slice(0,10)}.csv`)
+  link.setAttribute("download", `Report_${report.value.model_slug}_${new Date().toISOString().slice(0,10)}.csv`)
   document.body.appendChild(link)
   link.click()
   document.body.removeChild(link)
@@ -416,7 +416,7 @@ const exportPdf = async () => {
     const { default: html2pdf } = await import('html2pdf.js')
     const opt = {
       margin: [10, 10, 10, 10],
-      filename: `AONI_Report_${report.value?.model_slug || 'model'}_${new Date().toISOString().slice(0, 10)}.pdf`,
+      filename: `Report_${report.value?.model_slug || 'model'}_${new Date().toISOString().slice(0, 10)}.pdf`,
       image: { type: 'jpeg', quality: 0.98 },
       html2canvas: { scale: 2, useCORS: true, backgroundColor: '#ffffff' },
       jsPDF: { unit: 'mm', format: 'a4', orientation: 'portrait' },

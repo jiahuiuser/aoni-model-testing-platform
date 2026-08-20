@@ -1,5 +1,5 @@
 """
-AONI 自动化测试套件 — 任务管理模块 (Task Management)
+大模型测试平台 自动化测试套件 — 任务管理模块 (Task Management)
 测试任务创建、流转跑通、暂停/恢复、删除及显存释放
 """
 import time

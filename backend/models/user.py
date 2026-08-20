@@ -1,5 +1,5 @@
 """
-AONI 用户系统 — 用户 ORM 模型
+大模型测试平台 用户系统 — 用户 ORM 模型
 """
 import datetime
 from sqlalchemy import Column, Integer, String, Boolean, DateTime

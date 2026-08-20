@@ -1,5 +1,5 @@
 """
-AONI 模型测试平台 — 数据库连接管理 (同步版)
+大模型测试平台 — 数据库连接管理 (同步版)
 """
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, Session

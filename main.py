@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-AONI 智能体模型平台运维总控工具 (main.py)
+大模型测试平台运维总控工具 (main.py)
 """
 import os
 import argparse
@@ -313,7 +313,7 @@ def run_report_action(args):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="AONI 智能体模型平台运维总控工具")
+    parser = argparse.ArgumentParser(description="大模型测试平台运维总控工具")
     subparsers = parser.add_subparsers(dest="command", help="支持的操作命令")
 
     # 1. sync 量化拉取同步命令
