@@ -1,6 +1,6 @@
 <template>
   <div class="task-detail-page">
-    <el-page-header @back="$router.push('/')" :content="task ? `任务 #${task.id} — ${task.name}` : '加载中...'" />
+    <el-page-header @back="$router.push('/tasks')" :content="task ? `任务 #${task.id} — ${task.name}` : '加载中...'" />
 
     <div style="margin-top: 16px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
       <el-tag :type="statusType(task?.status)" size="large" effect="dark">{{ statusLabel(task?.status) }}</el-tag>

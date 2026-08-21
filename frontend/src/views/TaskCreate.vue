@@ -1026,7 +1026,7 @@ const handleSubmit = async () => {
     if (editId.value) {
       await apiUpdateTask(editId.value, payload)
       ElMessage.success('任务已更新')
-      router.push('/')
+      router.push('/tasks')
     } else {
       const task = await apiCreateTask(payload)
       ElMessage.success('任务已创建并开始执行')

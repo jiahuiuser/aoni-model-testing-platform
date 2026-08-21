@@ -6,7 +6,8 @@ const routes = [
   { path: '/login', name: 'Login', component: () => import('../views/Login.vue'), meta: { public: true } },
 
   // 主业务页（需登录）
-  { path: '/',          name: 'TaskList',         component: () => import('../views/TaskList.vue') },
+  { path: '/',          redirect: '/tasks' },
+  { path: '/tasks',     name: 'TaskList',         component: () => import('../views/TaskList.vue') },
   { path: '/create',    name: 'TaskCreate',        component: () => import('../views/TaskCreate.vue') },
   { path: '/task/:id',  name: 'TaskDetail',        component: () => import('../views/TaskDetail.vue') },
   { path: '/models',    name: 'ModelManagement',   component: () => import('../views/ModelManagement.vue') },
@@ -32,7 +33,7 @@ router.beforeEach((to, _from, next) => {
   if (to.meta.public) {
     // 已登录则跳过登录页
     if (authStore.isLoggedIn && to.name === 'Login') {
-      return next('/')
+      return next('/tasks')
     }
     return next()
   }
@@ -42,7 +43,7 @@ router.beforeEach((to, _from, next) => {
   }
 
   if (to.meta.requireAdmin && !authStore.isAdmin) {
-    return next('/')
+    return next('/tasks')
   }
 
   next()

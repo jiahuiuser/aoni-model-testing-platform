@@ -42,7 +42,7 @@
         </div>
 
         <el-menu :default-active="activeMenu" router class="sidebar-menu">
-          <el-menu-item index="/">
+          <el-menu-item index="/tasks">
             <el-icon><List /></el-icon>
             <span>任务管理</span>
           </el-menu-item>
@@ -332,7 +332,8 @@ const activeMenu = computed(() => {
   if (route.path.startsWith('/models')) return '/models'
   if (route.path.startsWith('/devices')) return '/devices'
   if (route.path.startsWith('/reports')) return '/reports'
-  return '/'
+  if (route.path.startsWith('/tasks')) return '/tasks'
+  return '/tasks'
 })
 
 watch(() => testStore.logs.length, () => {

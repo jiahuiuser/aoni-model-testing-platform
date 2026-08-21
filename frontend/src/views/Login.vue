@@ -417,7 +417,7 @@ const handleLogin = async () => {
     const ok = await authStore.login(form.username, form.password)
     if (ok) {
       triggerSpeech('验证成功！即将进入测试矩阵 🎉')
-      setTimeout(() => { router.push('/') }, 500)
+      setTimeout(() => { router.push('/tasks') }, 500)
     } else {
       errorMsg.value = authStore.error || '登录失败，请检查用户名或密码'
       triggerSpeech('登录失败，请检查用户名或密码 😅')
