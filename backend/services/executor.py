@@ -292,12 +292,24 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
             _vol_m = re.search(rf"-v\s+(\S+):{re.escape(_model_root_container)}", cmd)
             _host_root = _vol_m.group(1) if _vol_m else None
             if _host_root:
-                # 展开 ~
-                _host_root = os.path.expanduser(_host_root)
+                # 存在性检查：远程设备必须下发到目标机执行（os.path.isdir 只能看到后端机自己的文件系统）
+                _root_raw = _vol_m.group(1)  # 原始挂载路径（可能含 ~）
+                _host_root = os.path.expanduser(_root_raw)
                 _local_model_path = os.path.join(_host_root, _model_name)
                 # 容器内的模型路径（挂载后）
                 _container_model_path = f"{_model_root_container}/{_model_name}"
-                if os.path.isdir(_local_model_path):
+                if runner.is_remote:
+                    # 远程机：~ 由目标机 shell 展开为其家目录（用 $HOME 前缀保证展开）
+                    _rest = (_root_raw[1:] if _root_raw.startswith("~") else _root_raw) + "/" + _model_name
+                    _rest = _rest.replace("'", "'\\''")
+                    _check_expr = f"$HOME'{_rest}'" if _root_raw.startswith("~") else f"'{_rest}'"
+                    _check_res = runner.run_shell(f"test -d {_check_expr}", timeout=15)
+                    _has_local_model = _check_res.returncode == 0
+                else:
+                    _has_local_model = os.path.isdir(_local_model_path)
+                # 日志展示路径（远程机显示 ~ 原样路径，本机显示展开路径）
+                _display_path = _local_model_path if not runner.is_remote else (_root_raw.rstrip("/") + "/" + _model_name)
+                if _has_local_model:
                     # 本地已有完整模型目录 → 强制禁用 TOS 下载
                     cmd = re.sub(r"-e\s+MODEL_OSS=\S+", "-e MODEL_OSS=False", cmd)
                     # 关键：vllm_monkey 在 MODEL_OSS=False 时不会自动传 --model 参数
@@ -311,14 +323,21 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
                             count=1,
                         )
                     if log_callback:
-                        log_callback("INFO", "", f"  [本地优先] 检测到本地模型: {_local_model_path}，已跳过 TOS 下载 (MODEL_OSS=False, --model {_container_model_path})", "container")
+                        log_callback("INFO", "", f"  [本地优先] 检测到本地模型: {_display_path}，已跳过 TOS 下载 (MODEL_OSS=False, --model {_container_model_path})", "container")
                 else:
                     if log_callback:
-                        log_callback("INFO", "", f"  [TOS 下载] 本地路径 {_local_model_path} 不存在，将从 TOS 拉取模型权重", "container")
+                        log_callback("INFO", "", f"  [TOS 下载] 本地路径 {_display_path} 不存在，将从 TOS 拉取模型权重", "container")
         # ───────────────────────────────────────────────────────────────────────────
 
 
-        if os.path.exists("/models/python_packages"):
+        # 存在性检查：远程设备必须下发到目标机执行（os.path.exists 只能看到后端机自己的文件系统）
+        if runner.is_remote:
+            _pp_res = runner.run_shell("test -d /models/python_packages", timeout=15)
+            _has_python_packages = _pp_res.returncode == 0
+        else:
+            _has_python_packages = os.path.exists("/models/python_packages")
+
+        if _has_python_packages:
 
             if "-v /models/python_packages" not in cmd and "-v /models:" not in cmd:
                 cmd = re.sub(r"(docker run\b)", r"\1 -v /models/python_packages:/models/python_packages", cmd, count=1)
@@ -524,6 +543,13 @@ from backend.models import ModelInfo
 
 def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: dict, log_callback):
     """执行单个模型的完整测试流水线"""
+
+    def _check_stale():
+        """阶段边界检查: 任务被取消、或流水线已被新一代取代(删除后重建)时立即退出"""
+        from backend.services.task_manager import _cancel_flags, is_pipeline_stale
+        if _cancel_flags.get(task_id, False) or is_pipeline_stale(task_id):
+            raise InterruptedError("任务已取消或已被重建，旧流水线退出")
+
     # 获取设备
     task = model_run.task
     device = task.device if task else None
@@ -642,6 +668,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
 
     # Stage 3: 网关协议与技能适配测试
     if config.get("gateway_enabled", True):
+        _check_stale()
         model_run.status = ModelStage.GATEWAY_TESTING
         model_run.stage_status["gateway_testing"] = StageStatus.RUNNING.value
         db.commit()
@@ -651,9 +678,23 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         model_run.progress = 40
         db.commit()
 
+    # Stage 3.5: 功能测试 (质量专项: 大海捞针/数学/乱码/工具冒烟/Agent回归/多模态)
+    feature_items = config.get("feature_items") or []
+    if config.get("feature_enabled", False) and feature_items:
+        _check_stale()
+        model_run.status = ModelStage.FEATURE_TESTING
+        model_run.stage_status["feature_testing"] = StageStatus.RUNNING.value
+        db.commit()
+        log_callback("INFO", model_slug, "========== 功能测试（质量专项） ==========", "feature")
+        _run_feature_stage(db, model_run, config, log_callback, runner)
+        model_run.stage_status["feature_testing"] = StageStatus.COMPLETED.value
+        model_run.progress = 30
+        db.commit()
+
     # Stage 4: 性能测试
     perf_failed = False
     if config.get("perf_enabled", True):
+        _check_stale()
         model_run.status = ModelStage.PERF_TESTING
         model_run.stage_status["perf_testing"] = StageStatus.RUNNING.value
         db.commit()
@@ -667,6 +708,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
     acc_datasets = config.get("acc_datasets") or []
     is_acc_enabled = bool(config.get("acc_enabled", False)) and len(acc_datasets) > 0
     if is_acc_enabled:
+        _check_stale()
         model_run.status = ModelStage.ACC_TESTING
         model_run.stage_status["acc_testing"] = StageStatus.RUNNING.value
         db.commit()
@@ -744,14 +786,32 @@ def _resolve_verified_model_id(api_cfg: dict, fallback_name: str, log_callback=N
         if r.status_code == 200:
             data = r.json()
             if isinstance(data, dict) and "data" in data and len(data["data"]) > 0:
-                served_id = data["data"][0].get("id")
-                if served_id:
-                    if log_callback:
-                        log_callback("INFO", slug, f"  [Model ID Guard] 服务端模型 ID 校验成功: '{served_id}'", "container")
-                    return served_id
+                served_ids = [m.get("id") for m in data["data"] if m.get("id")]
+                if not served_ids:
+                    return fallback_name
+                # 多模型网关: 优先精确匹配/包含期望名 (大小写不敏感), 避免误选第一个
+                fn = (fallback_name or "").strip()
+                if fn:
+                    matched = next((sid for sid in served_ids if sid == fn), None) \
+                        or next((sid for sid in served_ids if fn.lower() == sid.lower()), None) \
+                        or next((sid for sid in served_ids if fn.lower() in sid.lower()), None)
+                    if matched:
+                        served_id = matched
+                    else:
+                        if len(served_ids) == 1:
+                            served_id = served_ids[0]
+                        else:
+                            if log_callback:
+                                log_callback("WARNING", slug, f"  [Model ID Guard] 多模型网关未匹配到 '{fn}'，使用第一个: '{served_ids[0]}'", "container")
+                            served_id = served_ids[0]
+                else:
+                    served_id = served_ids[0]
+                if log_callback:
+                    log_callback("INFO", slug, f"  [Model ID Guard] 服务端模型 ID 校验成功: '{served_id}'", "container")
+                return served_id
     except Exception as e:
         if log_callback:
-            log_callback("WARNING", slug, f"  [Model ID Guard] 模型 ID 预检异常 ({e})，使用回退 ID: '{fallback_name}'", "container")
+            log_callback("WARNING", slug, f"  [Model ID Guard] 模型 ID 预检异常 ({e})，使用回退 ID. '{fallback_name}'", "container")
     return fallback_name
 
 
@@ -796,6 +856,72 @@ def _run_gateway_stage(db: Session, model_run: ModelRun, config: dict, log_callb
         db.add(res_obj)
 
     db.commit()
+
+
+def _run_feature_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
+    """功能测试阶段: 逐项运行勾选的质量专项 (后端节点直接 HTTP 打推理端点)"""
+    from backend.services.features import ITEMS
+    from backend.models import FeatureResult
+
+    # 清理旧的功能测试记录
+    db.query(FeatureResult).filter_by(model_run_id=model_run.id).delete()
+    db.commit()
+
+    _port_in_cmd = re.search(r'--port\s+(\d+)', model_run.docker_command or '')
+    port = int(_port_in_cmd.group(1)) if _port_in_cmd else config.get("container_port", 8300)
+    model_slug = model_run.model_slug
+
+    api_cfg = _get_model_api_config(db, model_slug, runner, port, model_run.model_name)
+    base_url = api_cfg["base_url"]
+    api_key = api_cfg["api_key"]
+
+    feature_items = config.get("feature_items") or []
+    if not feature_items:
+        log_callback("INFO", model_slug, "未勾选任何功能测试项，跳过功能测试阶段", "feature")
+        return
+
+    log_callback("INFO", model_slug, f"功能测试项: {', '.join(feature_items)}", "feature")
+
+    verified_model_name = _resolve_verified_model_id(api_cfg, api_cfg["model_name"], log_callback, model_slug)
+
+    for key in feature_items:
+        item = ITEMS.get(key)
+        if not item:
+            log_callback("WARNING", model_slug, f"未知功能测试项: {key}，跳过", "feature")
+            continue
+        log_callback("INFO", model_slug, f"── 功能测试: {item['name']} ──", "feature")
+        try:
+            result = item["module"].run(
+                base_url, verified_model_name,
+                api_key=api_key, options=config.get("feature_options") or {},
+                log_callback=log_callback,
+            )
+        except Exception as e:
+            log_callback("ERROR", model_slug, f"功能测试 {item['name']} 执行异常: {e}", "feature")
+            result = {
+                "category": "feature",
+                "feature_key": key,
+                "test_item": item["name"],
+                "status": "FAIL",
+                "latency_ms": None,
+                "message": f"执行异常: {e}",
+                "raw_details": {},
+            }
+        log_callback("INFO", model_slug,
+                      f"功能测试 [{result.get('test_item')}] 结果: {result.get('status')} — {result.get('message')}",
+                      "feature")
+        res_obj = FeatureResult(
+            model_run_id=model_run.id,
+            category=result.get("category", "feature"),
+            feature_key=result.get("feature_key", key),
+            test_item=result.get("test_item", key),
+            status=result.get("status", "SKIP"),
+            latency_ms=result.get("latency_ms"),
+            message=result.get("message", ""),
+            raw_details=result.get("raw_details"),
+        )
+        db.add(res_obj)
+        db.commit()
 
 
 # ============================================================
@@ -943,6 +1069,11 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
             strategy_id = f"{model_run.model_slug}_round{round_num}_{output_type}"
 
             for concurrency in concurrencies:
+                # 压测项之间检查取消/代际，防止删除任务后流水线继续跑完剩余压测项
+                from backend.services.task_manager import _cancel_flags, is_pipeline_stale
+                if _cancel_flags.get(model_run.task_id, False) or is_pipeline_stale(model_run.task_id):
+                    raise InterruptedError("任务已取消或已被重建，旧流水线退出")
+
                 elapsed_sec = time.time() - perf_start_time
                 if completed_steps > 0:
                     avg_step_sec = elapsed_sec / completed_steps
@@ -1600,8 +1731,12 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     api_url = api_cfg["v1_url"]
     api_key = api_cfg["api_key"]
     eval_model_name = api_cfg["model_name"]
+    # 校正为服务端真实注册的模型 ID (容器部署场景 model_name 可能是带空格的显示名, 直接调用会 404)
+    eval_model_name = _resolve_verified_model_id(api_cfg, eval_model_name, log_callback, model_run.model_slug)
 
-    gen_config = json.dumps({"temperature": 0.0, "max_tokens": 512, "do_sample": False, "timeout": 30})
+    # 请求超时 300s: 慢速外部 API (如 15 tok/s × 512 tokens ≈ 34s/题) 需要更长超时，
+    # 30s 会导致所有请求超时重试 → 0 进度、无题目明细
+    gen_config = json.dumps({"temperature": 0.0, "max_tokens": 512, "do_sample": False, "timeout": 300})
 
     work_dir = DATA_DIR / "evalscope_reports" / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_t{model_run.task_id}_mr{model_run.id}"
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -1675,6 +1810,14 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     eval_env["NO_PROXY"] = f"{no_proxy_defaults},{existing_no_proxy}".rstrip(",")
     eval_env["no_proxy"] = eval_env["NO_PROXY"]
 
+    # 关键修复: httpx (openai SDK) 不支持 socks:// scheme, 构造客户端时直接抛
+    # "Unknown scheme for proxy URL" 导致 200 样本瞬间全失败 (无成绩生成)。
+    # 被测 API 端点为本地/内网 (已被 NO_PROXY 覆盖), 剔除无效的 socks 代理即可。
+    for _proxy_key in ("ALL_PROXY", "all_proxy"):
+        _proxy_val = (eval_env.get(_proxy_key) or "").strip()
+        if _proxy_val.startswith("socks://"):
+            eval_env.pop(_proxy_key, None)
+
     if limit > 0:
         cmd.extend(["--limit", str(limit)])
         limit_desc = f"抽取样本 limit={limit}/数据集"
@@ -1706,6 +1849,17 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
         stop_flag = threading.Event()
         progress_state = {"pct": None, "ds": None, "done": False}
         logged_detail_keys = set()
+
+        # 线程安全日志函数: 监控线程内绝不使用流水线主线程的 db session (Session 非线程安全,
+        # 跨线程共用会导致事务边界错乱, 曾引发 SQLite 写锁不释放 -> 全平台登录 500)
+        def _mt_log(level, slug, msg, module="accuracy"):
+            try:
+                from backend.database import session_factory
+                from backend.services.task_manager import _add_log
+                with session_factory() as sdb:
+                    _add_log(sdb, model_run.task_id, level, slug, msg, module)
+            except Exception:
+                pass
 
         def _poll_realtime_details():
             try:
@@ -1779,7 +1933,7 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                             if len(ans_brief) > 100:
                                 ans_brief = ans_brief[:100] + "..."
 
-                            log_callback("DEBUG", model_run.model_slug,
+                            _mt_log("DEBUG", model_run.model_slug,
                                          f"  [DEBUG 明细] [{ds_name.upper()} 题 #{idx}] 题目: {q_text} | 标准答案: [{target}] | 模型选项: [{extracted_pred or '未提取'}] | 结果: [{status_str}] | 模型推理: [{ans_brief}]", "accuracy")
                             emitted_count += 1
                         except Exception:
@@ -1813,11 +1967,11 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                                 if m:
                                     progress_state["ds"] = m.group(1)
                                     progress_state["pct"] = int(m.group(2))
-                                log_callback("INFO", model_run.model_slug, f"  [EvalScope] {line[:250]}", "accuracy")
+                                _mt_log("INFO", model_run.model_slug, f"  [EvalScope] {line[:250]}", "accuracy")
                             if "error code: 500" in line.lower() or "500. retrying" in line.lower():
                                 err_500_count[0] += 1
                                 if err_500_count[0] >= 8:
-                                    log_callback("WARNING", model_run.model_slug, "  ⚠️ 被测 API 服务端点 (DeepSeek-V4-Flash) 持续返回 HTTP 500 内部服务异常，中断异常重试挂机并保存现有评测记录...", "accuracy")
+                                    _mt_log("WARNING", model_run.model_slug, "  ⚠️ 被测 API 服务端点 (DeepSeek-V4-Flash) 持续返回 HTTP 500 内部服务异常，中断异常重试挂机并保存现有评测记录...", "accuracy")
                                     if proc and proc.poll() is None:
                                         proc.kill()
                                     break
@@ -1833,7 +1987,7 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
 
                     # 抗挂机监控：若 EvalScope 控制台超过 10 分钟未产生任何新日志，主动终止卡死进程以进入隔离重试
                     if now - last_activity_time > 600:
-                        log_callback("WARNING", model_run.model_slug, "  ⚠️ EvalScope 控制台超过 10 分钟未产生任何新日志 (可能由于网络下载卡死)，自动终止批处理子进程以启动隔离抗抖动重试引擎...", "accuracy")
+                        _mt_log("WARNING", model_run.model_slug, "  ⚠️ EvalScope 控制台超过 10 分钟未产生任何新日志 (可能由于网络下载卡死)，自动终止批处理子进程以启动隔离抗抖动重试引擎...", "accuracy")
                         if proc and proc.poll() is None:
                             proc.kill()
                         break
@@ -1861,9 +2015,9 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                                     mr.progress_detail = f"准确率测试中 | 已用: {elapsed_str} | 真实题库推理评测进行中..."
                                 mdb.commit()
                         if pct is not None and ds:
-                            log_callback("INFO", model_run.model_slug, f"  └─ [{ds.upper()}] 准确率评测进行中: {pct}% | 已用: {elapsed_str}", "accuracy")
+                            _mt_log("INFO", model_run.model_slug, f"  └─ [{ds.upper()}] 准确率评测进行中: {pct}% | 已用: {elapsed_str}", "accuracy")
                         else:
-                            log_callback("INFO", model_run.model_slug, f"  └─ 准确率评测后台任务持续运行中 | 已用: {elapsed_str}", "accuracy")
+                            _mt_log("INFO", model_run.model_slug, f"  └─ 准确率评测后台任务持续运行中 | 已用: {elapsed_str}", "accuracy")
                 except Exception:
                     pass
                 time.sleep(3)
@@ -2035,6 +2189,8 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
     api_url = api_cfg["chat_url"]
     api_key = api_cfg["api_key"]
     eval_model_name = api_cfg["model_name"]
+    # 校正为服务端真实注册的模型 ID (容器部署场景 model_name 可能是带空格的显示名, 直接调用会 404)
+    eval_model_name = _resolve_verified_model_id(api_cfg, eval_model_name, log_callback, model_run.model_slug)
 
     headers = {}
     if api_key and api_key != "EMPTY":

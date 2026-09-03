@@ -1339,3 +1339,68 @@ def api_test_model_stream(slug: str, device_id: int | None = Query(None), db: Se
             await asyncio.to_thread(_stop_test_container, runner)
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
+
+
+# ============================================================
+#  ModelScope 模型引入（精确 repo_id，无目录/关键字搜索 API）
+# ============================================================
+
+class ModelScopeResolveRequest(BaseModel):
+    repo_id: str
+
+
+class ModelScopeImportRequest(BaseModel):
+    repo_id: str
+    group_name: str = "NVIDIA_jetson_AGX_Thor"
+
+
+@router.post("/modelscope/resolve")
+def api_modelscope_resolve(data: ModelScopeResolveRequest):
+    """预览 ModelScope 模型：详情+文件列表+大小估算（匿名 API）"""
+    from backend.services import modelscope_service
+    try:
+        info = modelscope_service.resolve_model(data.repo_id)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        raise HTTPException(404, str(e))
+    return info
+
+
+@router.post("/modelscope/import")
+def api_modelscope_import(data: ModelScopeImportRequest, db: Session = Depends(get_db)):
+    """确认引入：注册到平台 + 生成 docker 部署命令"""
+    from backend.services import modelscope_service
+    try:
+        info = modelscope_service.resolve_model(data.repo_id)
+    except Exception as e:
+        raise HTTPException(400, str(e))
+
+    repo_id = info["repo_id"]
+    slug = repo_id.split("/")[-1].lower().replace("_", "-").replace(".", "-")
+    name = info["name"]
+
+    existing = db.execute(select(ModelInfo).where(ModelInfo.slug == slug)).scalar_one_or_none()
+    if existing:
+        existing.tos_path = f"modelscope://{repo_id}"
+        existing.result_detail = f"ModelScope 引入更新 ({info['total_size_human']})"
+        db.commit()
+        db.refresh(existing)
+        return {"message": f"模型 {name} 已存在，已更新为 ModelScope 来源", "model": {"id": existing.id, "name": existing.name, "slug": existing.slug}}
+
+    max_idx = db.execute(select(func.max(ModelInfo.idx))).scalar() or 0
+    model = ModelInfo(
+        idx=max_idx + 1,
+        name=name,
+        slug=slug,
+        group_name=data.group_name,
+        docker_command=modelscope_service.build_docker_command(repo_id),
+        tos_path=f"modelscope://{repo_id}",
+        status="NEW",
+        size_category="Custom",
+        result_detail=f"ModelScope 引入 ({info['total_size_human']}, 下载 {info['downloads']})",
+    )
+    db.add(model)
+    db.commit()
+    db.refresh(model)
+    return {"message": f"模型 {name} 已成功引入并注册就绪！", "model": {"id": model.id, "name": model.name, "slug": model.slug}}

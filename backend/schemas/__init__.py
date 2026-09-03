@@ -34,6 +34,8 @@ class TaskConfig(BaseModel):
     gateway_enabled: bool = True
     gateway_protocols: List[str] = Field(default_factory=lambda: ["openai", "anthropic", "responses"])
     test_longctx: bool = False
+    feature_enabled: bool = False
+    feature_items: List[str] = Field(default_factory=list)
     perf_enabled: bool = True
     perf_rounds_config: List[PerfRoundConfig] = Field(default_factory=lambda: [
         PerfRoundConfig()
@@ -80,6 +82,21 @@ class DockerImageCreate(BaseModel):
     download_url: Optional[str] = None
     hardware_group: str = "NVIDIA_jetson_AGX_Thor"
     description: Optional[str] = None
+    category_id: Optional[int] = None
+    source: str = "custom"
+    chip_type: Optional[str] = None
+    arch: str = "amd64"
+    source_ref: Optional[str] = None
+    size_bytes: Optional[int] = None
+    pull_command: Optional[str] = None
+    install_step: Optional[str] = None
+
+
+class ImageCategoryCreate(BaseModel):
+    name: str
+    parent_id: Optional[int] = None
+    description: Optional[str] = None
+    sort_order: int = 0
 
 
 class DatasetDownloadRequest(BaseModel):

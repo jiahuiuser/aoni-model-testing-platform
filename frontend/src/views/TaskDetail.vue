@@ -480,8 +480,8 @@ function getProtocolSuites(gatewayResults) {
   return Object.values(groupMap).filter(g => g.items.length > 0)
 }
 
-const modelStatusType = (s) => ({ deploying: 'warning', validating: 'warning', gateway_testing: 'primary', perf_testing: 'primary', acc_testing: 'primary', reporting: '', done: 'success' })[s] || 'info'
-const modelStatusLabel = (s) => ({ deploying: '容器部署', validating: '服务就绪', gateway_testing: '网关测试', perf_testing: '性能测试', acc_testing: '准确率测试', reporting: '生成报告', done: '完成' })[s] || s
+const modelStatusType = (s) => ({ deploying: 'warning', validating: 'warning', gateway_testing: 'primary', feature_testing: 'primary', perf_testing: 'primary', acc_testing: 'primary', reporting: '', done: 'success' })[s] || 'info'
+const modelStatusLabel = (s) => ({ deploying: '容器部署', validating: '服务就绪', gateway_testing: '网关测试', feature_testing: '功能测试', perf_testing: '性能测试', acc_testing: '准确率测试', reporting: '生成报告', done: '完成' })[s] || s
 
 const loadTask = async () => {
   try {

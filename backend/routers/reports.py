@@ -205,6 +205,15 @@ def api_get_report(
             "accuracy": ar.accuracy, "error": ar.error,
         })
 
+    feature_data = []
+    for fr in (mr.feature_results or []):
+        feature_data.append({
+            "id": fr.id, "category": fr.category, "feature_key": fr.feature_key,
+            "test_item": fr.test_item, "status": fr.status,
+            "latency_ms": fr.latency_ms, "message": fr.message,
+            "raw_details": fr.raw_details,
+        })
+
     dev = mr.device
     dev_name = mr.device_name or (dev.name if dev else "NVIDIA AGX Thor (本机)")
     gpu_spec = (dev.gpu_info if dev and dev.gpu_info else "NVIDIA AGX Thor (Blackwell Tensor Cores / 64GB Unified)")
@@ -237,6 +246,7 @@ def api_get_report(
         "gateway_results": gateway_data,
         "perf_results": perf_data,
         "acc_results": acc_data,
+        "feature_results": feature_data,
     }
 
 
@@ -944,7 +954,27 @@ def api_download_report(
             lines.append(f"| {_gr.test_item} | {(_gr.protocol or '-').upper()} | {_st} |")
         lines.append("")
 
-    # 2.4 测试方法说明
+    # 2.4 功能测试（质量专项）
+    if mr.feature_results:
+        _n2 += 1
+        lines.append(f"### 2.{_n2} 功能测试（质量专项）")
+        lines.append("")
+        lines.append("| 测试项 | 状态 | 结果说明 |")
+        lines.append("|:---|:---:|:---|")
+        for _fr in mr.feature_results:
+            lines.append(f"| {_fr.test_item} | {_fr.status} | {(_fr.message or '-')} |")
+        _f_pass = sum(1 for x in mr.feature_results if (x.status or "") == "PASS")
+        _f_total = len(mr.feature_results)
+        if _f_pass == _f_total:
+            _f_verdict = "全部通过 ✅ 可作为放行依据"
+        else:
+            _f_failed = [x.test_item for x in mr.feature_results if (x.status or "") != "PASS"]
+            _f_verdict = f"存在未通过项：{('、'.join(_f_failed))}"
+        lines.append("")
+        lines.append(f"> **功能验收：{_f_pass}/{_f_total} 项通过 — {_f_verdict}**")
+        lines.append("")
+
+    # 2.5 测试方法说明
     _n2 += 1
     lines.append(f"### 2.{_n2} 测试方法说明")
     lines.append("")
@@ -958,6 +988,8 @@ def api_download_report(
         lines.append("- **准确率评测**：对上述基准数据集各抽取固定数量样本，计算模型 Top-1 准确率（Accuracy）。")
     if mr.gateway_results:
         lines.append("- **协议规范校验**：通过 OpenAI/Anthropic/Responses 等 API 协议规范逐项校验模型的接口兼容性（分类、响应结构、鉴权等）。")
+    if mr.feature_results:
+        lines.append("- **功能测试（质量专项）**：通过长上下文检索（大海捞针）、数学正确性、乱码检测、工具调用冒烟、Agent 多工具回归、多模态图片输入等专项用例验证模型输出质量与行为正确性。")
     lines.append("")
     lines.append("---")
     lines.append("")
@@ -1453,6 +1485,16 @@ def api_download_report(
     elif mr.gateway_results:
         pass_gw = sum(1 for gr in mr.gateway_results if gr.status == "PASS")
         lines.append(f"{n}. **API 协议规范校验**：通过 {pass_gw}/{len(mr.gateway_results)} 项 OpenAI API 兼容规范校验，可直接对接上层应用及 API 网关。")
+        n += 1
+
+    # 动态判定 4.5: 功能测试（质量专项）
+    if mr.feature_results:
+        f_pass = sum(1 for fr in mr.feature_results if (fr.status or "") == "PASS")
+        f_total = len(mr.feature_results)
+        if f_pass == f_total:
+            lines.append(f"{n}. **功能验收**：全部 {f_total} 项功能/质量专项测试（{('、'.join(fr.test_item for fr in mr.feature_results))}）全部通过，可作为放行依据。")
+        else:
+            lines.append(f"{n}. **功能验收**：功能/质量专项测试通过 {f_pass}/{f_total} 项，存在未通过项，建议复测确认后再放行。")
         n += 1
 
     # 动态判定 6：生产部署与并发选型（仅在有有效数据时给出实测定量建议）

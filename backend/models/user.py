@@ -17,4 +17,4 @@ class User(Base):
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
     last_login = Column(DateTime, nullable=True)
-    active_token = Column(String(500), nullable=True, comment="单设备登录校验唯一有效Token")
+    active_token = Column(String(500), nullable=True, comment="最近一次登录Token (仅记录, 不做单设备校验)")

@@ -35,24 +35,16 @@
 
               <el-form-item label="测试 Profile">
                 <el-select v-model="form.profile" style="width: 100%" @change="handleProfileChange">
-                  <template v-if="isExternalModelSelected">
-                    <el-option label="全量测试 (API 协议 + 准确率)" value="full" />
-                    <el-option label="仅 API 协议规范校验" value="gateway" />
-                    <el-option label="仅准确率测试" value="accuracy" />
-                    <el-option label="自定义" value="custom" />
-                  </template>
-                  <template v-else>
-                    <el-option label="全量测试 (API 协议 + 性能 + 准确率)" value="full" />
-                    <el-option label="仅 API 协议规范校验" value="gateway" />
-                    <el-option label="仅性能测试" value="perf" />
-                    <el-option label="仅准确率测试" value="accuracy" />
-                    <el-option label="快速冒烟测试" value="quick" />
-                    <el-option label="自定义" value="custom" />
-                  </template>
+                  <el-option label="全量测试 (API 协议 + 性能 + 准确率)" value="full" />
+                  <el-option label="仅 API 协议规范校验" value="gateway" />
+                  <el-option label="仅性能测试" value="perf" />
+                  <el-option label="仅准确率测试" value="accuracy" />
+                  <el-option label="快速冒烟测试" value="quick" />
+                  <el-option label="自定义" value="custom" />
                 </el-select>
               </el-form-item>
 
-              <el-form-item v-if="!isExternalModelSelected" label="矩阵用例模板">
+              <el-form-item label="矩阵用例模板">
                 <el-select
                   v-model="selectedTemplateIds"
                   multiple
@@ -287,30 +279,62 @@
               </template>
             </el-card>
 
-            <!-- 5. 性能矩阵压测 -->
+            <!-- 5. 功能测试（质量专项） -->
             <el-card shadow="never" class="config-card">
               <template #header>
                 <div class="card-header-title">
                   <span class="card-icon-tag">5</span>
+                  <span>功能测试（质量专项）</span>
+                  <el-switch
+                    v-model="form.config.feature_enabled"
+                    style="margin-left: auto"
+                  />
+                </div>
+              </template>
+
+              <template v-if="form.config.feature_enabled">
+                <el-form-item label="测试项">
+                  <el-checkbox-group v-model="form.config.feature_items">
+                    <el-checkbox label="needle">大海捞针（长上下文检索）</el-checkbox>
+                    <el-checkbox label="math">数学正确性</el-checkbox>
+                    <el-checkbox label="garble">长上下文乱码检测</el-checkbox>
+                    <el-checkbox label="tool_smoke">工具调用冒烟快筛</el-checkbox>
+                    <el-checkbox label="agent_replay">Agent 多工具决定性回归</el-checkbox>
+                    <el-checkbox label="multimodal" :disabled="!isVisionModelSelected">多模态图片输入测试（仅 VL 模型）</el-checkbox>
+                  </el-checkbox-group>
+                </el-form-item>
+                <div class="form-tip">
+                  大海捞针：长文本中嵌入关键信息，验证检索正确性；数学正确性：确定性运算校验；乱码检测：分层扫描 U+FFFD/重复符号；
+                  工具冒烟/Agent 回归：验证工具调用能力（Agent 回归用 39 工具+33K 上下文真实请求重放）；多模态：仅图片输入模型可勾选。
+                </div>
+              </template>
+              <template v-else>
+                <div class="disabled-tip">功能测试模块未激活</div>
+              </template>
+            </el-card>
+
+            <!-- 6. 性能矩阵压测 -->
+            <el-card shadow="never" class="config-card">
+              <template #header>
+                <div class="card-header-title">
+                  <span class="card-icon-tag">6</span>
                   <span>性能矩阵压测</span>
                   <el-switch
-                    v-if="form.profile === 'custom' && !isExternalModelSelected"
+                    v-if="form.profile === 'custom'"
                     v-model="form.config.perf_enabled"
                     style="margin-left: auto"
                   />
                 </div>
               </template>
 
-              <template v-if="isExternalModelSelected">
-                <el-alert type="info" show-icon :closable="false">
-                  外部 API 端点模型不支持本地硬件容器级别的性能压测，该模块已自动停用。
-                </el-alert>
-              </template>
-              <template v-else-if="form.config.perf_enabled">
+              <el-alert v-if="isExternalModelSelected && form.config.perf_enabled" type="info" show-icon :closable="false" style="margin-bottom: 10px">
+                外部 API 端点模型将使用【自定义 HTTP】异步流式压测（同样输出 ITL/TPOT 指标），无法使用容器内原生 vLLM bench。
+              </el-alert>
+              <template v-if="form.config.perf_enabled">
                 <el-form-item label="压测框架">
                   <el-radio-group v-model="form.config.benchmark_framework">
                     <el-radio label="auto">自动</el-radio>
-                    <el-radio label="native">原生 vLLM</el-radio>
+                    <el-radio label="native" :disabled="isExternalModelSelected">原生 vLLM</el-radio>
                     <el-radio label="custom">自定义 HTTP</el-radio>
                   </el-radio-group>
                   <div class="form-tip">
@@ -377,11 +401,11 @@
               </template>
             </el-card>
 
-            <!-- 6. 自动化学科准确率评测 -->
+            <!-- 7. 自动化学科准确率评测 -->
             <el-card shadow="never" class="config-card">
               <template #header>
                 <div class="card-header-title">
-                  <span class="card-icon-tag">6</span>
+                  <span class="card-icon-tag">7</span>
                   <span>自动化学科准确率评测</span>
                   <el-switch
                     v-if="form.profile === 'custom'"
@@ -723,6 +747,8 @@ const form = reactive({
     gateway_enabled: true,
     gateway_protocols: ['openai', 'anthropic', 'responses'],
     test_longctx: false,
+    feature_enabled: false,
+    feature_items: [],
     perf_enabled: true,
     benchmark_framework: 'auto',
     perf_rounds_config: [makeDefaultRound()],
@@ -884,6 +910,14 @@ const isExternalModelSelected = computed(() => {
   return selectedExternalModels.value.length > 0
 })
 
+// 是否选中了 VL (多模态) 模型 —— 决定多模态图片测试项是否可勾选
+const isVisionModelSelected = computed(() => {
+  return selectedModelObjects.value.some((m) => {
+    const slug = (m.slug || '').toLowerCase()
+    return slug.includes('-vl') || slug.includes('vision') || slug.includes('omni')
+  })
+})
+
 const hasDeviceSelected = computed(() => {
   return selectedModelObjects.value.some((m) => !m.is_external && !m.api_base)
 })
@@ -916,10 +950,6 @@ const isAllExternalSelected = computed(() => {
 
 watch(isExternalModelSelected, (isExt) => {
   if (isExt) {
-    form.config.perf_enabled = false
-    if (form.profile === 'perf') {
-      form.profile = 'gateway'
-    }
     if (form.profile === 'full') {
       form.config.gateway_enabled = true
       form.config.acc_enabled = true
@@ -982,7 +1012,7 @@ const handleProfileChange = (profile) => {
     form.config.acc_enabled = false
   } else if (profile === 'quick') {
     form.config.gateway_enabled = true
-    form.config.perf_enabled = !isExternalModelSelected.value
+    form.config.perf_enabled = true
     form.config.perf_rounds_config = [
       { input_len: 512, output_lens_str: '128', concurrencies_str: '1,4', num_prompts: 100 },
     ]
@@ -998,11 +1028,9 @@ const handleProfileChange = (profile) => {
     form.config.acc_enabled = true
   } else if (profile === 'full') {
     form.config.gateway_enabled = true
-    form.config.perf_enabled = !isExternalModelSelected.value
+    form.config.perf_enabled = true
     form.config.acc_enabled = true
-    if (!isExternalModelSelected.value) {
-      form.config.perf_rounds_config = [makeDefaultRound()]
-    }
+    form.config.perf_rounds_config = [makeDefaultRound()]
   }
 }
 

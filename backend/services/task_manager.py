@@ -20,6 +20,20 @@ _running_tasks: dict[int, threading.Thread] = {}
 _pause_flags: dict[int, bool] = {}
 _cancel_flags: dict[int, bool] = {}
 
+# 流水线代际(Generation)登记: task_id -> 当前代次。
+# 每次 start_task 递增；旧一代流水线在检查点发现代次落后即自行退出，
+# 彻底防止「暂停→删除→重建同 id 任务」后僵尸流水线污染新任务数据。
+_task_generation: dict[int, int] = {}
+_pipeline_gen_start: dict[int, int] = {}  # task_id -> 本轮流水线启动时的代次
+
+
+def is_pipeline_stale(task_id: int) -> bool:
+    """供 executor 各阶段调用：当前流水线是否已被新一代流水线取代（或任务已删除重建）"""
+    gen = _pipeline_gen_start.get(task_id)
+    if gen is None:
+        return False
+    return _task_generation.get(task_id) != gen
+
 # 设备级串行执行队列：记录每台设备当前正在运行的任务，以及等待队列
 _device_running: dict[int, int] = {}          # device_id -> running task_id
 _device_queue: dict[int, list[int]] = {}      # device_id -> [待执行 task_id 列表]
@@ -207,7 +221,10 @@ def start_task(task_id: int):
                     _device_running[dev_id] = task_id
     except Exception:
         pass
-    t = threading.Thread(target=_execute_task_pipeline, args=(task_id,), daemon=True)
+    # 代际(Generation)登记: 每次 start_task 递增，旧一代流水线检测到落后即自杀，
+    # 防止「暂停→删除→重建同 id 任务」后僵尸流水线继续污染新任务数据
+    _task_generation[task_id] = _task_generation.get(task_id, 0) + 1
+    t = threading.Thread(target=_execute_task_pipeline, args=(task_id, _task_generation[task_id]), daemon=True)
     t.start()
     _running_tasks[task_id] = t
 
@@ -331,8 +348,9 @@ def restart_task(db: Session, task_id: int):
     _cancel_flags[task_id] = True
     _pause_flags[task_id] = False
     stop_task_containers(task)
-    time.sleep(0.5)
-    _cancel_flags[task_id] = False
+    # 注意: 不在此处复位 _cancel_flags（旧流水线可能每秒才检查一次，过早复位会产生竞态），
+    # 标志由随后的 start_task 统一复位，确保旧流水线能可靠退出
+    time.sleep(1.0)
 
     task.status = TaskStatus.RUNNING
     task.started_at = datetime.utcnow()
@@ -380,8 +398,9 @@ def retry_failed_task(db: Session, task_id: int):
     _cancel_flags[task_id] = True
     _pause_flags[task_id] = False
     stop_task_containers(task)
-    time.sleep(0.5)
-    _cancel_flags[task_id] = False
+    # 注意: 不在此处复位 _cancel_flags（旧流水线可能每秒才检查一次，过早复位会产生竞态），
+    # 标志由随后的 start_task 统一复位，确保旧流水线能可靠退出
+    time.sleep(1.0)
 
     # 2. 重置主任务状态
     task.status = TaskStatus.RUNNING
@@ -440,10 +459,16 @@ def _check_pause(task_id: int):
         raise InterruptedError("Task cancelled or restarted")
 
 
-def _execute_task_pipeline(task_id: int):
+def _execute_task_pipeline(task_id: int, generation: int | None = None):
     """在后台线程执行任务流水线"""
     import time
     from backend.services.executor import run_model_pipeline
+
+    if generation is not None:
+        # 代际落后说明已被新一代流水线取代（如删除后重建同 id 任务），直接退出
+        if _task_generation.get(task_id) != generation:
+            return
+        _pipeline_gen_start[task_id] = generation
 
     db = session_factory()
     this_device_id = None
@@ -463,6 +488,10 @@ def _execute_task_pipeline(task_id: int):
         for model_run in model_runs:
             try:
                 _check_pause(task_id)
+                # 代际检查: 已被新一代流水线取代（如删除后重建同 id 任务），立即退出
+                if generation is not None and is_pipeline_stale(task_id):
+                    _add_log(db, task_id, "INFO", model_run.model_slug, "检测到任务已被删除/重建，旧流水线自动退出", "system")
+                    return
                 # 断点续跑保护：如果该模型已成功完成且无失败记录，则直接跳过该模型
                 has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (model_run.stage_status or {}).values())
                 has_error_detail = any(kw in (model_run.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止"])
@@ -521,6 +550,9 @@ def _execute_task_pipeline(task_id: int):
     finally:
         db.close()
         _running_tasks.pop(task_id, None)
+        # 清理代际登记（仅当未被新一代取代时）
+        if generation is not None and _pipeline_gen_start.get(task_id) == generation:
+            _pipeline_gen_start.pop(task_id, None)
         # 释放设备占用并启动排队中的下一个任务
         if this_device_id is not None:
             with _device_queue_lock:
@@ -579,6 +611,20 @@ def recover_running_tasks():
         # 清空旧的运行态占用，重新登记
         _device_running.clear()
         _device_queue.clear()
+
+        # 0. 清理上一进程遗留的孤儿: evalscope 子进程(Popen 不随主进程死亡)与残留容器。
+        #    否则孤儿评测会持续抢占端口吞吐, 且可能打到错误模型上污染评测结果。
+        try:
+            from backend.services.executor import stop_task_containers
+            stale_tasks = db.query(Task).filter(Task.status == TaskStatus.RUNNING).all()
+            for st in stale_tasks:
+                try:
+                    stop_task_containers(st)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         # 1. 恢复运行态任务线程 (start_task 内含设备串行保护：设备已被占用时自动入队等待)
         running_tasks = db.query(Task).filter(Task.status == TaskStatus.RUNNING).all()
         for t in running_tasks:
@@ -593,3 +639,13 @@ def recover_running_tasks():
         for t in scheduled_tasks:
             if t.id not in _running_tasks:
                 schedule_or_start_task(db, t.id)
+
+        # 3. 恢复普通排队态任务 (无 scheduled_at)：设备空闲则立即执行, 忙则自动重新入队
+        #    修复: 队列信息存于内存 (_device_queue), 后端重启后丢失, 不恢复则任务永久卡在排队态
+        queued_tasks = db.query(Task).filter(
+            Task.status == TaskStatus.QUEUED,
+            Task.scheduled_at.is_(None),
+        ).all()
+        for t in queued_tasks:
+            if t.id not in _running_tasks:
+                start_task(t.id)

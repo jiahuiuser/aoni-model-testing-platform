@@ -9,6 +9,9 @@
         <el-button type="success" plain @click="openImportSyncDialog">
           <el-icon><Cloudy /></el-icon> 模型同步与导入
         </el-button>
+        <el-button type="primary" plain @click="showModelScopeDialog = true">
+          <el-icon><Search /></el-icon> ModelScope 引入
+        </el-button>
         <el-button type="warning" plain @click="openHardwareGroupsDialog">
           <el-icon><Cpu /></el-icon> 硬件架构组
         </el-button>
@@ -509,16 +512,66 @@
         </div>
       </div>
 
-      <template #footer>
-        <el-button @click="runTestModalVisible = false">关闭</el-button>
-        <el-button
-          type="success"
-          :loading="probing"
-          @click="submitProbeChat"
-        >
+       <template #footer>
+         <el-button @click="runTestModalVisible = false">关闭</el-button>
+         <el-button
+           type="success"
+           :loading="probing"
+           @click="submitProbeChat"
+         >
           <el-icon><Promotion /></el-icon>
           {{ probeTargetModel?.is_external ? '发送测试请求' : '部署并开启实时控制台' }}
         </el-button>
+      </template>
+    </el-dialog>
+
+    <!-- ModelScope 引入 Dialog -->
+    <el-dialog v-model="showModelScopeDialog" title="ModelScope 引入" width="620px">
+      <el-form label-width="90px">
+        <el-form-item label="模型 ID">
+          <div style="display:flex;gap:8px;width:100%">
+            <el-input v-model="msRepoId" placeholder="如 Qwen/Qwen2.5-7B-Instruct" @keyup.enter="resolveModelScope" />
+            <el-button type="primary" :loading="msResolving" @click="resolveModelScope">查询</el-button>
+          </div>
+          <div style="font-size:12px;color:#94a3b8;margin-top:4px">
+            输入完整仓库 ID（组织/模型名），暂不支持关键字搜索
+          </div>
+        </el-form-item>
+        <el-form-item v-if="msPreview" label=" ">
+          <div class="ms-preview">
+            <div class="ms-title">{{ msPreview.name }}</div>
+            <div v-if="msPreview.chinese_name" style="color:#64748b;font-size:13px;">{{ msPreview.chinese_name }}</div>
+            <div v-if="msPreview.description" style="font-size:13px;margin-top:8px;">{{ msPreview.description }}</div>
+            <div style="display:flex;gap:18px;margin-top:10px;font-size:12px;color:#475569;flex-wrap:wrap;">
+              <span>📦 {{ msPreview.total_size_human }}</span>
+              <span>⬇️ {{ msPreview.downloads?.toLocaleString?.() || msPreview.downloads }} 次下载</span>
+              <span>📄 {{ msPreview.file_count }} 个文件</span>
+              <span v-if="msPreview.license">⚖️ {{ msPreview.license }}</span>
+            </div>
+            <div v-if="msPreview.tasks?.length" style="margin-top:8px">
+              <el-tag v-for="t in msPreview.tasks" :key="t" size="small" type="info" style="margin-right:6px">{{ t }}</el-tag>
+            </div>
+          </div>
+        </el-form-item>
+        <el-form-item label="硬件组">
+          <el-select v-model="msGroupName" style="width:100%">
+            <el-option
+              v-for="g in groupOptions.filter(x => x.value !== 'ALL')"
+              :key="g.value"
+              :label="g.label"
+              :value="g.value"
+            />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="showModelScopeDialog = false">取消</el-button>
+        <el-button
+          type="primary"
+          :disabled="!msPreview"
+          :loading="msImporting"
+          @click="importModelScope"
+        >确认引入</el-button>
       </template>
     </el-dialog>
   </div>
@@ -1132,11 +1185,59 @@ const refreshCurrentModel = async () => {
   } catch (e) { console.error(e) }
 }
 
+// ---------- ModelScope 引入 ----------
+const showModelScopeDialog = ref(false)
+const msRepoId = ref('')
+const msPreview = ref(null)
+const msResolving = ref(false)
+const msImporting = ref(false)
+const msGroupName = ref('NVIDIA_jetson_AGX_Thor')
+
+const resolveModelScope = async () => {
+  if (!msRepoId.value.trim()) return ElMessage.warning('请输入模型 ID')
+  msResolving.value = true
+  msPreview.value = null
+  try {
+    const res = await api.post('/models/modelscope/resolve', { repo_id: msRepoId.value.trim() })
+    msPreview.value = res.data
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || '查询失败，请检查模型 ID')
+  } finally {
+    msResolving.value = false
+  }
+}
+
+const importModelScope = async () => {
+  if (!msPreview.value) return
+  msImporting.value = true
+  try {
+    const res = await api.post('/models/modelscope/import', {
+      repo_id: msPreview.value.repo_id,
+      group_name: msGroupName.value,
+    })
+    ElMessage.success(res.data.message || '引入成功')
+    showModelScopeDialog.value = false
+    msPreview.value = null
+    msRepoId.value = ''
+    loadModels()
+  } catch (err) {
+    ElMessage.error(err.response?.data?.detail || '引入失败')
+  } finally {
+    msImporting.value = false
+  }
+}
+
 onMounted(() => { loadModels(); loadDevices(); loadCustomHardwareGroups() })
 </script>
 
 <style scoped>
 .model-mgmt-page { padding: 0; }
+
+.ms-preview {
+  background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 8px;
+  padding: 14px 16px; width: 100%;
+}
+.ms-title { font-size: 16px; font-weight: 600; color: #1e293b; margin-bottom: 4px; }
 
 .top-toolbar {
   background: #ffffff; padding: 14px 18px; border-radius: 8px; border: 1px solid #e2e8f0;

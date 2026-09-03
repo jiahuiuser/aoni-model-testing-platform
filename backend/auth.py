@@ -59,13 +59,10 @@ def get_current_user(
     if user is None:
         raise credentials_exception
 
-    # 单账号单设备强退比对
-    if user.active_token and user.active_token != token:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="SINGLE_DEVICE_KICKED: 您的账号已在另一台设备登录，已被强制下线",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    # 多端在线: 同一账号可同时在多个设备登录，互不挤掉
+    # (active_token 仅记录最近一次登录令牌，不再做强退比对)
+    if user.is_active is False:
+        raise credentials_exception
 
     return user
 

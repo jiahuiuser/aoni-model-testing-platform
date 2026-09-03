@@ -20,6 +20,7 @@ def set_sqlite_pragma(dbapi_connection, connection_record):
     cursor = dbapi_connection.cursor()
     cursor.execute("PRAGMA journal_mode=WAL")
     cursor.execute("PRAGMA synchronous=NORMAL")
+    cursor.execute("PRAGMA busy_timeout=30000")
     cursor.close()
 
 session_factory = sessionmaker(bind=engine)
@@ -67,9 +68,13 @@ def init_db():
 
 
 def get_db() -> Session:
-    """依赖注入: 获取数据库会话"""
+    """依赖注入: 获取数据库会话 (退出时显式回滚遗留事务, 防止连接持锁不释放)"""
     db = session_factory()
     try:
         yield db
     finally:
+        try:
+            db.rollback()
+        except Exception:
+            pass
         db.close()

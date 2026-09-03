@@ -2,7 +2,7 @@
 大模型测试平台 — 数据库模型 (SQLAlchemy)
 """
 import datetime
-from sqlalchemy import Column, Integer, String, Float, Text, DateTime, JSON, ForeignKey, Enum as SAEnum
+from sqlalchemy import Column, Integer, String, Float, Text, DateTime, JSON, ForeignKey, Enum as SAEnum, BigInteger, Boolean
 from sqlalchemy.orm import DeclarativeBase, relationship
 import enum
 
@@ -143,6 +143,7 @@ class ModelStage(str, enum.Enum):
     DEPLOYING = "deploying"
     VALIDATING = "validating"
     GATEWAY_TESTING = "gateway_testing"
+    FEATURE_TESTING = "feature_testing"
     PERF_TESTING = "perf_testing"
     ACC_TESTING = "acc_testing"
     REPORTING = "reporting"
@@ -215,6 +216,7 @@ class ModelRun(Base):
     task = relationship("Task", back_populates="model_runs")
     device = relationship("Device", back_populates="model_runs")
     gateway_results = relationship("GatewayResult", back_populates="model_run", cascade="all, delete-orphan")
+    feature_results = relationship("FeatureResult", back_populates="model_run", cascade="all, delete-orphan")
     perf_results = relationship("PerfResult", back_populates="model_run", cascade="all, delete-orphan")
     acc_results = relationship("AccResult", back_populates="model_run", cascade="all, delete-orphan")
 
@@ -317,6 +319,28 @@ class GatewayResult(Base):
     model_run = relationship("ModelRun", back_populates="gateway_results")
 
 
+# ---------- 功能/质量专项测试结果 ----------
+
+class FeatureResult(Base):
+    """功能测试结果 (PASS/FAIL/SKIP)，由 backend/services/features/ 各模块产出"""
+    __tablename__ = "feature_results"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    model_run_id = Column(Integer, ForeignKey("model_runs.id", ondelete="CASCADE"))
+
+    category = Column(String(50), default="feature")       # feature / vision
+    feature_key = Column(String(50), nullable=False)       # needle / math / garble / tool_smoke / agent_replay / multimodal
+    test_item = Column(String(255), nullable=False)        # 展示名，如 "大海捞针（长上下文检索）"
+    status = Column(String(20), default="SKIP")            # PASS / FAIL / SKIP
+    latency_ms = Column(Float, nullable=True)
+    message = Column(Text, nullable=True)
+    raw_details = Column(JSON, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+    model_run = relationship("ModelRun", back_populates="feature_results")
+
+
 # ---------- 硬件组管理 ----------
 
 class HardwareGroup(Base):
@@ -366,6 +390,18 @@ class DatasetInfo(Base):
 
 # ---------- Docker 镜像管理 ----------
 
+class ImageCategory(Base):
+    """镜像分类（文件夹式目录，支持层级）"""
+    __tablename__ = "image_categories"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False, comment="分类/文件夹名称")
+    parent_id = Column(Integer, ForeignKey("image_categories.id", ondelete="SET NULL"), nullable=True, comment="父分类 ID（一级目录为 NULL）")
+    description = Column(String(500), nullable=True)
+    sort_order = Column(Integer, default=0, comment="排序权重，越小越靠前")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
 class DockerImage(Base):
     __tablename__ = "docker_images"
 
@@ -376,7 +412,49 @@ class DockerImage(Base):
     hardware_group = Column(String(100), default="NVIDIA_jetson_AGX_Thor", nullable=True)
     status = Column(String(20), default="ready", comment="ready / downloading / failed / deployed")
     description = Column(String(500), nullable=True)
+
+    # ---- 重构新增字段（迁移脚本补充，保留旧数据） ----
+    category_id = Column(Integer, ForeignKey("image_categories.id", ondelete="SET NULL"), nullable=True, comment="所属分类（文件夹）")
+    source = Column(String(30), default="custom", nullable=True, comment="来源: official(沐曦等官方目录) / registry(内网registry) / tar(离线文件) / custom(自定义)")
+    chip_type = Column(String(50), nullable=True, comment="适配芯片类型: metax_c500 / nvidia_thor 等，部署时与设备 chip_type 匹配")
+    arch = Column(String(20), default="amd64", nullable=True, comment="架构: amd64 / arm64 / aarch64")
+    source_ref = Column(String(500), nullable=True, comment="外部来源标识（沐曦镜像 ID / 下载地址）")
+    size_bytes = Column(BigInteger, nullable=True, comment="镜像大小(字节)")
+    pull_command = Column(Text, nullable=True, comment="完整 docker pull 命令（沐曦登录后获取）")
+    install_step = Column(Text, nullable=True, comment="安装/使用说明")
+    pulled = Column(Boolean, default=False, nullable=True, comment="是否已在设备上完成拉取")
+    pulled_at = Column(DateTime, nullable=True, comment="最近一次拉取完成时间")
+    sync_at = Column(DateTime, nullable=True, comment="最近一次从外部目录同步时间")
+    latest = Column(Boolean, default=True, nullable=True, comment="同来源下是否最新版本")
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)
+
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class DeviceImageBinding(Base):
+    """镜像-设备 多对多绑定与部署状态跟踪"""
+    __tablename__ = "device_image_bindings"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_id = Column(Integer, ForeignKey("docker_images.id", ondelete="CASCADE"), nullable=False)
+    device_id = Column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False)
+    status = Column(String(20), default="pending", comment="pending / pulling / ready / failed")
+    message = Column(Text, nullable=True, comment="最近一次部署输出（脱敏后）")
+    pulled_at = Column(DateTime, nullable=True, comment="最近一次拉取成功时间")
+    created_at = Column(DateTime, default=datetime.datetime.utcnow)
+
+
+class ImageDeployLog(Base):
+    """镜像部署历史日志（脱敏后落库，后台可查）"""
+    __tablename__ = "image_deploy_logs"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    image_id = Column(Integer, ForeignKey("docker_images.id", ondelete="CASCADE"), nullable=False)
+    device_id = Column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=True)
+    binding_id = Column(Integer, ForeignKey("device_image_bindings.id", ondelete="SET NULL"), nullable=True)
+    level = Column(String(20), default="INFO", comment="INFO / WARNING / ERROR")
+    message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.datetime.utcnow, index=True)
 
 
 # ---------- 日志 ----------
