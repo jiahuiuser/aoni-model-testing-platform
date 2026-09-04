@@ -246,41 +246,41 @@
     </el-tab-pane>
 
     <el-tab-pane label="沐曦资源中心" name="metax">
-      <!-- 未连接状态 -->
-      <div v-if="!metaxSessionId" class="metax-connect">
-        <el-icon style="font-size: 42px; color: #94a3b8;"><Connection /></el-icon>
-        <p style="color: #475569; margin: 12px 0 4px;">浏览沐曦软星推理镜像需要先登录授权</p>
-        <p style="color: #94a3b8; font-size: 12px; margin: 0 0 16px;">将打开新窗口跳转沐曦官方登录，授权后自动返回，平台不保存您的账号信息</p>
-        <el-button type="primary" @click="connectMetax">
-          <el-icon><Link /></el-icon> 连接沐曦软星
-        </el-button>
-      </div>
+      <!-- 手动 pull 命令接入（沐曦登录回调有域名白名单，无法自动回调） -->
+      <div class="metax-manual">
+        <el-alert type="info" :closable="false" style="margin-bottom: 14px;">
+          <template #title>
+            通过 docker pull 命令接入沐曦软星镜像（共 3 步）
+          </template>
+          <div style="line-height: 1.9; font-size: 12px; color: #64748b;">
+            <b>1.</b> 点击「打开沐曦官网」，登录后进入「软件下载」页面<br />
+            <b>2.</b> �到目标镜像，点击官方页面的复制按钮，得到 <code>docker pull xxx</code> 命令<br />
+            <b>3.</b> 把命令粘贴到下方输入框，点击「解析并注册」，即可下发到设备
+          </div>
+        </el-alert>
 
-      <!-- 已连接: 镜像清单 -->
-      <div v-else>
-        <div class="metax-toolbar">
-          <el-button size="small" @click="loadMetaxCatalog"><el-icon><Refresh /></el-icon> 刷新</el-button>
-          <span class="metax-user" v-if="metaxUsername">已连接: {{ metaxUsername }}</span>
-          <el-button size="small" type="danger" plain @click="disconnectMetax">断开</el-button>
+        <div style="display: flex; gap: 10px; margin-bottom: 14px;">
+          <el-button type="primary" @click="openMetaxSite">
+            <el-icon><Link /></el-icon> 打开沐曦官网
+          </el-button>
+          <div style="flex: 1; position: relative;">
+            <el-input
+              v-model="metaxPullCmd"
+              placeholder="粘贴 docker pull 命令，例如: docker pull xxx.metax-tech.com/xxx/xxx:tag"
+              size="large"
+              @keyup.enter="parseAndRegister"
+            />
+          </div>
+          <el-button type="success" size="large" :loading="metaxParsing" @click="parseAndRegister">
+            解析并注册
+          </el-button>
         </div>
-        <el-alert v-if="metaxError" :title="metaxError" type="error" show-icon style="margin-bottom:10px" />
 
-        <el-table :data="metaxImages" v-loading="metaxLoading" stripe border class="custom-table">
-          <el-table-column prop="name" label="镜像名称" min-width="220">
-            <template #default="{ row }">
-              <b style="color:#c2410c;">{{ row.name }}</b>
-            </template>
-          </el-table-column>
-          <el-table-column prop="version" label="版本" width="130" />
-          <el-table-column prop="arch" label="架构" width="90" />
-          <el-table-column prop="size" label="大小" width="100" />
-          <el-table-column prop="description" label="说明" min-width="220" show-overflow-tooltip />
-          <el-table-column label="操作" width="170" align="center" fixed="right">
-            <template #default="{ row }">
-              <el-button size="small" type="success" @click="openMetaxDeploy(row)">docker pull 下发</el-button>
-            </template>
-          </el-table-column>
-        </el-table>
+        <div v-if="metaxPreview.name" class="metax-preview">
+          <span style="color: #64748b; font-size: 13px;">解析结果：</span>
+          <b style="color: #c2410c;">{{ metaxPreview.name }}</b>
+          <span v-if="metaxPreview.tag" style="color: #475569;"> : {{ metaxPreview.tag }}</span>
+        </div>
       </div>
     </el-tab-pane>
     </el-tabs>
@@ -303,128 +303,52 @@ const activeCategory = ref(null)
 const searchKw = ref('')
 const mainView = ref('platform')
 
-// ---------- 沐曦软星会话与清单 ----------
-const metaxSessionId = ref(localStorage.getItem('metax_session_id') || '')
-const metaxUsername = ref('')
-const metaxImages = ref([])
-const metaxLoading = ref(false)
-const metaxError = ref('')
-const metaxConfig = ref({})
+// ---------- 沐曦软星（手动 pull 命令接入） ----------
+const metaxPullCmd = ref('')
+const metaxParsing = ref(false)
+const metaxPreview = ref({})
 
-const checkMetaxSession = async () => {
-  if (!metaxSessionId.value) return
-  try {
-    const res = await api.get('/images/metax/oauth/status', { params: { session_id: metaxSessionId.value } })
-    if (res.data.logged_in) {
-      metaxUsername.value = res.data.username || ''
-      await loadMetaxCatalog()
-    } else {
-      metaxSessionId.value = ''
-      localStorage.removeItem('metax_session_id')
-    }
-  } catch (err) { /* ignore */ }
+const openMetaxSite = () => {
+  window.open('https://developer.metax-tech.com/softnova/docker', '_blank')
 }
 
-const connectMetax = async () => {
-  try {
-    const res = await api.get('/images/metax/config')
-    metaxConfig.value = res.data
-    const base = res.data.base_url
-    const prefix = res.data.api_prefix || '/client/api'
-    // 新窗口打开软星 authing 登录，回调到平台前端 #/metax-callback
-    const redirectUri = encodeURIComponent(`${window.location.origin}${window.location.pathname}#/metax-callback`)
-    window.open(`${base}${prefix}/user/authing/login?redirect_uri=${redirectUri}`, '_blank', 'width=720,height=640')
-    ElMessage.info('已打开沐曦官方登录窗口，登录完成后会自动返回')
-  } catch (err) {
-    ElMessage.error('获取沐曦配置失败')
-  }
-}
-
-const handleMetaxCallback = async (params) => {
-  const token = params.access_token || params.token
-  if (!token) {
-    ElMessage.error('登录回调缺少 token')
+// 解析 docker pull 命令 → 登记入库 → 打开设备选择
+const parseAndRegister = async () => {
+  const raw = metaxPullCmd.value.trim()
+  const m = raw.match(/docker\s+pull\s+(\S+)(\s*:\s*(\S+))?/i) || raw.match(/^(\S+):\S+$/) || (raw.includes('/') && !raw.includes(' ') ? [raw, raw] : null)
+  let ref = m ? (m[1] + (m[3] ? ':' + m[3] : '')) : ''
+  if (!ref || (!ref.includes('/') && !m)) {
+    ElMessage.warning('请粘贴有效的 docker pull 命令')
     return
   }
+  // 补全 tag（无 tag 时用 latest，便于用户识别）
+  const hasTag = ref.includes('/') && ref.lastIndexOf(':') > ref.lastIndexOf('/')
+  const tag = hasTag ? ref.slice(ref.lastIndexOf(':') + 1) : 'latest'
+  const name = hasTag ? ref.slice(0, ref.lastIndexOf(':')) : ref
+  const shortName = name.split('/').pop() || name
+
+  metaxPreview.value = { name, tag }
+  metaxParsing.value = true
   try {
-    const res = await api.post('/images/metax/oauth/callback', {
-      access_token: token,
-      username: params.username || params.name || '',
-    })
-    metaxSessionId.value = res.data.session_id
-    localStorage.setItem('metax_session_id', metaxSessionId.value)
-    ElMessage.success('沐曦软星连接成功')
-    await checkMetaxSession()
-  } catch (err) {
-    ElMessage.error('建立会话失败')
-  }
-}
-
-const disconnectMetax = () => {
-  metaxSessionId.value = ''
-  metaxUsername.value = ''
-  metaxImages.value = []
-  localStorage.removeItem('metax_session_id')
-  ElMessage.success('已断开沐曦连接')
-}
-
-const loadMetaxCatalog = async () => {
-  if (!metaxSessionId.value) return
-  metaxLoading.value = true
-  metaxError.value = ''
-  try {
-    const res = await api.post('/images/metax/catalog', { session_id: metaxSessionId.value })
-    metaxImages.value = normalizeMetaxList(res.data)
-  } catch (err) {
-    const detail = err.response?.data?.detail || ''
-    metaxError.value = detail || '拉取沐曦镜像清单失败'
-    if (err.response?.status === 401) {
-      metaxSessionId.value = ''
-      localStorage.removeItem('metax_session_id')
-    }
-  } finally {
-    metaxLoading.value = false
-  }
-}
-
-// 把软星返回结构拍平成表格行（兼容 list / items / data 等常见字段）
-const normalizeMetaxList = (data) => {
-  let rows = []
-  if (Array.isArray(data)) rows = data
-  else if (Array.isArray(data?.Data)) rows = data.Data
-  else if (Array.isArray(data?.data)) rows = data.data
-  else if (Array.isArray(data?.items)) rows = data.items
-  else if (Array.isArray(data?.list)) rows = data.list
-  return rows.map((r, i) => ({
-    name: r.name || r.Name || r.display_name || r.title || `镜像-${i + 1}`,
-    version: r.version || r.Version || r.tag || '-',
-    arch: r.arch || r.Arch || '-',
-    size: r.size || r.Size || '',
-    description: r.description || r.Description || r.desc || '',
-    raw: r,
-  }))
-}
-
-// 沐曦镜像下发: 登记入库 → 打开设备选择 → 部署
-const openMetaxDeploy = async (row) => {
-  try {
-    // 先登记入库（归入「沐曦推理镜像」分类）
     const reg = await api.post('/images/metax/register', {
-      name: row.name,
-      image_tag: row.version && row.version !== '-'
-        ? `metax/${row.name}:${row.version}`.replace(/\s+/g, '-')
-        : `metax/${row.name}`.replace(/\s+/g, '-'),
+      name: shortName,
+      image_tag: ref,
       chip_type: 'metax_c500',
-      arch: row.arch && row.arch !== '-' ? row.arch : 'amd64',
-      source_ref: row.name,
-      description: row.description,
-      pull_command: row.raw?.pull_command || row.raw?.docker_pull || '',
+      arch: 'amd64',
+      source_ref: ref,
+      description: '沐曦软星推理镜像（手动导入）',
+      pull_command: `docker pull ${ref}`,
     })
+    ElMessage.success('镜像已注册，请选择设备下发')
+    metaxPullCmd.value = ''
     deployImg.value = reg.data
     selectedDeviceIds.value = []
     showDeployDialog.value = true
+    await loadImages()
   } catch (err) {
-    ElMessage.error(err.response?.data?.detail || '镜像登记失败')
+    ElMessage.error(err.response?.data?.detail || '镜像注册失败')
+  } finally {
+    metaxParsing.value = false
   }
 }
 
@@ -629,15 +553,6 @@ onMounted(() => {
   loadImages()
   loadCategories()
   loadDevices()
-  checkMetaxSession()
-
-  // 处理沐曦登录回调: #/metax-callback?access_token=xxx
-  if (window.location.hash.startsWith('#/metax-callback')) {
-    const qs = new URLSearchParams(window.location.hash.split('?')[1] || '')
-    const params = Object.fromEntries(qs.entries())
-    handleMetaxCallback(params)
-    window.location.hash = '#/images'
-  }
 })
 
 onBeforeUnmount(() => {
@@ -652,12 +567,8 @@ onBeforeUnmount(() => {
 
 .main-tabs { background: transparent; }
 
-.metax-connect {
-  display: flex; flex-direction: column; align-items: center; justify-content: center;
-  padding: 60px 0; background: #fff; border-radius: 8px; border: 1px solid #e5e7eb;
-}
-.metax-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
-.metax-user { color: #16a34a; font-size: 13px; }
+.metax-manual { padding: 18px; background: #fff; border-radius: 8px; border: 1px solid #e5e7eb; }
+.metax-preview { padding: 10px 14px; background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 6px; font-size: 13px; }
 
 
 .category-bar { margin-bottom: 14px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
