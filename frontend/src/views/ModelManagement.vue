@@ -226,6 +226,20 @@
                   </el-button>
                 </div>
               </el-form-item>
+              <el-form-item v-if="detectedModels.length > 0" label="服务端可用模型">
+                <div style="width:100%;">
+                  <div style="font-size:12px;color:#909399;margin-bottom:6px;">点击选择填入"远程模型标识"：</div>
+                  <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                    <el-tag v-for="m in detectedModels" :key="m"
+                      :type="form.model_endpoint_name === m ? 'primary' : 'info'"
+                      effect="plain"
+                      style="cursor:pointer;"
+                      @click="form.model_endpoint_name = m">
+                      {{ m }}
+                    </el-tag>
+                  </div>
+                </div>
+              </el-form-item>
             </template>
 
             <template v-else>
@@ -922,6 +936,7 @@ const loadDevices = async () => {
 }
 
 const testingConnection = ref(false)
+const detectedModels = ref([])
 const form = ref({
   name: '',
   slug: '',
@@ -937,6 +952,7 @@ const form = ref({
 const handleTestConnection = async () => {
   if (!form.value.api_base) return ElMessage.warning('请先填写 API Base URL')
   testingConnection.value = true
+  detectedModels.value = []
   try {
     const res = await api.post('/models/test-connection', {
       api_base: form.value.api_base,
@@ -944,6 +960,9 @@ const handleTestConnection = async () => {
       model_endpoint_name: form.value.model_endpoint_name,
     })
     ElMessage.success(res.data.message || 'API 连通性测试通过！')
+    if (res.data.remote_models && res.data.remote_models.length > 0) {
+      detectedModels.value = res.data.remote_models
+    }
   } catch (e) {
     ElMessage.error(e.response?.data?.detail || '无法连接到指定的 API 服务')
   } finally {

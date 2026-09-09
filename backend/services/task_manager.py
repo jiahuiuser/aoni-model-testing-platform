@@ -148,7 +148,8 @@ def create_task(db: Session, data: TaskCreate, user_id: Optional[int] = None) ->
 
     for m in pass_models:
         dc = device_config_map.get(m.id)
-        docker_cmd = dc.docker_command if dc and dc.docker_command else (m.docker_command or "")
+        # 启动命令以模型管理全局配置为主，全局为空时才回退到设备专属配置
+        docker_cmd = m.docker_command or (dc.docker_command if dc else "") or ""
         is_ext = bool(m.is_external) or bool(m.api_base)
         if is_ext:
             api_target = m.api_base or "外部 API"

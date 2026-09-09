@@ -251,6 +251,7 @@
         </div>
       </div>
       <template #footer>
+        <el-button v-if="testStore.isRunning" type="danger" plain @click="testStore.stopBackendTest">停止验证</el-button>
         <el-button v-if="testStore.isRunning" type="info" @click="testStore.closeModal">后台运行</el-button>
         <el-button v-if="!testStore.isRunning" @click="testStore.closeModal">保留横幅</el-button>
         <el-button type="primary" @click="testStore.resetTest">完成并关闭</el-button>

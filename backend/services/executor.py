@@ -26,6 +26,15 @@ CONTAINER_NAME = "aoni_benchmark_runner"
 _container_launch_lock = threading.Lock()
 
 
+def _wait_if_paused(task_id: int):
+    """暂停等待: 任务被暂停时阻塞在此，直到恢复或被取消。用于阶段间/数据集间检查点。"""
+    from backend.services.task_manager import _cancel_flags, _pause_flags
+    while _pause_flags.get(task_id, False):
+        if _cancel_flags.get(task_id, False):
+            raise InterruptedError("任务已在暂停期间被取消")
+        time.sleep(2)
+
+
 def _format_duration(seconds: float) -> str:
     """格式化秒数为易读时间，如 '45秒' 或 '2分15秒' 或 '1小时10分'"""
     if seconds is None or seconds <= 0:
@@ -802,7 +811,13 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         model_run.stage_status["perf_testing"] = StageStatus.RUNNING.value
         db.commit()
         log_callback("INFO", model_slug, "========== 性能测试 ==========", "perf")
-        _run_perf_stage(db, model_run, config, log_callback, runner)
+        perf_ok = _run_perf_stage(db, model_run, config, log_callback, runner)
+        if not perf_ok:
+            model_run.stage_status["perf_testing"] = StageStatus.FAILED.value
+            model_run.status = ModelStage.FAILED
+            db.commit()
+            log_callback("ERROR", model_slug, "❌ 性能压测异常终止（吞吐全为 0），任务结束", "perf")
+            return
         model_run.stage_status["perf_testing"] = StageStatus.COMPLETED.value
         model_run.progress = 70
         db.commit()
@@ -1162,6 +1177,7 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
     perf_start_time = time.time()
     completed_steps = 0
     valid_perf_count = 0
+    consecutive_zero_count = 0
 
     log_callback("INFO", model_run.model_slug,
                  f"性能测试启动: 共 {total_steps} 项压测组合 | 开始时间: {datetime.now().strftime('%H:%M:%S')}", "perf")
@@ -1200,6 +1216,8 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
                 log_callback("INFO", model_run.model_slug,
                              f"  性能测试 [{completed_steps + 1}/{total_steps}]: c={concurrency}, output={output_len} (已用 {elapsed_str}, 预计剩余 {eta_str})", "perf")
 
+                # 暂停检查: 被暂停时阻塞等待，恢复后继续下一项压测
+                _wait_if_paused(model_run.task_id)
                 if use_fallback or is_external:
                     bench_cmd_preview = f"vllm bench serve --host {api_cfg['chat_url']} --dataset-name random --random-input-len {input_len} --random-output-len {output_len} --num-prompts {num_prompts} --max-concurrency {concurrency} --request-rate inf"
                     log_callback("INFO", model_run.model_slug,
@@ -1252,7 +1270,12 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
                         log_callback("ERROR", model_run.model_slug,
                                      f"    c={concurrency}, output={output_len}: 失败 - {err}", "perf")
                     else:
-                        valid_perf_count += 1
+                        # 只有拿到正数吞吐才算有效结果
+                        if tps_val > 0:
+                            valid_perf_count += 1
+                            consecutive_zero_count = 0
+                        else:
+                            consecutive_zero_count += 1
                         ttft = result.get("mean_ttft_ms", 0) or 0
                         tpot = result.get("mean_tpot_ms", 0) or 0
                         ttft_val = float(ttft) if isinstance(ttft, (int, float)) else 0.0
@@ -1266,6 +1289,13 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
                             duration = raw.get("duration", 0)
                             log_callback("INFO", model_run.model_slug,
                                          f"    完成={completed}/{completed+failed}, 耗时={duration:.1f}s" if isinstance(duration, float) else f"    完成={completed}/{completed+failed}", "perf")
+
+                # ── 熔断: 开头连续 2 项吞吐为 0/空 → 判定压测环境异常，立即终止 ──
+                if consecutive_zero_count >= 2 and completed_steps <= 2:
+                    log_callback("ERROR", model_run.model_slug,
+                                 f"❌ 连续 {consecutive_zero_count} 项压测吞吐为 0（压测环境异常或结果文件无法回传），"
+                                 f"终止性能测试避免无效等待。请检查: 1) 容器内 vllm bench 是否可用 2) 远程设备结果文件回传 (scp) 是否正常 3) 模型服务是否正常响应", "perf")
+                    return False
 
     if valid_perf_count == 0:
         log_callback("ERROR", model_run.model_slug, "❌ 性能压测未能获取到任何有效吞吐数据，阶段判定为失败", "perf")
@@ -1877,13 +1907,6 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             normalized_datasets.append(mapped)
 
     evalscope_bin = _get_evalscope_bin()
-    cmd = [evalscope_bin, "eval", "--model", eval_model_name,
-           "--eval-type", "openai_api", "--api-url", api_url,
-           "--api-key", api_key, "--datasets"] + normalized_datasets + [
-           "--generation-config", gen_config,
-           "--eval-batch-size", "8",
-           "--ignore-errors",
-           "--work-dir", str(work_dir)]
 
     # 从 config/.env 读取代理配置，透传给 evalscope 子进程 (下载 HF 数据集需要)
     eval_env = os.environ.copy()
@@ -1928,40 +1951,85 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
         if _proxy_val.startswith("socks://"):
             eval_env.pop(_proxy_key, None)
 
+    # ========== 每数据集独立采样计划 ==========
+    # evalscope 的 --limit 是"每子集"上限 (evalscope 源码 evaluator.py: "--limit applies per subset")，
+    # 而 longbench_v2(3子集)/ceval(52子集) 等是多子集数据集，直接透传 --limit=N 会变成"每个子集 N 题"：
+    # 子集题数 < N 时等于全量跑，子集多时题量爆炸 (52×N)。修复：每个数据集单独跑一次 evalscope，
+    # 按该数据集实际子集数拆算 per-subset limit，使每数据集总量 ≈ acc_limit；
+    # 并过滤会超出模型上下文的超长子集 (如 longbench_v2 的 long 子集文档可达 2M token)，避免必然 400。
+    sampling_plan = []
+    for d in normalized_datasets:
+        meta = BENCHMARK_REGISTRY.get(d) if valid_registry_keys else None
+        subsets = list(meta.subset_list) if (meta and getattr(meta, 'subset_list', None)) else []
+        if d == "longbench_v2" and subsets:
+            safe = [s for s in subsets if s != "long"]
+            if safe:
+                subsets = safe
+        num_subsets = max(len(subsets), 1)
+        per_subset = 0
+        if limit > 0:
+            per_subset = (int(limit) + num_subsets - 1) // num_subsets
+        sampling_plan.append({
+            "ds": d, "subsets": subsets, "num_subsets": num_subsets, "per_subset": per_subset,
+        })
+
     if limit > 0:
-        cmd.extend(["--limit", str(limit)])
-        limit_desc = f"抽取样本 limit={limit}/数据集"
+        limit_desc = f"抽样模式 limit={limit}/数据集"
     else:
         limit_desc = "全量题库不限上限评测"
+    log_callback("INFO", model_run.model_slug, f"准确率评测计划 ({limit_desc})", "accuracy")
 
-    log_callback("INFO", model_run.model_slug,
-                 f"评测指令: evalscope eval --model {eval_model_name} --datasets {' '.join(normalized_datasets)}" + (f" --limit {limit}" if limit > 0 else "") + " --dataset-hub huggingface", "accuracy")
-    log_callback("INFO", model_run.model_slug, f"API 端点: {api_url}", "accuracy")
-    log_callback("INFO", model_run.model_slug, f"样本测试启动 ({limit_desc})...", "accuracy")
+    def _extract_acc(ds_name, metrics):
+        mapped_ds = dataset_alias_map.get(ds_name.lower(), ds_name.lower())
+        ds_clean = ds_name.lower().replace("_", "").replace("-", "")
+        mapped_clean = mapped_ds.replace("_", "").replace("-", "")
+        for k, v in metrics.items():
+            k_clean = k.lower().replace("_", "").replace("-", "")
+            if (ds_name.lower() in k.lower() or mapped_ds in k.lower() or
+                ds_clean in k_clean or mapped_clean in k_clean) and "accuracy" in k.lower():
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    return None
+        return None
 
-    evalscope_success = False
-    proc = None
-    try:
-        # 后台启动 evalscope，并实时监控其日志输出，保证前端进度条与日志持续刷新
-        log_file = work_dir / "evalscope_stdout.log"
-        with open(log_file, "w") as f:
+    def _run_evalscope_one(ds_item, cur_ds_idx, total_ds, ds_work_dir):
+        """运行单数据集 evalscope (含实时监控线程)，返回 returncode"""
+        mapped = dataset_alias_map.get(ds_item["ds"].lower(), ds_item["ds"].lower())
+        ds_log_file = ds_work_dir / "evalscope_stdout.log"
+        with open(ds_log_file, "w") as f:
             f.write("")
+
+        single_cmd = [evalscope_bin, "eval", "--model", eval_model_name,
+                      "--eval-type", "openai_api", "--api-url", api_url,
+                      "--api-key", api_key, "--datasets", mapped,
+                      "--generation-config", gen_config,
+                      "--eval-batch-size", "8",
+                      "--ignore-errors",
+                      "--work-dir", str(ds_work_dir)]
+        if ds_item["per_subset"] > 0:
+            single_cmd.extend(["--limit", str(ds_item["per_subset"])])
+        if ds_item["subsets"]:
+            single_cmd.extend(["--dataset-args", json.dumps({mapped: {"subset_list": ds_item["subsets"]}})])
+
+        ds_desc = f"每子集≤{ds_item['per_subset']}×{ds_item['num_subsets']}子集" if ds_item["per_subset"] > 0 else "全量"
+        log_callback("INFO", model_run.model_slug,
+                     f"  评测指令: evalscope eval --datasets {mapped} ({ds_desc}) [{cur_ds_idx+1}/{total_ds}]", "accuracy")
+        log_callback("INFO", model_run.model_slug, f"  API 端点: {api_url}", "accuracy")
+
         proc = subprocess.Popen(
-            cmd,
-            stdout=open(log_file, "w"),
+            single_cmd,
+            stdout=open(ds_log_file, "w"),
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             text=True,
             env=eval_env,
         )
 
-        # 实时日志流与进度监控线程：解析 evalscope 控制台输出，及时推送到日志系统
         stop_flag = threading.Event()
-        progress_state = {"pct": None, "ds": None, "done": False}
+        progress_state = {"pct": None}
         logged_detail_keys = set()
 
-        # 线程安全日志函数: 监控线程内绝不使用流水线主线程的 db session (Session 非线程安全,
-        # 跨线程共用会导致事务边界错乱, 曾引发 SQLite 写锁不释放 -> 全平台登录 500)
         def _mt_log(level, slug, msg, module="accuracy"):
             try:
                 from backend.database import session_factory
@@ -1973,48 +2041,41 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
 
         def _poll_realtime_details():
             try:
-                review_files = sorted(work_dir.glob("**/reviews/**/*.jsonl"))
+                review_files = sorted(ds_work_dir.glob("**/reviews/**/*.jsonl"))
                 if not review_files:
                     return
                 pred_map = {}
-                pred_files = sorted(work_dir.glob("**/predictions/**/*.jsonl"))
+                pred_files = sorted(ds_work_dir.glob("**/predictions/**/*.jsonl"))
                 for pf in pred_files:
                     for line in pf.read_text(encoding="utf-8", errors="ignore").splitlines():
                         if not line.strip():
                             continue
                         try:
                             data = json.loads(line)
-                            idx = data.get("index")
+                            idx_ = data.get("index")
                             out = data.get("model_output")
                             ans_text = ""
                             if isinstance(out, dict):
                                 choices = out.get("choices", [])
                                 if choices and isinstance(choices[0], dict):
-                                    msg = choices[0].get("message", {})
-                                    ans_text = msg.get("content", "")
+                                    ans_text = choices[0].get("message", {}).get("content", "")
                             elif isinstance(out, str):
                                 ans_text = out
-                            pred_map[(pf.stem, idx)] = ans_text
+                            pred_map[(pf.stem, idx_)] = ans_text
                         except Exception:
                             pass
-
-                emitted_count = 0
-                max_emit_per_poll = 30
-
+                emitted = 0
                 for rf in review_files:
-                    if emitted_count >= max_emit_per_poll:
+                    if emitted >= 30:
                         break
                     ds_name = rf.stem
-                    lines = rf.read_text(encoding="utf-8", errors="ignore").splitlines()
-                    for line in lines:
-                        if emitted_count >= max_emit_per_poll:
+                    for line in rf.read_text(encoding="utf-8", errors="ignore").splitlines():
+                        if emitted >= 30 or not line.strip():
                             break
-                        if not line.strip():
-                            continue
                         try:
                             data = json.loads(line)
-                            idx = data.get("index")
-                            key = (ds_name, idx)
+                            idx_ = data.get("index")
+                            key = (ds_name, idx_)
                             if key in logged_detail_keys:
                                 continue
                             ans_text = pred_map.get(key)
@@ -2023,29 +2084,23 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                             logged_detail_keys.add(key)
                             target = data.get("target", "")
                             msgs = data.get("messages", [])
-                            q_text = ""
-                            if msgs and isinstance(msgs[-1], dict):
-                                q_text = msgs[-1].get("content", "").replace("\n", " ").strip()
+                            q_text = msgs[-1].get("content", "").replace("\n", " ").strip() if msgs and isinstance(msgs[-1], dict) else ""
                             if len(q_text) > 120:
                                 q_text = q_text[:120] + "..."
                             sample_score = data.get("sample_score") or {}
                             score_info = sample_score.get("score") or {}
                             extracted_pred = score_info.get("extracted_prediction") or ""
-                            val_info = score_info.get("value") or {}
-                            acc_val = val_info.get("acc")
+                            acc_val = (score_info.get("value") or {}).get("acc")
                             if acc_val is not None:
-                                is_correct = (float(acc_val) == 1.0)
-                                status_str = "PASS (对)" if is_correct else "FAIL (错)"
+                                status_str = "PASS (对)" if float(acc_val) == 1.0 else "FAIL (错)"
                             else:
                                 status_str = "PASS (对)" if (extracted_pred and extracted_pred == target) else "FAIL (错)"
-
                             ans_brief = ans_text.replace("\n", " ").strip()
                             if len(ans_brief) > 100:
                                 ans_brief = ans_brief[:100] + "..."
-
                             _mt_log("DEBUG", model_run.model_slug,
-                                         f"  [DEBUG 明细] [{ds_name.upper()} 题 #{idx}] 题目: {q_text} | 标准答案: [{target}] | 模型选项: [{extracted_pred or '未提取'}] | 结果: [{status_str}] | 模型推理: [{ans_brief}]", "accuracy")
-                            emitted_count += 1
+                                    f"  [DEBUG 明细] [{ds_name.upper()} 题 #{idx_}] 题目: {q_text} | 标准答案: [{target}] | 模型选项: [{extracted_pred or '未提取'}] | 结果: [{status_str}] | 模型推理: [{ans_brief}]", "accuracy")
+                            emitted += 1
                         except Exception:
                             pass
             except Exception:
@@ -2059,15 +2114,13 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             err_500_count = [0]
             while not stop_flag.is_set():
                 try:
-                    if log_file.exists():
-                        with open(log_file, "r", encoding="utf-8", errors="ignore") as f:
+                    if ds_log_file.exists():
+                        with open(ds_log_file, "r", encoding="utf-8", errors="ignore") as f:
                             f.seek(last_file_pos)
                             new_lines = f.readlines()
                             last_file_pos = f.tell()
-
                         if new_lines:
                             last_activity_time = time.time()
-
                         for raw_line in new_lines:
                             line = raw_line.strip()
                             if not line:
@@ -2075,59 +2128,41 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                             if any(k in line.lower() for k in ("evaluating", "loading", "downloading", "accuracy", "score", "metric", "pass", "dataset", "completed")):
                                 m = re.search(r"Evaluating\[(\w+)\]:?\s*(\d+)%", line)
                                 if m:
-                                    progress_state["ds"] = m.group(1)
                                     progress_state["pct"] = int(m.group(2))
                                 _mt_log("INFO", model_run.model_slug, f"  [EvalScope] {line[:250]}", "accuracy")
                             if "error code: 500" in line.lower() or "500. retrying" in line.lower():
                                 err_500_count[0] += 1
                                 if err_500_count[0] >= 8:
-                                    _mt_log("WARNING", model_run.model_slug, "  ⚠️ 被测 API 服务端点 (DeepSeek-V4-Flash) 持续返回 HTTP 500 内部服务异常，中断异常重试挂机并保存现有评测记录...", "accuracy")
+                                    _mt_log("WARNING", model_run.model_slug,
+                                            "  ⚠️ 被测 API 服务端持续返回 HTTP 500 内部服务异常，中断异常重试挂机并保存现有评测记录...", "accuracy")
                                     if proc and proc.poll() is None:
                                         proc.kill()
                                     break
-                            elif m:
-                                err_500_count[0] = 0
-
-                    # 实时轮询 predictions/reviews 数据集，将已评测试题输出到 DEBUG 日志
                     _poll_realtime_details()
-
                     pct = progress_state["pct"]
-                    ds = progress_state["ds"]
                     now = time.time()
-
-                    # 抗挂机监控：若 EvalScope 控制台超过 10 分钟未产生任何新日志，主动终止卡死进程以进入隔离重试
-                    if now - last_activity_time > 600:
-                        _mt_log("WARNING", model_run.model_slug, "  ⚠️ EvalScope 控制台超过 10 分钟未产生任何新日志 (可能由于网络下载卡死)，自动终止批处理子进程以启动隔离抗抖动重试引擎...", "accuracy")
+                    # 暂停期间不触发抗挂机检测（SIGSTOP 冻结的进程不会产生日志）
+                    from backend.services.task_manager import _pause_flags as _pf
+                    if now - last_activity_time > 600 and not _pf.get(model_run.task_id, False):
+                        _mt_log("WARNING", model_run.model_slug,
+                                "  ⚠️ EvalScope 控制台超过 10 分钟未产生任何新日志，自动终止子进程以启动重试...", "accuracy")
                         if proc and proc.poll() is None:
                             proc.kill()
                         break
-
-                    # 每 10 秒进行数据库 progress 更新与日志保活心跳
                     if now - last_heartbeat >= 10:
                         last_heartbeat = now
                         elapsed_str = _format_duration(now - acc_start_time)
                         with session_factory() as mdb:
                             mr = mdb.get(ModelRun, model_run.id)
                             if mr is not None:
+                            # 整体准确率进度: 60% 起，30% 给准确率阶段
+                                overall = (cur_ds_idx + (pct or 0) / 100.0) / max(total_ds, 1)
+                                mr.progress = max(mr.progress, 60 + int(30 * overall))
                                 if pct is not None:
-                                    ds_count = max(len(normalized_datasets), 1)
-                                    ds_idx = 0
-                                    if ds:
-                                        for i_d, d_n in enumerate(normalized_datasets):
-                                            if ds.lower() in d_n.lower() or d_n.lower() in ds.lower():
-                                                ds_idx = i_d
-                                                break
-                                    overall_acc_ratio = (ds_idx + (pct / 100.0)) / ds_count
-                                    mr.progress = max(mr.progress, 60 + int(30 * overall_acc_ratio))
-                                    detail_ds = ds.upper() if ds else "ALL"
-                                    mr.progress_detail = f"准确率测试中 | 正在评测 [{ds_idx + 1}/{ds_count}]: {detail_ds} ({pct}%) | 已用: {elapsed_str} | 实时推理中..."
+                                    mr.progress_detail = f"准确率测试中 | [{cur_ds_idx+1}/{total_ds}] {ds_item['ds'].upper()} ({pct}%) | 已用: {elapsed_str} | 实时推理中..."
                                 else:
-                                    mr.progress_detail = f"准确率测试中 | 已用: {elapsed_str} | 真实题库推理评测进行中..."
+                                    mr.progress_detail = f"准确率测试中 | [{cur_ds_idx+1}/{total_ds}] {ds_item['ds'].upper()} | 已用: {elapsed_str} | 真实题库推理评测进行中..."
                                 mdb.commit()
-                        if pct is not None and ds:
-                            _mt_log("INFO", model_run.model_slug, f"  └─ [{ds.upper()}] 准确率评测进行中: {pct}% | 已用: {elapsed_str}", "accuracy")
-                        else:
-                            _mt_log("INFO", model_run.model_slug, f"  └─ 准确率评测后台任务持续运行中 | 已用: {elapsed_str}", "accuracy")
                 except Exception:
                     pass
                 time.sleep(3)
@@ -2135,152 +2170,110 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
         monitor_thread = threading.Thread(target=_monitor_progress, daemon=True)
         monitor_thread.start()
 
-        # 根据数据集数量动态计算批处理超时上限 (每个数据集预留 4 小时，最低 24 小时)
-        batch_timeout = max(86400, len(normalized_datasets) * 14400)
-        returncode = proc.wait(timeout=batch_timeout)
+        batch_timeout = max(86400, 14400)
+        try:
+            returncode = proc.wait(timeout=batch_timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            returncode = -1
         stop_flag.set()
         monitor_thread.join(timeout=2)
 
-        # 将 evalscope 输出落盘
-        with open(log_file, encoding="utf-8", errors="ignore") as f:
+        with open(ds_log_file, encoding="utf-8", errors="ignore") as f:
             out_text = f.read()
+        return returncode, out_text
 
-        # 核心增强 1：无论批处理进程是否正常退出，优先从输出报告目录解析提取已完成评测的数据集成绩
-        metrics = _parse_evalscope_output(out_text, work_dir=work_dir, model_name=eval_model_name)
-        _log_evalscope_details(work_dir, log_callback, model_run.model_slug)
+    # ========== 逐数据集执行评测 ==========
+    total_ds_count = len(sampling_plan)
+    completed_ds_count = 0
+    acc_summary = []
+    recorded_datasets = set()
 
-        total_ds = len(datasets) if datasets else 1
-        completed_ds = 0
-        acc_summary = []
-        recorded_datasets = set()
+    try:
+        for ds_idx, ds_item in enumerate(sampling_plan):
+            ds = ds_item["ds"]
+            # 暂停检查: 被暂停时阻塞等待，恢复后继续下一个数据集
+            _wait_if_paused(model_run.task_id)
+            from backend.services.task_manager import _cancel_flags
+            if _cancel_flags.get(model_run.task_id, False):
+                log_callback("INFO", model_run.model_slug, "准确率测试收到终止指令，评测任务已停止", "accuracy")
+                return
 
-        for ds in datasets:
-            acc = None
-            mapped_ds = dataset_alias_map.get(ds.lower(), ds.lower())
-            ds_clean = ds.lower().replace("_", "").replace("-", "")
-            mapped_clean = mapped_ds.replace("_", "").replace("-", "")
-            for k, v in metrics.items():
-                k_clean = k.lower().replace("_", "").replace("-", "")
-                if (ds.lower() in k.lower() or mapped_ds in k.lower() or ds_clean in k_clean or mapped_clean in k_clean) and "accuracy" in k.lower():
-                    try:
-                        acc = float(v)
-                    except (ValueError, TypeError):
-                        pass
-                    break
-            if acc is not None:
-                completed_ds += 1
+            if "bigcodebench" in ds.lower():
+                log_callback("WARNING", model_run.model_slug,
+                             f"  ⚠️ 数据集 {ds.upper()} 评估需要代码执行沙盒环境支持，当前环境未开启，自动标定并顺畅推进后续数据集", "accuracy")
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="需要代码执行沙盒环境"))
+                db.commit()
                 recorded_datasets.add(ds.lower())
-                elapsed_sec = time.time() - acc_start_time
-                elapsed_str = _format_duration(elapsed_sec)
-                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=acc, limit=limit, error=None))
+                completed_ds_count += 1
+                continue
+
+            ds_work_dir = work_dir / f"ds_{ds}"
+            ds_work_dir.mkdir(parents=True, exist_ok=True)
+
+            acc = None
+            for attempt in range(1, 4):
+                try:
+                    log_callback("INFO", model_run.model_slug,
+                                 f"  正在评测 {ds.upper()} (第 {attempt}/3 次尝试)...", "accuracy")
+                    returncode, out_text = _run_evalscope_one(ds_item, ds_idx, total_ds_count, ds_work_dir)
+                    metrics = _parse_evalscope_output(out_text, work_dir=ds_work_dir, model_name=eval_model_name)
+                    acc = _extract_acc(ds, metrics)
+                    if acc is not None or returncode == 0:
+                        break
+                except Exception as se:
+                    log_callback("WARNING", model_run.model_slug,
+                                 f"  [隔离重试提示] 数据集 {ds.upper()} 第 {attempt} 次测试重试: {se}", "accuracy")
+                time.sleep(5)
+
+            if acc is not None:
+                completed_ds_count += 1
+                recorded_datasets.add(ds.lower())
+                elapsed_str = _format_duration(time.time() - acc_start_time)
                 acc_str = f"{acc:.2%}"
                 acc_summary.append(f"{ds.upper()}: {acc_str}")
-                model_run.progress = 60 + int(30 * (completed_ds / total_ds))
-                model_run.progress_detail = f"准确率测试 ({completed_ds}/{total_ds}) | 已用: {elapsed_str} | 结果: {' | '.join(acc_summary)}"
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=acc, limit=limit, error=None))
                 db.commit()
-                log_callback("INFO", model_run.model_slug, f"  ✅ 准确率 {ds.upper()}: {acc_str} (成绩已自动保存入库)", "accuracy")
-
-        # 检查是否所有数据集都已评测完成
-        remaining_datasets = [ds for ds in datasets if ds.lower() not in recorded_datasets]
-        if not remaining_datasets and returncode == 0:
-            evalscope_success = True
-            return
-
-        # 核心增强 2：对于因网络超时/中断未完成的数据集，启动单数据集隔离防护与重试机制
-        if remaining_datasets:
-            log_callback("WARNING", model_run.model_slug, f"  ⚠️ 发现 {len(remaining_datasets)} 个数据集未在主批次完成 (待评测: {', '.join(remaining_datasets)})，启动单数据集抗抖动隔离评测...", "accuracy")
-
-            for ds in remaining_datasets:
-                from backend.services.task_manager import _cancel_flags
-                if _cancel_flags.get(model_run.task_id, False):
-                    log_callback("INFO", model_run.model_slug, "准确率测试收到终止指令，评测任务已停止", "accuracy")
-                    return
-
-                # 特殊沙盒数据集防护：BigCodeBench 需要代码运行沙盒支持
-                if "bigcodebench" in ds.lower():
-                    log_callback("WARNING", model_run.model_slug, f"  ⚠️ 数据集 {ds.upper()} 评估需要代码执行沙盒环境支持，当前环境未开启，自动标定并顺畅推进后续数据集", "accuracy")
-                    db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="需要代码执行沙盒环境"))
-                    db.commit()
-                    recorded_datasets.add(ds.lower())
-                    continue
-
-                mapped_ds = dataset_alias_map.get(ds.lower(), ds.lower())
-                ds_work_dir = work_dir / f"single_{ds}"
-                ds_work_dir.mkdir(parents=True, exist_ok=True)
-
-                single_cmd = [evalscope_bin, "eval", "--model", eval_model_name,
-                              "--eval-type", "openai_api", "--api-url", api_url,
-                              "--api-key", api_key, "--datasets", mapped_ds,
-                              "--generation-config", gen_config,
-                              "--eval-batch-size", "8",
-                              "--ignore-errors",
-                              "--work-dir", str(ds_work_dir)]
+                model_run.progress = 60 + int(30 * (completed_ds_count / max(total_ds_count, 1)))
+                model_run.progress_detail = f"准确率测试 ({completed_ds_count}/{total_ds_count}) | 已用: {elapsed_str} | 结果: {' | '.join(acc_summary)}"
+                db.commit()
+                log_callback("INFO", model_run.model_slug,
+                             f"  ✅ 准确率 {ds.upper()}: {acc_str} (成绩已自动保存入库)", "accuracy")
+            else:
                 if limit > 0:
-                    single_cmd.extend(["--limit", str(limit)])
+                    log_callback("INFO", model_run.model_slug,
+                                 f"  [容错降级] 启动真实题库 HTTP 评估引擎补全 {ds.upper()}...", "accuracy")
+                    _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, [ds], limit, acc_start_time)
+                else:
+                    db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="在线拉取超时/网络中断"))
+                    db.commit()
+                    log_callback("WARNING", model_run.model_slug,
+                                 f"  ❌ 数据集 {ds.upper()} 在线拉取超时，已自动记录并平滑推进后续测试", "accuracy")
+                recorded_datasets.add(ds.lower())
+                completed_ds_count += 1
 
-                success_single = False
-                for attempt in range(1, 4):
-                    try:
-                        log_callback("INFO", model_run.model_slug, f"  [隔离抗抖动重试] 正在拉取/评估数据集 {ds.upper()} (第 {attempt}/3 次尝试)...", "accuracy")
-                        sproc = subprocess.run(single_cmd, capture_output=True, text=True, env=eval_env, timeout=7200)
-                        s_out = (sproc.stdout or "") + (sproc.stderr or "")
-                        s_metrics = _parse_evalscope_output(s_out, work_dir=ds_work_dir, model_name=eval_model_name)
-                        acc = None
-                        for k, v in s_metrics.items():
-                            if (ds.lower() in k.lower() or mapped_ds in k.lower()) and "accuracy" in k.lower():
-                                try:
-                                    acc = float(v)
-                                except (ValueError, TypeError):
-                                    pass
-                                break
-                        if acc is not None or sproc.returncode == 0:
-                            completed_ds += 1
-                            recorded_datasets.add(ds.lower())
-                            db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=acc, limit=limit, error=None if acc is not None else "解析完成"))
-                            db.commit()
-                            acc_str = f"{acc:.2%}" if acc is not None else "已完成"
-                            log_callback("INFO", model_run.model_slug, f"  ✅ 隔离容错评测完成 {ds.upper()}: {acc_str}", "accuracy")
-                            success_single = True
-                            break
-                    except Exception as se:
-                        log_callback("WARNING", model_run.model_slug, f"  [隔离重试提示] 数据集 {ds.upper()} 第 {attempt} 次测试重试: {se}", "accuracy")
-                    time.sleep(5)
+        _log_evalscope_details(work_dir, log_callback, model_run.model_slug)
 
-                if not success_single:
-                    if limit > 0:
-                        log_callback("INFO", model_run.model_slug, f"  [容错降级] 启动真实题库 HTTP 评估引擎补全 {ds.upper()}...", "accuracy")
-                        _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, [ds], limit, acc_start_time)
-                        recorded_datasets.add(ds.lower())
-                    else:
-                        db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="网络抖动/在线下载失败"))
-                        db.commit()
-                        recorded_datasets.add(ds.lower())
-                        log_callback("WARNING", model_run.model_slug, f"  ❌ 数据集 {ds.upper()} 在线拉取超时，已自动记录并平滑推进后续测试", "accuracy")
-            evalscope_success = True
-            return
     except Exception as e:
-        if "proc" in locals() and proc is not None and proc.poll() is None:
-            proc.kill()
         from backend.services.task_manager import _cancel_flags
         if _cancel_flags.get(model_run.task_id, False):
             log_callback("INFO", model_run.model_slug, "准确率测试收到终止/重启指令，评测任务已停止", "accuracy")
             return
-        log_callback("WARNING", model_run.model_slug, f"EvalScope 主批次遇到网络或长跑中断 ({e})，正在启动未完成数据集的救底处理引擎...", "accuracy")
-
-        # 最外层救底：遍历剩余未记录的数据集，确保不中途被扔掉
-        unprocessed = [ds for ds in datasets if ds.lower() not in recorded_datasets]
-        if unprocessed:
-            for ds in unprocessed:
-                if "bigcodebench" in ds.lower():
-                    db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="需要代码执行沙盒环境"))
-                    db.commit()
-                    continue
-                if limit > 0:
-                    _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, [ds], limit, acc_start_time)
-                else:
-                    db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="长跑批处理网络中断/超时"))
-                    db.commit()
-                    log_callback("WARNING", model_run.model_slug, f"  ❌ 数据集 {ds.upper()} 自动记录中断，推进完成", "accuracy")
+        log_callback("WARNING", model_run.model_slug,
+                     f"EvalScope 评测遇到网络或长跑中断 ({e})，正在启动未完成数据集的救底处理引擎...", "accuracy")
+        unprocessed = [item["ds"] for item in sampling_plan if item["ds"].lower() not in recorded_datasets]
+        for ds in unprocessed:
+            if "bigcodebench" in ds.lower():
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="需要代码执行沙盒环境"))
+                db.commit()
+                continue
+            if limit > 0:
+                _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, [ds], limit, acc_start_time)
+            else:
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="长跑批处理网络中断/超时"))
+                db.commit()
+                log_callback("WARNING", model_run.model_slug,
+                             f"  ❌ 数据集 {ds.upper()} 自动记录中断，推进完成", "accuracy")
 
 
 def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner, datasets: list, limit: int, acc_start_time: float = None):

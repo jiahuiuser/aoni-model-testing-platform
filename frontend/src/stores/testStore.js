@@ -7,6 +7,7 @@ export const useTestStore = defineStore('testStore', () => {
   const modelSlug = ref('')
   const modelName = ref('')
   const deviceName = ref('本机节点')
+  let deviceId = null
 
   const step = ref(1)
   const progress = ref(0)
@@ -15,12 +16,13 @@ export const useTestStore = defineStore('testStore', () => {
 
   let activeEventSource = null
 
-  const startTest = (slug, name, deviceId = null, devName = '本机节点') => {
+  const startTest = (slug, name, devId = null, devName = '本机节点') => {
     stopTest()
 
     modelSlug.value = slug
     modelName.value = name
     deviceName.value = devName
+    deviceId = devId
     isRunning.value = true
     isModalVisible.value = true
     step.value = 1
@@ -84,6 +86,21 @@ export const useTestStore = defineStore('testStore', () => {
     isRunning.value = false
   }
 
+  const stopBackendTest = async () => {
+    try {
+      const params = deviceId ? `?device_id=${deviceId}` : ''
+      await axios.post(`/api/models/stop-test-container${params}`)
+    } catch (e) {
+      console.error('停止容器失败:', e)
+    }
+    stopTest()
+    logs.value.push({
+      time: new Date().toLocaleTimeString(),
+      stage: 'SYSTEM',
+      msg: '用户手动停止了验证，测试容器已清理释放。',
+    })
+  }
+
   const resetTest = () => {
     stopEventSourceOnly()
     isRunning.value = false
@@ -117,6 +134,7 @@ export const useTestStore = defineStore('testStore', () => {
     finalResult,
     startTest,
     stopTest,
+    stopBackendTest,
     resetTest,
     openModal,
     closeModal,

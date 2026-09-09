@@ -484,6 +484,7 @@ const modelStatusType = (s) => ({ deploying: 'warning', validating: 'warning', g
 const modelStatusLabel = (s) => ({ deploying: '容器部署', validating: '服务就绪', gateway_testing: '网关测试', feature_testing: '功能测试', perf_testing: '性能测试', acc_testing: '准确率测试', reporting: '生成报告', done: '完成' })[s] || s
 
 const loadTask = async () => {
+  if (!taskId.value || taskId.value === 'undefined') return
   try {
     task.value = await apiGetTask(taskId.value)
     modelRuns.value = task.value.model_runs || []
@@ -549,12 +550,11 @@ const handleRetrySingleModel = async (mr) => {
   }
 }
 
-const MAX_LOGS_DISPLAY = 2000
-
 const pollLogs = async () => {
+  if (!taskId.value || taskId.value === 'undefined') return
   try {
     const afterId = lastLogId.value > 0 ? lastLogId.value : null
-    const newLogs = await apiGetTaskLogs(taskId.value, null, 500, afterId)
+    const newLogs = await apiGetTaskLogs(taskId.value, null, afterId ? 500 : 50000, afterId)
     if (newLogs && newLogs.length > 0) {
       if (lastLogId.value > 0 && newLogs[0].id < lastLogId.value) {
         logs.value = []
@@ -565,9 +565,6 @@ const pollLogs = async () => {
           logs.value.push(log)
           lastLogId.value = log.id
         }
-      }
-      if (logs.value.length > MAX_LOGS_DISPLAY) {
-        logs.value = logs.value.slice(logs.value.length - MAX_LOGS_DISPLAY)
       }
       scrollToBottom(false)
     }
