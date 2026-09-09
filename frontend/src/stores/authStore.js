@@ -50,7 +50,7 @@ export const useAuthStore = defineStore('auth', () => {
       } catch (e) {
         // 401 拦截器已自动处理 SINGLE_DEVICE_KICKED 强制下线
       }
-    }, 30000) // 每 30 秒轮询一次心跳
+    }, 8 * 60 * 60 * 1000) // 每 8 小时轮询一次心跳
   }
 
   const stopHeartbeat = () => {
@@ -61,12 +61,14 @@ export const useAuthStore = defineStore('auth', () => {
   }
 
   const initActivityListener = () => {
-    const events = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart']
-    events.forEach(event => {
-      window.addEventListener(event, resetInactivityTimer, { passive: true })
-    })
-    resetInactivityTimer()
-    startHeartbeat()
+    // 已屏蔽：20分钟无操作强制下线 + 心跳轮询。
+    // 改为登录态由 token 有效期控制（后端签发 8 小时），过期后任意请求 401 自动跳登录页。
+    // const events = ['mousemove', 'mousedown', 'keydown', 'scroll', 'touchstart']
+    // events.forEach(event => {
+    //   window.addEventListener(event, resetInactivityTimer, { passive: true })
+    // })
+    // resetInactivityTimer()
+    // startHeartbeat()
   }
 
   // 初始化时恢复 token 并启动保活与心跳

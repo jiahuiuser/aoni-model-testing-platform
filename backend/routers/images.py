@@ -61,7 +61,35 @@ def list_docker_images(
     if limit > 0:
         query = query.offset((page - 1) * limit).limit(limit)
     items = query.all()
-    return {"total": total, "items": items}
+
+    # 附带每张镜像的设备下发状态（模型管理选镜像时展示）
+    from sqlalchemy import inspect as sa_inspect
+    from backend.models import DeviceImageBinding, Device as _Dev
+    dep_map: dict = {}
+    if items:
+        bindings = (
+            db.query(DeviceImageBinding, _Dev.name)
+            .join(_Dev, DeviceImageBinding.device_id == _Dev.id)
+            .filter(DeviceImageBinding.image_id.in_([i.id for i in items]))
+            .order_by(DeviceImageBinding.id.asc())
+            .all()
+        )
+        latest: dict = {}
+        for b, dname in bindings:
+            latest[(b.image_id, b.device_id)] = {
+                "device_id": b.device_id,
+                "device_name": dname,
+                "status": b.status,
+                "pulled_at": b.pulled_at.isoformat() if b.pulled_at else None,
+            }
+        for (img_id, _dev_id), entry in latest.items():
+            dep_map.setdefault(img_id, []).append(entry)
+    items_out = []
+    for i in items:
+        d = {c.key: getattr(i, c.key) for c in sa_inspect(i).mapper.column_attrs}
+        d["deployments"] = dep_map.get(i.id, [])
+        items_out.append(d)
+    return {"total": total, "items": items_out}
 
 
 @router.post("")
@@ -206,9 +234,24 @@ def deploy_image_to_devices(img_id: int, data: DeployRequest, db: Session = Depe
 
     dev_names = ", ".join(f"{d.name}({d.host})" for d in devices)
     return {
-        "message": f"镜像 {img.name} 已下发到 {len(devices)} 台设备: {dev_names}",
+        "message": f"镜像 {img.name} 已下发到 {len(binding_ids)} 台设备: {dev_names}",
         "binding_ids": binding_ids,
-        "device_count": len(devices),
+        "device_count": len(binding_ids),
+    }
+
+
+@router.post("/sync-from-devices")
+def sync_images_from_devices(db: Session = Depends(get_db)):
+    """扫描所有设备上实际存在的 Docker 镜像，同步/纠正平台'已下发'状态"""
+    devices = db.query(Device).all()
+    result = image_svc.sync_from_devices(devices)
+    found = result["found"]
+    matched_images = len({tag for tag, _ in found})
+    matched_devs = len({name for _, name in found})
+    return {
+        "message": f"检测完成：{matched_images} 个镜像已在 {matched_devs} 台设备上存在并已标记为已下发。",
+        "found": [{"image_tag": tag, "device_name": name} for tag, name in found],
+        "errors": result["errors"],
     }
 
 
@@ -220,8 +263,11 @@ def get_deploy_status(img_id: int, db: Session = Depends(get_db)):
     if not img:
         raise HTTPException(status_code=404, detail="镜像不存在")
     bindings = db.query(DeviceImageBinding).filter(DeviceImageBinding.image_id == img_id) \
-        .order_by(DeviceImageBinding.id.desc()).all()
-    return bindings
+        .order_by(DeviceImageBinding.id.asc()).all()
+    latest: dict = {}
+    for b in bindings:
+        latest[b.device_id] = b
+    return list(latest.values())
 
 
 @router.get("/{img_id}/deploy-logs")

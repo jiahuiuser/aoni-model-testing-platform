@@ -79,6 +79,7 @@ export const apiDoctorDevice = (id) => api.post(`/devices/${id}/doctor`).then(r 
 
 // 报告
 export const apiListReports = (params) => api.get('/reports', { params }).then(r => r.data)
+export const apiGetReportModelOptions = () => api.get('/reports/model-options').then(r => r.data)
 export const apiGetReportTasks = () => api.get('/reports/tasks').then(r => r.data)
 export const apiGetReport = (id) => api.get(`/reports/${id}`).then(r => r.data)
 export const apiDeleteReport = (id) => api.delete(`/reports/${id}`).then(r => r.data)

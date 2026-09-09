@@ -3,6 +3,7 @@
 """
 import re
 import json
+import threading
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -11,6 +12,9 @@ from datetime import datetime
 
 from backend.database import get_db
 from backend.models import Device, Credential
+
+import logging
+log = logging.getLogger("aoni-backend")
 
 router = APIRouter(prefix="/api", tags=["devices"])
 
@@ -209,6 +213,18 @@ def api_get_device(device_id: int, db: Session = Depends(get_db)):
     return _device_to_dict(d)
 
 
+def _trigger_bg_check(device_id: int):
+    """后台线程立即体检一次设备（新建/编辑后调用，避免状态滞后）"""
+    def _run():
+        try:
+            from backend.database import session_factory
+            with session_factory() as sdb:
+                run_device_check(sdb, device_id)
+        except Exception:
+            pass
+    threading.Thread(target=_run, daemon=True).start()
+
+
 @router.post("/devices")
 def api_create_device(data: DeviceCreate, db: Session = Depends(get_db)):
     fields = data.model_dump()
@@ -222,6 +238,8 @@ def api_create_device(data: DeviceCreate, db: Session = Depends(get_db)):
     # 若填了密码，自动创建/复用凭证并绑定
     _resolve_device_credential(db, d, data)
     db.commit()
+    # 立即触发一次体检，避免新设备默认"在线"误导
+    _trigger_bg_check(d.id)
     # 重新加载关联
     d = db.execute(select(Device).options(joinedload(Device.credential)).where(Device.id == d.id)).unique().scalar()
     return _device_to_dict(d)
@@ -253,6 +271,8 @@ def api_update_device(device_id: int, data: DeviceUpdate, db: Session = Depends(
         if merged.ssh_username and merged.ssh_password:
             _resolve_device_credential(db, d, merged)
     db.commit()
+    # 地址或凭证可能变了，立即重新体检
+    _trigger_bg_check(d.id)
     d = db.execute(select(Device).options(joinedload(Device.credential)).where(Device.id == d.id)).unique().scalar()
     return _device_to_dict(d)
 
@@ -345,9 +365,36 @@ def _parse_free_output(stdout: str) -> dict:
     return result
 
 
+def _parse_mxsmi(out: str) -> dict:
+    """解析 mx-smi --show-memory 输出（沐曦 GPU），返回 {gpu_info, gpu_count}，失败返回 {}"""
+    if not out:
+        return {}
+    names = re.findall(r"GPU#\d+\s+(\S+)", out)
+    if not names:
+        return {}
+    total_kb = used_kb = 0
+    m = re.search(r"vis_vram total\s*:\s*(\d+)\s*KB", out)
+    if m:
+        total_kb = int(m.group(1))
+    m = re.search(r"vis_vram used\s*:\s*(\d+)\s*KB", out)
+    if m:
+        used_kb = int(m.group(1))
+    if total_kb <= 0:
+        return {}
+    info = f"{names[0]}, {total_kb/1024/1024:.0f} GiB"
+    if used_kb:
+        info = f"{names[0]}, {used_kb/1024/1024:.1f}/{total_kb/1024/1024:.0f} GiB"
+    return {"gpu_info": info, "gpu_count": len(names)}
+
+
 @router.post("/devices/{device_id}/check")
 def api_check_device(device_id: int, db: Session = Depends(get_db)):
-    """全面检测设备状态"""
+    """全面检测设备状态（手动触发；后台定时采集也调用本函数）"""
+    return run_device_check(db, device_id)
+
+
+def run_device_check(db: Session, device_id: int) -> dict:
+    """执行单台设备的全面检测并落库，返回 {status, detail}"""
     d = db.execute(
         select(Device).options(joinedload(Device.credential)).where(Device.id == device_id)
     ).unique().scalar()
@@ -376,9 +423,13 @@ def api_check_device(device_id: int, db: Session = Depends(get_db)):
             detail["docker_containers"] = [x for x in res["stdout"].split("\n") if x.strip()]
 
         gpu = _local_run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null")
+        mx = _parse_mxsmi(_local_run("mx-smi --show-memory 2>/dev/null").get("stdout") or "")
         if gpu["ok"] and gpu["stdout"]:
             detail["gpu_info"] = gpu["stdout"]
             detail["gpu_count"] = len([l for l in gpu["stdout"].split("\n") if l.strip()])
+        elif mx:
+            detail["gpu_info"] = mx["gpu_info"]
+            detail["gpu_count"] = mx["gpu_count"]
 
         mem = _local_run("LC_ALL=C free -h")
         if mem["ok"]:
@@ -420,15 +471,21 @@ def api_check_device(device_id: int, db: Session = Depends(get_db)):
     else:
         detail["errors"].append(f"Docker: {docker_check['stderr'][:100]}")
 
-    # 3. GPU
+    # 3. GPU (NVIDIA → MetaX 沐曦 → 设备型号回退)
     gpu = _ssh_cmd("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null")
     if gpu["ok"] and gpu["stdout"]:
         detail["gpu_info"] = gpu["stdout"]
         detail["gpu_count"] = len([l for l in gpu["stdout"].split("\n") if l.strip()])
     else:
-        teg = _ssh_cmd("cat /proc/device-tree/model 2>/dev/null; tegrastats --interval 100 --count 1 2>/dev/null | head -2", 15)
-        if teg["ok"] and teg["stdout"]:
-            detail["gpu_info"] = teg["stdout"]
+        mx = _parse_mxsmi(_ssh_cmd("mx-smi --show-memory 2>/dev/null", 15).get("stdout") or "")
+        if mx:
+            detail["gpu_info"] = mx["gpu_info"]
+            detail["gpu_count"] = mx["gpu_count"]
+        else:
+            # 注. tegrastats 不支持 --count 参数会报错，这里只取设备型号（echo 补换行避免拼接）
+            teg = _ssh_cmd("echo \"$(cat /proc/device-tree/model 2>/dev/null)\"", 15)
+            if teg["ok"] and teg["stdout"]:
+                detail["gpu_info"] = teg["stdout"]
 
     # 4. 内存
     mem = _ssh_cmd("LC_ALL=C free -h", 10)
@@ -647,13 +704,18 @@ def _collect_resource_detail(d: Device, runner) -> dict:
         detail["docker_ok"] = True
         detail["docker_containers"] = [x for x in dock.split("\n") if x.strip()]
 
-    # GPU
+    # GPU (NVIDIA → MetaX 沐曦 → 设备型号回退)
     gpu = run("nvidia-smi --query-gpu=name,memory.total --format=csv,noheader 2>/dev/null")
+    mx = _parse_mxsmi(run("mx-smi --show-memory 2>/dev/null", 15))
     if gpu:
         detail["gpu_info"] = gpu
         detail["gpu_count"] = len([l for l in gpu.split("\n") if l.strip()])
+    elif mx:
+        detail["gpu_info"] = mx["gpu_info"]
+        detail["gpu_count"] = mx["gpu_count"]
     else:
-        teg = run("cat /proc/device-tree/model 2>/dev/null; tegrastats --interval 100 --count 1 2>/dev/null | head -2", 15)
+        # 注. tegrastats 不支持 --count 参数会报错，这里只取设备型号（echo 补换行避免拼接）
+        teg = run("echo \"$(cat /proc/device-tree/model 2>/dev/null)\"", 15)
         if teg:
             detail["gpu_info"] = teg
 
@@ -680,3 +742,51 @@ def _collect_resource_detail(d: Device, runner) -> dict:
         detail["vllm"] = vllm
 
     return detail
+
+
+# ==================== 后台定时采集 ====================
+
+_DEVICE_COLLECT_INTERVAL = 60          # 采集间隔（秒）
+_device_collect_started = False        # 防止重复启动
+_device_collecting = False             # 防止上一轮未完成时重叠执行
+
+
+def _device_collect_loop():
+    """后台线程: 周期性采集全部设备的资源快照并落库"""
+    global _device_collecting
+    import time
+    import traceback
+
+    while True:
+        time.sleep(_DEVICE_COLLECT_INTERVAL)
+        if _device_collecting:
+            continue
+        _device_collecting = True
+        t0 = time.time()
+        try:
+            from backend.database import session_factory
+            with session_factory() as db:
+                device_ids = db.execute(select(Device.id)).scalars().all()
+            for did in device_ids:
+                try:
+                    from backend.database import session_factory as _sf
+                    with _sf() as sdb:
+                        run_device_check(sdb, did)
+                except Exception:
+                    log.warning(f"设备[{did}]定时采集失败: {traceback.format_exc()[-300:]}")
+            log.info(f"设备定时采集完成: {len(device_ids)} 台, 耗时 {time.time()-t0:.1f}s")
+        except Exception:
+            log.error(f"设备定时采集异常: {traceback.format_exc()[-300:]}")
+        finally:
+            _device_collecting = False
+
+
+def start_device_collect_if_needed():
+    """启动后台定时采集线程（幂等）"""
+    global _device_collect_started
+    if _device_collect_started:
+        return
+    _device_collect_started = True
+    t = threading.Thread(target=_device_collect_loop, daemon=True, name="device-collector")
+    t.start()
+    log.info("设备定时采集线程已启动 (每 60 秒一轮)")

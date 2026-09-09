@@ -229,10 +229,41 @@
             </template>
 
             <template v-else>
+              <el-form-item label="关联推理镜像">
+                <el-select v-model="form.image_id" clearable filterable
+                  placeholder="从镜像管理选择推理镜像（自动同步命令）"
+                  style="width: 100%" @change="onImageSelect">
+                  <el-option v-for="img in images" :key="img.id"
+                    :label="`${img.name}  (${img.image_tag})`" :value="img.id">
+                    <div style="display: flex; justify-content: space-between; align-items: center; width: 100%;">
+                      <span>{{ img.name }}</span>
+                      <el-tag v-if="deployCount(img) > 0" size="small" type="success">已下发 {{ deployCount(img) }} 台</el-tag>
+                      <el-tag v-else size="small" type="danger">未下发</el-tag>
+                    </div>
+                  </el-option>
+                </el-select>
+                <div v-if="selectedImageInfo" style="font-size: 12px; color: #94a3b8; margin-top: 4px;">
+                  <template v-if="deployedNames(selectedImageInfo)">
+                    ✅ 已下发设备: {{ deployedNames(selectedImageInfo) }}，可直接跑通验证
+                  </template>
+                  <template v-else>
+                    ⚠ 该镜像尚未下发到任何设备，请先在镜像管理中下发后再跑通验证
+                  </template>
+                </div>
+                <div v-else style="font-size: 12px; color: #94a3b8; margin-top: 4px;">
+                  选中后 Docker 命令中的镜像段将自动替换为该镜像；镜像升级只需在镜像管理更新
+                </div>
+              </el-form-item>
               <el-form-item label="全局默认 Docker 命令">
-                <el-input v-model="form.docker_command" type="textarea" :rows="5"
-                  placeholder="sudo docker run -it --rm --runtime=nvidia --network host -e MODEL_NAME=xxx ..."
-                />
+                <div style="width: 100%;">
+                  <el-input v-model="form.docker_command" type="textarea" :rows="5"
+                    placeholder="sudo docker run -it --rm --runtime=nvidia --network host -e MODEL_NAME=xxx ..."
+                  />
+                  <el-button size="small" text type="primary" style="margin-top: 4px"
+                    @click="form.docker_command = formatDockerCmdStr(form.docker_command)">
+                    ⤵ 格式化（参数分行）
+                  </el-button>
+                </div>
               </el-form-item>
               <el-form-item label="TOS 路径">
                 <el-input v-model="form.tos_path" placeholder="tos://ai-hub/models/..." />
@@ -317,7 +348,13 @@
               推荐参数配置 (优化显存与并行数)
             </el-button>
           </div>
-          <el-input v-model="editingDcCommand" type="textarea" :rows="7" />
+          <div style="width: 100%;">
+            <el-input v-model="editingDcCommand" type="textarea" :rows="7" />
+            <el-button size="small" text type="primary" style="margin-top: 4px"
+              @click="editingDcCommand = formatDockerCmdStr(editingDcCommand)">
+              ⤵ 格式化（参数分行）
+            </el-button>
+          </div>
         </el-form-item>
       </el-form>
       <template #footer>
@@ -477,6 +514,7 @@
             :value="d.id"
           >
             <span>{{ d.name }}</span>
+            <el-tag v-if="isDeviceBound(d.id)" size="small" type="warning" style="margin-left: 8px">已配置</el-tag>
             <el-tag size="small" type="success" style="margin-left: 8px">在线</el-tag>
             <span style="color: #909399; margin-left: 4px">{{ d.host }}</span>
           </el-option>
@@ -797,6 +835,19 @@ const formatCmdPretty = (cmd) => {
   return formatted
 }
 
+const formatDockerCmdStr = (cmd) => {
+  if (!cmd) return ''
+  let s = cmd.replace(/\r\n/g, '\n')
+  // 先合并续行符与已有换行，再统一按参数断行
+  s = s.replace(/\\\n\s*/g, ' ').replace(/\n\s*/g, ' ')
+  s = s.replace(/\s+/g, ' ').trim()
+  s = s
+    .replace(/\s+(--[^-\s])/g, ' \\\n  $1')
+    .replace(/\s+(-e\s)/g, ' \\\n  $1')
+    .replace(/\s+(-v\s)/g, ' \\\n  $1')
+  return s
+}
+
 const copyCmd = (cmd) => {
   if (!cmd) return
   navigator.clipboard.writeText(cmd)
@@ -900,6 +951,61 @@ const handleTestConnection = async () => {
   }
 }
 
+// // ---------- 关联推理镜像（镜像管理绑定） ----------
+const images = ref([])
+const oldImageTag = ref(null)
+
+const loadImages = async () => {
+  try {
+    const res = await api.get('/images')
+    images.value = res.data.items || []
+  } catch (e) {
+    console.error('加载镜像列表失败', e)
+  }
+}
+
+const detectImageToken = (cmd) => {
+  if (!cmd) return null
+  const m = cmd.match(/(ghcr\.io\/\S+|nvcr\.io\/\S+|aoni-docker\S*|aoni\/vllm\/vllm-openai:\S+)/)
+  return m ? m[1] : null
+}
+
+const deployCount = (img) => (img?.deployments || []).length
+const deployedNames = (img) =>
+  (img?.deployments || []).map((d) => d.device_name).join('、')
+const selectedImageInfo = computed(() =>
+  images.value.find((x) => x.id === form.value.image_id) || null
+)
+
+const onImageSelect = (imageId) => {
+  const img = images.value.find((x) => x.id === imageId)
+  if (!img || !img.image_tag) return
+  const cmd = form.value.docker_command || ''
+  if (!cmd) {
+    ElMessage.info('Docker 命令为空，已记录镜像关联；请补充完整启动命令')
+    oldImageTag.value = img.image_tag
+    return
+  }
+  const newTag = img.image_tag
+  const oldTag = oldImageTag.value || detectImageToken(cmd)
+  if (oldTag && cmd.includes(oldTag)) {
+    form.value.docker_command = cmd.replace(oldTag, newTag)
+    ElMessage.success(`命令镜像段已同步: ${newTag}`)
+  } else if (cmd.includes(newTag)) {
+    ElMessage.success('命令已使用该镜像，无需同步')
+  } else {
+    // 命令中无镜像段 → 在入口命令前自动插入关联镜像
+    const m = cmd.match(/\s(vllm\s|python3?\s|llama-server\s)/)
+    if (m && m.index !== undefined) {
+      form.value.docker_command = cmd.slice(0, m.index) + ' ' + newTag + cmd.slice(m.index)
+      ElMessage.success(`命令无镜像，已自动插入: ${newTag}`)
+    } else {
+      ElMessage.warning('未能自动定位命令中的镜像段，请手动检查')
+    }
+  }
+  oldImageTag.value = newTag
+}
+
 const showAddDialog = () => {
   editing.value = null
   currentModel.value = null
@@ -915,7 +1021,9 @@ const showAddDialog = () => {
     api_base: '',
     api_key: 'EMPTY',
     model_endpoint_name: '',
+    image_id: null,
   }
+  oldImageTag.value = null
   dialogVisible.value = true
 }
 
@@ -935,7 +1043,9 @@ const openEditModel = (row) => {
     api_base: target.api_base || '',
     api_key: target.api_key || 'EMPTY',
     model_endpoint_name: target.model_endpoint_name || '',
+    image_id: target.image_id || null,
   }
+  oldImageTag.value = target.image_tag || detectImageToken(target.docker_command)
   dialogVisible.value = true
 }
 
@@ -999,14 +1109,12 @@ const handleDeleteSelected = async () => {
 }
 
 const boundDevices = computed(() => {
-  if (!probeTargetModel.value) return devices.value
-  if (probeTargetModel.value.device_configs && probeTargetModel.value.device_configs.length > 0) {
-    const boundIds = probeTargetModel.value.device_configs.map(dc => dc.device_id)
-    const list = devices.value.filter(d => boundIds.includes(d.id))
-    if (list.length > 0) return list
-  }
-  return devices.value
+  // 允许在任意设备上验证（后端直连失败会自动部署容器跑通验证）；已绑定配置的设备排前面
+  const ids = (probeTargetModel.value?.device_configs || []).map(dc => dc.device_id)
+  return [...devices.value].sort((a, b) => (ids.includes(b.id) ? 1 : 0) - (ids.includes(a.id) ? 1 : 0))
 })
+
+const isDeviceBound = (deviceId) => (probeTargetModel.value?.device_configs || []).some(dc => dc.device_id === deviceId)
 
 const openRunTestDialog = (row) => {
   const target = row || models.value[0]
@@ -1227,7 +1335,7 @@ const importModelScope = async () => {
   }
 }
 
-onMounted(() => { loadModels(); loadDevices(); loadCustomHardwareGroups() })
+onMounted(() => { loadModels(); loadDevices(); loadCustomHardwareGroups(); loadImages() })
 </script>
 
 <style scoped>

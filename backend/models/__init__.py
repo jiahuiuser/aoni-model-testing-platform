@@ -34,8 +34,11 @@ class ModelInfo(Base):
     api_base = Column(String(500), nullable=True, comment="外部 API Base URL，如 http://192.168.1.40:8000/v1")
     api_key = Column(String(255), nullable=True, default="EMPTY", comment="API Key")
     model_endpoint_name = Column(String(255), nullable=True, comment="远程 API 服务模型标识名")
+    image_id = Column(Integer, ForeignKey("docker_images.id", ondelete="SET NULL"), nullable=True, comment="关联的推理镜像（镜像管理）")
+    service_port = Column(Integer, nullable=True, comment="推理服务端口（缺省用平台默认 8400/8300）")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
+    image_ref = relationship("DockerImage", foreign_keys=[image_id])
     device_configs = relationship("ModelDeviceConfig", back_populates="model", cascade="all, delete-orphan")
 
 
@@ -103,7 +106,7 @@ class Device(Base):
     gpu_info = Column(String(255), nullable=True, comment="GPU 型号/显存")
     gpu_count = Column(Integer, nullable=True, comment="GPU 数量")
 
-    status = Column(String(20), default="online")  # online / offline / busy
+    status = Column(String(20), default="unknown")  # online / offline / unknown(未检测)
     description = Column(String(500), nullable=True)
 
     last_checked_at = Column(DateTime, nullable=True)

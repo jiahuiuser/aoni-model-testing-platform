@@ -50,6 +50,7 @@ def api_list_report_tasks(
 def api_list_reports(
     device_id: int = None,
     task_id: int = None,
+    model_slug: str = None,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
@@ -61,6 +62,8 @@ def api_list_reports(
         query = query.where(ModelRun.device_id == device_id)
     if task_id:
         query = query.where(ModelRun.task_id == task_id)
+    if model_slug:
+        query = query.where(ModelRun.model_slug == model_slug)
     query = query.limit(500)
     runs = db.execute(query).scalars().all()
     data = []
@@ -119,6 +122,23 @@ def parse_docker_env_params(cmd_str: str) -> dict:
         params["concurrency_limit"] = m_seqs.group(1)
 
     return params
+
+
+@router.get("/model-options")
+def api_list_report_model_options(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """查看过滤用的已测模型选项（去重，含报告份数）"""
+    from sqlalchemy import func
+    q = select(ModelRun.model_slug, ModelRun.model_name, func.count(ModelRun.id))
+    if current_user.role != "admin":
+        q = q.where(ModelRun.task_id.in_(
+            select(Task.id).where(Task.user_id == current_user.id)
+        ))
+    rows = db.execute(q.group_by(ModelRun.model_slug, ModelRun.model_name)
+                        .order_by(ModelRun.model_name.asc())).all()
+    return [{"slug": slug, "name": name, "report_count": cnt} for slug, name, cnt in rows]
 
 
 @router.get("/compare/throughput")
@@ -346,7 +366,11 @@ def parse_full_docker_cmd(cmd_str: str) -> dict:
                 or ".gguf" in cmd_str or "llamacpp" in cmd_str.lower())
     info["engine"] = "llama_cpp" if is_llama else "vllm"
 
-    m_img = re.search(r"(ghcr\.io/nvidia-ai-iot/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|aoni-docker-cn-guangzhou\.cr\.volces\.com/public/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|aoni/vllm/[a-zA-Z0-9_\-\.]+:[a-zA-Z0-9_\-\.]+)", cmd_str)
+    # MIM 官方镜像固定服务端口 25535（命令无 --port 参数）
+    if "mxcr.metax-tech.com/" in cmd_str:
+        info["port"] = "25535"
+
+    m_img = re.search(r"(mxcr\.metax-tech\.com/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|ghcr\.io/nvidia-ai-iot/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|aoni-docker-cn-guangzhou\.cr\.volces\.com/public/[a-zA-Z0-9_\-\.\/]+:[a-zA-Z0-9_\-\.]+|aoni/vllm/[a-zA-Z0-9_\-\.]+:[a-zA-Z0-9_\-\.]+)", cmd_str)
     if m_img:
         parts = m_img.group(1).rsplit(":", 1)
         info["image_repo"] = parts[0]

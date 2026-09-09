@@ -37,6 +37,13 @@ async def lifespan(app: FastAPI):
         log.info("任务运行线程自愈扫描完成")
     except Exception as e:
         log.error(f"自愈恢复运行任务失败: {e}")
+
+    # 设备资源动态采集：每 60 秒自动巡检全部设备并落库
+    try:
+        from backend.routers.devices import start_device_collect_if_needed
+        start_device_collect_if_needed()
+    except Exception as e:
+        log.error(f"启动设备定时采集失败: {e}")
     yield
 
 

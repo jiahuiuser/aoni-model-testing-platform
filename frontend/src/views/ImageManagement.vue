@@ -45,6 +45,9 @@
         <el-button type="success" plain :disabled="selectedImages.length !== 1" @click="openDeploy(selectedImages[0])">
           <el-icon><Promotion /></el-icon> docker pull 下发
         </el-button>
+        <el-button type="info" plain :loading="syncing" @click="handleSyncFromDevices">
+          <el-icon><Search /></el-icon> 检测设备已下载镜像
+        </el-button>
         <el-button v-if="selectedImages.length > 0" type="danger" plain @click="confirmDeleteSelectedImages">
           <el-icon><Delete /></el-icon> 批量删除 ({{ selectedImages.length }})
         </el-button>
@@ -94,9 +97,18 @@
           <span>{{ row.arch || '-' }}</span>
         </template>
       </el-table-column>
-      <el-table-column prop="status" label="状态" width="100" align="center">
+      <el-table-column prop="status" label="状态" width="170" align="center">
         <template #default="{ row }">
           <el-tag :type="statusTagType(row.status)">{{ statusLabel(row.status) }}</el-tag>
+          <div v-if="row.deployments && row.deployments.length" style="margin-top: 4px; line-height: 1.6;">
+            <el-tag v-for="d in row.deployments" :key="d.device_id" size="small"
+              :type="deployTagType(d.status)" :title="deployTooltip(d)" style="margin: 1px;">
+              {{ d.device_name }} {{ deployStateLabel(d.status) }}
+            </el-tag>
+          </div>
+          <div v-else style="margin-top: 4px;">
+            <el-tag size="small" type="info">未下发</el-tag>
+          </div>
         </template>
       </el-table-column>
       <el-table-column prop="description" label="描述" min-width="180" show-overflow-tooltip />
@@ -366,6 +378,7 @@ const showDeployDialog = ref(false)
 const deployImg = ref(null)
 const selectedDeviceIds = ref([])
 const deploying = ref(false)
+const syncing = ref(false)
 
 const showLogsDialog = ref(false)
 const logsImg = ref(null)
@@ -387,6 +400,12 @@ const chipLabel = (c) => ({
 }[c] || c)
 const statusLabel = (s) => ({ ready: '就绪', downloading: '下载中', failed: '失败', deployed: '已部署' }[s] || s)
 const statusTagType = (s) => (s === 'ready' ? 'success' : s === 'failed' ? 'danger' : 'warning')
+const deployStateLabel = (s) => ({ ready: '✓', pulling: '拉取中', pending: '排队中', failed: '失败' }[s] || s)
+const deployTooltip = (d) => {
+  const t = d.pulled_at ? new Date(d.pulled_at + 'Z').toLocaleString() : ''
+  return `${d.device_name}: ${deployStateLabel(d.status)}${t ? ' · 最近拉取 ' + t : ''}（完整下发历史见"部署日志"）`
+}
+const deployTagType = (s) => ({ ready: 'success', failed: 'danger', pulling: 'warning', pending: 'info' }[s] || 'info')
 const bindingStatusLabel = (s) => ({ pending: '排队中', pulling: '拉取中', ready: '已完成', failed: '失败' }[s] || s)
 
 const loadImages = async () => {
@@ -398,6 +417,22 @@ const loadImages = async () => {
     images.value = res.data.items || []
   } catch (err) {
     ElMessage.error('加载镜像列表失败')
+  }
+}
+
+const handleSyncFromDevices = async () => {
+  syncing.value = true
+  try {
+    const res = await api.post('/images/sync-from-devices')
+    ElMessage.success(res.data.message)
+    if (res.data.errors && Object.keys(res.data.errors).length) {
+      console.warn('设备镜像检测异常:', res.data.errors)
+    }
+    await loadImages()
+  } catch (err) {
+    ElMessage.error('设备镜像检测失败: ' + (err.response?.data?.detail || err.message))
+  } finally {
+    syncing.value = false
   }
 }
 
@@ -517,6 +552,8 @@ const openLogs = (row) => {
 const refreshLogs = async () => {
   if (!logsImg.value) return
   try {
+    // 同时刷新列表，让"状态/下发设备"标签实时更新
+    loadImages()
     const [bRes, lRes] = await Promise.all([
       api.get(`/images/${logsImg.value.id}/deploy-status`),
       api.get(`/images/${logsImg.value.id}/deploy-logs`, { params: { limit: 200 } }),

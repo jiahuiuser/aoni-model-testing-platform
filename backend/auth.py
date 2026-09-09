@@ -15,7 +15,7 @@ from backend.models.user import User
 # JWT 配置
 SECRET_KEY = "aoni-platform-secret-key-2026-jetson-thor-llm"
 ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 天
+ACCESS_TOKEN_EXPIRE_MINUTES = 8 * 60  # 登录后 8 小时有效
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/auth/login")

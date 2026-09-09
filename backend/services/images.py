@@ -15,6 +15,7 @@ from backend.models import DockerImage, Device, DeviceImageBinding, ImageDeployL
 # 并发部署线程池上限（每设备一个线程，控制总量）
 _DEPLOY_SEMAPHORE = threading.Semaphore(8)
 
+
 # ---------- 日志脱敏 ----------
 
 # 匹配常见凭据形态: key=value / key: value / Bearer xxx / docker login -p 密码
@@ -96,6 +97,26 @@ def _deploy_one(image_id: int, device_id: int, binding_id: int):
             from backend.services.executor import RemoteRunner
             runner = RemoteRunner(device=device)
 
+            # ── 镜像已存在检测: 已在目标机器上时跳过拉取（避免 registry 凭证过期等无关失败） ──
+            try:
+                chk = runner.run_shell(
+                    f"docker image inspect {image.image_tag} --format '{{{{.Id}}}}' 2>/dev/null",
+                    timeout=15,
+                )
+                if (chk.stdout or "").strip():
+                    msg = f"镜像已存在于 [{device.name}({device.host})]，跳过拉取"
+                    _update_binding(db, binding_id, "ready", msg, set_pulled=True)
+                    _deploy_log(db, image_id, device_id, binding_id, "INFO", msg)
+                    img = db.query(DockerImage).filter(DockerImage.id == image_id).first()
+                    if img:
+                        img.pulled = True
+                        img.pulled_at = datetime.utcnow()
+                        img.status = "deployed"
+                        db.commit()
+                    return
+            except Exception:
+                pass
+
             pull_cmd = _build_pull_command(image)
             _update_binding(db, binding_id, "pulling", f"开始拉取: {pull_cmd}")
             _deploy_log(db, image_id, device_id, binding_id, "INFO", f"[{device.name}({device.host})] 执行: {pull_cmd}")
@@ -120,8 +141,16 @@ def _deploy_one(image_id: int, device_id: int, binding_id: int):
                     img.status = "deployed"
                     db.commit()
             else:
-                _update_binding(db, binding_id, "failed", output)
-                _deploy_log(db, image_id, device_id, binding_id, "ERROR", f"[{device.name}({device.host})] 拉取失败: {output}")
+                # 认证类失败给出可操作提示
+                hint = ""
+                low = output.lower()
+                if "unauthorized" in low or "authentication required" in low or "token" in low and "expired" in low:
+                    hint = (f"\n\n提示: 目标机器访问 registry 需要登录且凭证已失效，"
+                            f"请先在 [{device.name}({device.host})] 上执行 docker login 后重试。")
+                elif "unknown manifest" in low or "not found" in low or "pull access denied" in low:
+                    hint = "\n\n提示: 镜像不存在或无权限访问，请检查 image tag 是否正确。"
+                _update_binding(db, binding_id, "failed", output + hint)
+                _deploy_log(db, image_id, device_id, binding_id, "ERROR", f"[{device.name}({device.host})] 拉取失败: {output}{hint}")
         except Exception as e:
             try:
                 _update_binding(db, binding_id, "failed", f"内部错误: {e}")
@@ -133,7 +162,10 @@ def _deploy_one(image_id: int, device_id: int, binding_id: int):
 
 
 def deploy_image_to_devices(image_id: int, device_ids: list[int]) -> list[int]:
-    """批量部署: 为每个设备创建绑定并起后台线程执行 docker pull, 返回 binding_id 列表"""
+    """批量部署: 每台设备复用唯一绑定行(upsert), 起后台线程执行 docker pull, 返回 binding_id 列表
+
+    绑定行代表该设备上的"当前状态", 重复下发覆盖同一行而不是新增行;
+    完整下发历史由 ImageDeployLog 追加记录。"""
     db = session_factory()
     binding_ids = []
     threads = []
@@ -142,10 +174,24 @@ def deploy_image_to_devices(image_id: int, device_ids: list[int]) -> list[int]:
         if not image:
             return []
         for did in device_ids:
-            b = DeviceImageBinding(image_id=image_id, device_id=did, status="pending")
-            db.add(b)
-            db.commit()
-            db.refresh(b)
+            b = db.query(DeviceImageBinding).filter(
+                DeviceImageBinding.image_id == image_id,
+                DeviceImageBinding.device_id == did,
+            ).first()
+            if b and b.status in ("pending", "pulling"):
+                _deploy_log(db, image_id, did, b.id, "INFO", "该设备已有部署任务进行中，本次下发已跳过")
+                continue
+            if b:
+                b.status = "pending"
+                b.message = None
+                b.pulled_at = None
+                db.commit()
+                db.refresh(b)
+            else:
+                b = DeviceImageBinding(image_id=image_id, device_id=did, status="pending")
+                db.add(b)
+                db.commit()
+                db.refresh(b)
             binding_ids.append(b.id)
             _deploy_log(db, image_id, did, b.id, "INFO", f"已创建部署任务 (设备ID={did})")
     finally:
@@ -156,6 +202,68 @@ def deploy_image_to_devices(image_id: int, device_ids: list[int]) -> list[int]:
         t.start()
         threads.append(t)
     return binding_ids
+
+
+def sync_from_devices(devices: list) -> dict:
+    """扫描各设备上实际存在的 docker 镜像，将对应用镜像标记为'已在该设备下发'。
+
+    用于纠正平台下发状态与实际设备镜像不一致的问题（例如镜像早已手动 pull 到设备，
+    但从未走平台下发流程，导致平台显示'未下发'）。
+    """
+    from backend.services.executor import RemoteRunner
+    found = []      # (image_tag, device_name)
+    errors = {}
+
+
+    for dev in devices:
+        runner = RemoteRunner(dev)
+        tags = set()
+        try:
+            res = runner.run(["docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], timeout=30)
+            if res.returncode != 0 or not res.stdout:
+                # 本机非 root/docker 组时重试 sudo
+                res2 = runner.run(["sudo", "-n", "docker", "images", "--format", "{{.Repository}}:{{.Tag}}"], timeout=30)
+                if res2.returncode == 0 and res2.stdout:
+                    res = res2
+                else:
+                    err = (res.stderr or "").strip() or (res2.stderr or "").strip() or "无法执行 docker images"
+                    errors[dev.name] = err[:120]
+                    continue
+            for line in res.stdout.strip().splitlines():
+                line = line.strip()
+                if line and "<none>" not in line:
+                    tags.add(line)
+        except Exception as e:
+            errors[dev.name] = str(e)[:120]
+            continue
+
+        if not tags:
+            continue
+
+        db = session_factory()
+        try:
+            images = db.query(DockerImage).all()
+            for img in images:
+                if img.image_tag and img.image_tag in tags:
+                    existing = db.query(DeviceImageBinding).filter(
+                        DeviceImageBinding.image_id == img.id,
+                        DeviceImageBinding.device_id == dev.id,
+                    ).first()
+                    if existing:
+                        if existing.status != "ready":
+                            existing.status = "ready"
+                            existing.pulled_at = None
+                    else:
+                        db.add(DeviceImageBinding(
+                            image_id=img.id, device_id=dev.id,
+                            status="ready", pulled_at=None,
+                        ))
+                    found.append((img.image_tag, dev.name))
+            db.commit()
+        finally:
+            db.close()
+
+    return {"found": found, "errors": errors}
 
 
 def list_deploy_logs(image_id: int, device_id: int | None = None, limit: int = 200):

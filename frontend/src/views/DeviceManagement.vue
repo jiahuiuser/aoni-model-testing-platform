@@ -49,7 +49,7 @@
             <div class="dev-name-row">
               <span class="dev-name">{{ dev.name }}</span>
               <span class="status-badge" :class="dev.status">
-                <span class="badge-dot"></span> {{ dev.status === 'online' ? '在线' : '离线' }}
+                <span class="badge-dot"></span> {{ statusText(dev.status) }}
               </span>
             </div>
             <div class="dev-host-row">
@@ -89,7 +89,15 @@
             </div>
           </template>
           <div v-else class="empty-metric-tip">
-            尚未诊断，点击「🩺 节点诊断」获取资源数据
+            <template v-if="dev.last_check_detail?.errors?.length" style="color: #dc2626;">
+              ⚠ {{ dev.last_check_detail.errors[0] }}
+            </template>
+            <template v-else>
+              等待后台采集资源数据...
+            </template>
+          </div>
+          <div v-if="dev.last_checked_at" class="collect-time-tip" style="margin-top: 8px; font-size: 12px; color: #94a3b8;">
+            ⏱ 上次采集: {{ formatLastChecked(dev.last_checked_at) }}
           </div>
         </div>
       </div>
@@ -114,8 +122,8 @@
       <el-table-column prop="host" label="地址 (Host)" width="150" />
       <el-table-column label="状态" width="90">
         <template #default="{ row }">
-          <el-tag :type="row.status === 'online' ? 'success' : 'danger'" size="small">
-            {{ row.status === 'online' ? '在线' : '离线' }}
+          <el-tag :type="row.status === 'online' ? 'success' : (row.status === 'offline' ? 'danger' : 'info')" size="small">
+            {{ statusText(row.status) }}
           </el-tag>
         </template>
       </el-table-column>
@@ -290,7 +298,7 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import axios from 'axios'
 import { apiDoctorDevice } from '../api'
@@ -337,6 +345,23 @@ const memProgressColor = [
   { color: '#F59E0B', percentage: 80 },
   { color: '#EF4444', percentage: 100 },
 ]
+
+const statusText = (s) => {
+  if (s === 'online') return '在线'
+  if (s === 'offline') return '离线'
+  return '未检测'
+}
+
+const formatLastChecked = (iso) => {
+  if (!iso) return '-'
+  const ts = new Date(iso.endsWith('Z') || iso.includes('+') ? iso : iso + 'Z')
+  const diff = Math.floor((Date.now() - ts.getTime()) / 1000)
+  if (diff < 0) return '刚刚'
+  if (diff < 60) return `${diff} 秒前`
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+  return `${Math.floor(diff / 86400)} 天前`
+}
 
 const parseMemPercent = (mem) => {
   if (!mem || !mem.total || !mem.used) return 0
@@ -499,7 +524,13 @@ const deleteCred = async (id) => {
 
 const dockerImages = ref([])
 
-onMounted(() => { loadDevices(); loadCredentials() })
+// 动态采集: 每 30 秒自动刷新设备列表（后端每 60 秒自动巡检落库）
+let deviceRefreshTimer = null
+onMounted(() => {
+  loadDevices(); loadCredentials()
+  deviceRefreshTimer = setInterval(loadDevices, 30000)
+})
+onBeforeUnmount(() => { if (deviceRefreshTimer) clearInterval(deviceRefreshTimer) })
 </script>
 
 <style scoped>
@@ -542,6 +573,7 @@ onMounted(() => { loadDevices(); loadCredentials() })
 .status-badge { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 12px; display: inline-flex; align-items: center; gap: 4px; }
 .status-badge.online { background: #d1fae5; color: #065f46; }
 .status-badge.offline { background: #fee2e2; color: #991b1b; }
+.status-badge.unknown { background: #f1f5f9; color: #64748b; }
 .badge-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
 
 .card-body-metrics { background: #ffffff; border-radius: 6px; padding: 10px; border: 1px solid #f3f4f6; }

@@ -18,7 +18,7 @@ from sqlalchemy.orm import Session, joinedload
 from backend.database import get_db
 from backend.models import ModelInfo, ModelDeviceConfig, Device
 from backend.services.pipeline import get_size_category_map
-from backend.services.executor import RemoteRunner
+from backend.services.executor import RemoteRunner, check_gpu_memory
 
 log = logging.getLogger("aoni-models")
 
@@ -43,6 +43,7 @@ class ModelCreate(BaseModel):
     api_base: str = ""
     api_key: str = "EMPTY"
     model_endpoint_name: str = ""
+    image_id: int | None = None
 
 
 class ModelUpdate(BaseModel):
@@ -55,6 +56,7 @@ class ModelUpdate(BaseModel):
     api_base: str | None = None
     api_key: str | None = None
     model_endpoint_name: str | None = None
+    image_id: int | None = None
 
 
 class TestConnectionRequest(BaseModel):
@@ -217,6 +219,9 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
         "api_base": m.api_base or "",
         "api_key": m.api_key or "EMPTY",
         "model_endpoint_name": m.model_endpoint_name or "",
+        "image_id": m.image_id,
+        "image_tag": m.image_ref.image_tag if getattr(m, "image_ref", None) else None,
+        "image_name": m.image_ref.name if getattr(m, "image_ref", None) else None,
         # 部署参数解析
         "engine": params.get("engine"),
         "docker_image": params.get("image"),
@@ -225,7 +230,8 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
         "gpu_memory_utilization": params.get("gpu_memory_utilization"),
         "quantization": params.get("quantization"),
         "is_multimodal": params.get("is_multimodal"),
-        "docker_port": params.get("port"),
+        "docker_port": params.get("port") or (str(m.service_port) if m.service_port else None),
+        "service_port": m.service_port,
         "model_oss": params.get("model_oss"),
         "engine_uri": params.get("engine_uri"),
         # 本地 config.json 详情
@@ -304,6 +310,8 @@ def api_create_model(data: ModelCreate, db: Session = Depends(get_db)):
         model_endpoint_name=data.model_endpoint_name or data.name,
         status="PASS" if data.is_external else "NEW",
     )
+    # 关联镜像管理: 绑定镜像并同步命令镜像段
+    _apply_model_image(db, m, data.image_id, data.docker_command)
     db.add(m)
     db.commit()
     db.refresh(m)
@@ -395,11 +403,12 @@ def api_probe_chat(data: ProbeChatRequest, db: Session = Depends(get_db)):
     if not m and not data.api_base:
         raise HTTPException(404, f"未找到模型 [{data.model_slug}]")
 
+    _svc_port = (m.service_port if m and m.service_port else 8300)
     api_base = data.api_base or (m.api_base if m else "")
     if not api_base and data.device_id:
         dev = db.execute(select(Device).where(Device.id == data.device_id)).scalar_one_or_none()
         if dev:
-            api_base = f"http://{dev.host}:8300/v1"
+            api_base = f"http://{dev.host}:{_svc_port}/v1"
 
     if not api_base:
         # 容器部署模型兜底：查找模型关联设备、系统在线设备或默认 本地 127.0.0.1
@@ -412,9 +421,9 @@ def api_probe_chat(data: ProbeChatRequest, db: Session = Depends(get_db)):
         if not dev:
             dev = db.execute(select(Device)).scalars().first()
         if dev:
-            api_base = f"http://{dev.host}:8300/v1"
+            api_base = f"http://{dev.host}:{_svc_port}/v1"
         else:
-            api_base = "http://127.0.0.1:8300/v1"
+            api_base = f"http://127.0.0.1:{_svc_port}/v1"
 
     api_base = api_base.strip().rstrip("/")
     if api_base.endswith("/v1"):
@@ -567,6 +576,9 @@ def api_update_model(slug: str, data: ModelUpdate, db: Session = Depends(get_db)
     if data.api_base is not None: m.api_base = data.api_base
     if data.api_key is not None: m.api_key = data.api_key
     if data.model_endpoint_name is not None: m.model_endpoint_name = data.model_endpoint_name
+    # 关联镜像管理: 绑定镜像并同步命令镜像段
+    if data.image_id is not None:
+        _apply_model_image(db, m, data.image_id, data.docker_command)
     db.commit()
     db.refresh(m)
     return _model_to_dict(m)
@@ -917,8 +929,9 @@ def api_stop_test_container(device_id: int | None = Query(None), db: Session = D
     return {"status": "ok", "message": f"已清理设备 [{runner.host_label}] 上的测试容器并释放显存"}
 
 
-def _build_test_command(original_cmd: str, is_remote: bool = False) -> str:
+def _build_test_command(original_cmd: str, is_remote: bool = False, port: int | None = None) -> str:
     import os
+    port = port or TEST_PORT
     # 先展平多行反斜杠命令
     lines = [line.strip().rstrip("\\").strip() for line in original_cmd.split("\n") if line.strip()]
     cmd = " ".join(lines)
@@ -948,14 +961,54 @@ def _build_test_command(original_cmd: str, is_remote: bool = False) -> str:
         no_proxy_flags = "--add-host=tos-cn-guangzhou.volces.com:14.119.66.1 --add-host=ai-hub.tos-cn-guangzhou.volces.com:14.119.66.1 -e NO_PROXY=localhost,127.0.0.1,volces.com,*.volces.com,tos-cn-guangzhou.volces.com,ai-hub.tos-cn-guangzhou.volces.com -e no_proxy=localhost,127.0.0.1,volces.com,*.volces.com,tos-cn-guangzhou.volces.com,ai-hub.tos-cn-guangzhou.volces.com -e TOS_ENDPOINT=https://tos-cn-guangzhou.volces.com"
         cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} {no_proxy_flags}", cmd, count=1)
 
-    cmd = re.sub(r"--port\s+\d+", f"--port {TEST_PORT}", cmd)
+    cmd = re.sub(r"--port\s+\d+", f"--port {port}", cmd)
     cmd = re.sub(r"--gpu-memory-utilization\s+[\d.]+", "--gpu-memory-utilization 0.25", cmd)
     if "nightly-aarch64" in cmd:
-        cmd = re.sub(r'(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:vllm-openai-nightly-aarch64|aoni/vllm/vllm-openai:nightly-aarch64)\s+vllm\s+serve\s+\S+(?=\s|\\|$)', r'\1', cmd)
+        cmd = re.sub(r'(aoni-docker-cn-guangzhou\.cr\.volces\.com/public/llm:vllm-openai-nightly-aarch64|aoni/vllm/vllm-openai:nightly-aarch64)\s+vllm\s+serve\s+(?!/)(?:\.?/[^\s]+)(?=\s|\\|$)', r'\1', cmd)
     if "vllm" in cmd:
-        # 清理 vllm serve 后面的多余位置参数 (如 /models/qwen/Qwen3-4B 或 Qwen/Qwen3-4B)，防止与 vllm_monkey 自动注入的 --model 参数发生冲突冲突
-        cmd = re.sub(r'vllm\s+serve\s+([^-]\S*)', 'vllm serve', cmd)
+        # 仅清理 vllm serve 后面的"本地路径"位置参数 (如 /models/qwen/... 或 ./llama.gguf)，
+        # 防止与 vllm_monkey 自动注入的 --model 参数冲突；保留远程模型 ID (如 openbmb/MiniCPM5-2B)
+        cmd = re.sub(r'vllm\s+serve\s+(?:\.?/[^\s]*)', 'vllm serve', cmd)
     return cmd
+
+
+def _sync_command_image(cmd: str, new_tag: str, old_tag: str | None = None) -> str:
+    """把 docker 命令里的镜像段替换为关联镜像的 tag。返回原命令（无法定位时不动）。"""
+    if not cmd or not new_tag:
+        return cmd
+    if old_tag and old_tag in cmd:
+        return cmd.replace(old_tag, new_tag, 1)
+    if new_tag in cmd:
+        return cmd
+    # 已知镜像特征定位 (ghcr.io / nvcr.io / aoni 内网 / aoni vllm)
+    replaced = re.sub(
+        r"(ghcr\.io/\S+|nvcr\.io/\S+|aoni-docker\S*|aoni/vllm/vllm-openai:\S+)",
+        new_tag, cmd, count=1)
+    if replaced != cmd:
+        return replaced
+    # 命令中没有可识别的镜像段 → 在入口命令前自动插入关联镜像
+    m = re.search(r"\s(?:vllm\s|python3?\s|llama-server\s)", cmd)
+    if m:
+        return cmd[:m.start()] + " " + new_tag + cmd[m.start():]
+    return cmd
+
+
+def _apply_model_image(db: Session, m: ModelInfo, data_image_id, docker_command: str | None) -> None:
+    """按 image_id 关联镜像并同步 docker 命令镜像段（直接修改 m 与命令）。"""
+    from backend.models import DockerImage
+    if data_image_id is None:
+        return
+    img = db.get(DockerImage, data_image_id)
+    if not img:
+        return
+    old_tag = None
+    if m.image_id and m.image_id != data_image_id:
+        old = db.get(DockerImage, m.image_id)
+        if old:
+            old_tag = old.image_tag
+    m.image_id = data_image_id
+    cmd = docker_command if docker_command is not None else (m.docker_command or "")
+    m.docker_command = _sync_command_image(cmd, img.image_tag, old_tag)
 
 
 @router.post("/{slug}/test")
@@ -997,7 +1050,9 @@ def api_test_model(slug: str, device_id: int | None = Query(None), db: Session =
     runner = RemoteRunner(device)
     host_label = runner.host_label
     api_host = runner.api_host
-    test_cmd = _build_test_command(docker_cmd, runner.is_remote)
+    # 模型自定义服务端口（如 MIM 容器固定 25535），缺省用平台测试端口
+    test_port = m.service_port or TEST_PORT
+    test_cmd = _build_test_command(docker_cmd, runner.is_remote, port=test_port)
 
     # 使用 try...finally 结构保证无论成功/失败/异常，均执行容器停止与清理
     try:
@@ -1022,7 +1077,7 @@ def api_test_model(slug: str, device_id: int | None = Query(None), db: Session =
 
         # 3. 等待 vLLM 服务响应
         import requests
-        url = f"http://{api_host}:{TEST_PORT}/v1/models"
+        url = f"http://{api_host}:{test_port}/v1/models"
         deadline = time.time() + MAX_VLLM_WAIT
         vllm_ready = False
         attempt = 0
@@ -1077,7 +1132,7 @@ def api_test_model(slug: str, device_id: int | None = Query(None), db: Session =
         model_name = model_name_match.group(1).strip() if model_name_match else m.name
 
         # 5. 执行探针对话请求，测试跑通验证
-        chat_url = f"http://{api_host}:{TEST_PORT}/v1/chat/completions"
+        chat_url = f"http://{api_host}:{test_port}/v1/chat/completions"
         payload = {
             "model": model_name,
             "messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}],
@@ -1164,6 +1219,8 @@ def api_test_model_stream(slug: str, device_id: int | None = Query(None), db: Se
     host_label = runner.host_label
     api_host = runner.api_host
     test_cmd = _build_test_command(docker_cmd, runner.is_remote)
+    # 模型自定义服务端口（如 MIM 容器固定 25535），缺省用平台测试端口
+    test_port = m.service_port or TEST_PORT
 
     async def event_generator():
         def send_evt(step: int, progress: int, stage: str, msg: str, extra: dict = None):
@@ -1200,6 +1257,12 @@ def api_test_model_stream(slug: str, device_id: int | None = Query(None), db: Se
             yield send_evt(2, 25, "START", f"在设备 [{host_label}] 执行 Docker 命令启动测试容器...")
             yield send_evt(2, 30, "START", f"➜ 命令: {test_cmd}")
 
+            # 2.1 启动前内存预检: vLLM 需预分配 gpu_memory_utilization × 总内存
+            mem_ok, mem_msg = check_gpu_memory(runner, test_cmd)
+            if not mem_ok:
+                yield send_evt(2, 100, "DONE", mem_msg, {"status": "FAIL", "detail": mem_msg})
+                return
+
             res = await asyncio.to_thread(runner.run_shell, test_cmd, timeout=45)
             if res.returncode != 0:
                 error_msg = f"容器启动失败 [{host_label}]: {res.stderr[:400] if res.stderr else res.stdout[:400]}"
@@ -1212,9 +1275,9 @@ def api_test_model_stream(slug: str, device_id: int | None = Query(None), db: Se
             yield send_evt(2, 40, "START", f"测试容器启动成功！容器 ID: {container_id}")
 
             # 3. 等待推理引擎服务就绪，并实时抓取逐行推送容器内真实输出日志
-            yield send_evt(3, 50, "VLLM", f"正在等待推理服务就绪 ({api_host}:{TEST_PORT})，实时抓取容器日志...")
+            yield send_evt(3, 50, "VLLM", f"正在等待推理服务就绪 ({api_host}:{test_port})，实时抓取容器日志...")
             import requests
-            url = f"http://{api_host}:{TEST_PORT}/v1/models"
+            url = f"http://{api_host}:{test_port}/v1/models"
             deadline = time.time() + MAX_VLLM_WAIT
             vllm_ready = False
             start_ts = time.time()
@@ -1272,7 +1335,31 @@ def api_test_model_stream(slug: str, device_id: int | None = Query(None), db: Se
                     if c_status in ("exited", "dead"):
                         logs_proc = await asyncio.to_thread(runner.run_docker, ["logs", "--tail", "30", CONTAINER_NAME], timeout=5)
                         logs_tail = (logs_proc.stdout + logs_proc.stderr).strip()
-                        err_detail = f"测试容器异常退出 [{host_label}] (容器状态: {c_status})\n{logs_tail[:400]}"
+                        err_detail = f"测试容器异常退出 [{host_label}] (容器状态: {c_status})"
+                        # OOM 特征识别，给出友好提示
+                        _logs_lower = logs_tail.lower()
+                        oom_hit = any(sig in _logs_lower for sig in (
+                            "no available memory", "cuda out of memory", "free memory",
+                            "insufficient memory", "not enough memory", "outofmemoryerror",
+                        ))
+                        # 内核级 OOM-Kill 通常无 vLLM 日志，从容器状态识别 (exit 137)
+                        try:
+                            inspect_proc = await asyncio.to_thread(
+                                runner.run_docker,
+                                ["inspect", "-f", "{{.State.OomKilled}} {{.State.ExitCode}}", CONTAINER_NAME],
+                                timeout=5,
+                            )
+                            _oom_killed, _exit_code = (inspect_proc.stdout or "").strip().split()
+                            if _oom_killed == "true" or _exit_code == "137":
+                                oom_hit = True
+                        except Exception:
+                            pass
+                        if oom_hit:
+                            from backend.services.executor import _get_gpu_free_mib
+                            free_mib = _get_gpu_free_mib(runner)
+                            err_detail += (f"\n⚠ 检测到内存不足 (当前可用 {free_mib/1024:.1f} GiB)。"
+                                           f"目标机上可能存在占用大量内存的服务/容器，请释放后重试。")
+                        err_detail += f"\n{logs_tail[:400]}"
                         _update_test_result(m, target_device_config, "FAIL", err_detail, db)
                         yield send_evt(3, 85, "DONE", err_detail, {
                             "status": "FAIL", "detail": err_detail, "logs_tail": logs_tail,
@@ -1304,7 +1391,7 @@ def api_test_model_stream(slug: str, device_id: int | None = Query(None), db: Se
             model_name_match = re.search(r"-e MODEL_NAME=([^ \n\\]+)", docker_cmd)
             model_name = model_name_match.group(1).strip() if model_name_match else m.name
 
-            chat_url = f"http://{api_host}:{TEST_PORT}/v1/chat/completions"
+            chat_url = f"http://{api_host}:{test_port}/v1/chat/completions"
             payload = {
                 "model": model_name,
                 "messages": [{"role": "user", "content": "你好，请用一句话介绍你自己。"}],
@@ -1396,11 +1483,41 @@ def api_modelscope_import(data: ModelScopeImportRequest, db: Session = Depends(g
         group_name=data.group_name,
         docker_command=modelscope_service.build_docker_command(repo_id),
         tos_path=f"modelscope://{repo_id}",
-        status="NEW",
+        status="DOWNLOADING",
         size_category="Custom",
-        result_detail=f"ModelScope 引入 ({info['total_size_human']}, 下载 {info['downloads']})",
+        result_detail=f"ModelScope 引入，正在自动下载权重到本机 ~/models/{name} ...",
     )
     db.add(model)
     db.commit()
     db.refresh(model)
-    return {"message": f"模型 {name} 已成功引入并注册就绪！", "model": {"id": model.id, "name": model.name, "slug": model.slug}}
+
+    # 后台线程自动下载权重（本地 ~/models/<name>），完成后更新状态
+    import threading
+    model_id = model.id
+    mdl_slug = model.slug
+
+    def _dl():
+        try:
+            target = modelscope_service.download_model(repo_id)
+            db2 = next(get_db())
+            try:
+                m = db2.get(ModelInfo, model_id)
+                if m:
+                    m.status = "NEW"
+                    m.result_detail = f"ModelScope 引入完成，权重已就绪: {target}"
+                    db2.commit()
+            finally:
+                db2.close()
+        except Exception as e:
+            db2 = next(get_db())
+            try:
+                m = db2.get(ModelInfo, model_id)
+                if m:
+                    m.status = "FAIL"
+                    m.result_detail = f"ModelScope 权重下载失败: {e}"
+                    db2.commit()
+            finally:
+                db2.close()
+
+    threading.Thread(target=_dl, daemon=True).start()
+    return {"message": f"模型 {name} 已成功引入！正在后台自动下载权重到本机（完成后即可验证）。", "model": {"id": model.id, "name": model.name, "slug": model.slug}}

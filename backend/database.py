@@ -47,6 +47,8 @@ def init_db():
             "api_base VARCHAR(500)",
             "api_key VARCHAR(255) DEFAULT 'EMPTY'",
             "model_endpoint_name VARCHAR(255)",
+            "image_id INTEGER",
+            "service_port INTEGER",
         ]:
             try:
                 from sqlalchemy import text

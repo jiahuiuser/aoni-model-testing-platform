@@ -49,6 +49,10 @@
           <el-option v-for="d in devices" :key="d.id" :label="d.name" :value="d.id" />
         </el-select>
 
+        <el-select v-model="filterModelSlug" placeholder="按模型筛选" clearable filterable style="width:200px" @change="loadReports">
+          <el-option v-for="m in modelOptions" :key="m.slug" :label="`${m.name} (${m.report_count}份)`" :value="m.slug" />
+        </el-select>
+
         <el-button circle @click="loadReports"><el-icon><Refresh /></el-icon></el-button>
       </div>
     </div>
@@ -244,6 +248,7 @@ import { useRouter } from 'vue-router'
 import {
   apiListReports,
   apiGetReportTasks,
+  apiGetReportModelOptions,
   apiDeleteReport,
   apiCompareThroughput,
   apiCompareAccuracy,
@@ -275,6 +280,8 @@ const devices = ref([])
 const selectedReports = ref([])
 const filterDeviceId = ref(null)
 const filterTaskId = ref(null)
+const filterModelSlug = ref(null)
+const modelOptions = ref([])
 const loading = ref(false)
 const throughputData = ref([])
 const accuracyData = ref([])
@@ -594,6 +601,7 @@ const loadReports = async () => {
     const params = {}
     if (filterDeviceId.value) params.device_id = filterDeviceId.value
     if (filterTaskId.value) params.task_id = filterTaskId.value
+    if (filterModelSlug.value) params.model_slug = filterModelSlug.value
     reports.value = await apiListReports(params)
   } catch (e) {
     console.error(e)
@@ -614,6 +622,7 @@ watch(accDataset, () => { apiCompareAccuracy(accDataset.value).then(r => accurac
 onMounted(async () => {
   try { devices.value = (await axios.get('/api/devices')).data } catch (e) { /* */ }
   try { reportTasks.value = await apiGetReportTasks() } catch (e) { /* */ }
+  try { modelOptions.value = await apiGetReportModelOptions() } catch (e) { /* */ }
   await loadReports(); await loadCompare()
 })
 </script>

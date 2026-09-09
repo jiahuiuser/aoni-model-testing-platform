@@ -1,8 +1,8 @@
 """
 Pydantic 数据模型 — API 请求/响应
 """
-from pydantic import BaseModel, Field
-from typing import Optional, List
+from pydantic import BaseModel, Field, field_validator
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
 
@@ -28,6 +28,21 @@ class PerfRoundConfig(BaseModel):
     concurrencies_str: str = ""
     num_prompts: int = 300
 
+    @field_validator("input_len", "num_prompts", mode="before")
+    @classmethod
+    def _coerce_int(cls, v):
+        """兼容前端传来的字符串数字（含全角数字/小数），避免 422"""
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, str):
+            v = v.strip().translate(str.maketrans("０１２３４５６７８９．", "0123456789."))
+            if not v:
+                raise ValueError("不能为空")
+            return int(float(v))
+        if isinstance(v, float):
+            return int(v)
+        return v
+
 
 class TaskConfig(BaseModel):
     model_slugs: List[str] = Field(default_factory=list)
@@ -37,12 +52,15 @@ class TaskConfig(BaseModel):
     feature_enabled: bool = False
     feature_items: List[str] = Field(default_factory=list)
     perf_enabled: bool = True
+    benchmark_framework: str = "auto"
     perf_rounds_config: List[PerfRoundConfig] = Field(default_factory=lambda: [
         PerfRoundConfig()
     ])
+    per_model_config: Dict[str, Any] = Field(default_factory=dict)
     acc_enabled: bool = True
     acc_datasets: List[str] = ["mmlu", "ceval", "gsm8k", "arc"]
-    acc_limit: int = 200
+    acc_limit: Optional[int] = 200
+    notify_email: Optional[str] = None
     container_port: int = 8300
     container_startup_timeout: int = 7200
     docker_command: Optional[str] = None

@@ -96,13 +96,32 @@ def _human(size: int) -> str:
 
 
 def build_docker_command(repo_id: str, group_name: str = "NVIDIA_jetson_AGX_Thor") -> str:
-    """生成下载 + 推理部署命令（vLLM 容器, 从 ModelScope 拉权重）"""
+    """生成推理部署命令（vLLM 容器, 使用本机已下载权重 /models/<name>）"""
     name = repo_id.split("/")[-1]
+    # 镜像 ENTRYPOINT 已为 vllm serve，因此镜像后直接跟模型位置参数（本地路径），
+    # 不再依赖镜像内置的 ENGINE_URI 下载机制（该机制在本平台镜像 tag 中未实现）。
     cmd = (
         f"sudo docker run -it --rm --runtime=nvidia --network host "
-        f"-e MODEL_OSS=True -e MODEL_ROOT=/models -e ENGINE_URI=modelscope://{repo_id} "
-        f"-e MODEL_NAME={name} -v ~/models:/models "
-        f"aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64 vllm serve {name} "
+        f"-v ~/models:/models "
+        f"aoni-docker-cn-guangzhou.cr.volces.com/public/llm:vllm-openai-nightly-aarch64 /models/{name} "
         f"--port 8300 --max-model-len 4096 --gpu-memory-utilization 0.8"
     )
     return cmd
+
+
+def download_model(repo_id: str) -> str:
+    """将 ModelScope 模型权重下载到本机 ~/models/<name>（平台挂载目录），返回模型本地目录"""
+    import os
+    from modelscope import snapshot_download
+
+    name = repo_id.split("/")[-1]
+    target = os.path.expanduser(f"~/models/{name}")
+    os.makedirs(target, exist_ok=True)
+
+    # local_dir 直接把文件平铺下载到目标目录（自动断点续传）
+    snapshot_download(
+        repo_id,
+        local_dir=target,
+        allow_patterns=["*.safetensors", "*.bin", "*.json", "*.txt", "*.md", "*.model", "*.pth", "*.gguf", "*.tokenizer", "*tokenizer*", "*.jinja", "*.py"],
+    )
+    return target

@@ -33,34 +33,13 @@
                 <el-input v-model="form.name" placeholder="例如: Qwen系列模型测试" />
               </el-form-item>
 
-              <el-form-item label="测试 Profile">
+              <el-form-item label="测试类型">
                 <el-select v-model="form.profile" style="width: 100%" @change="handleProfileChange">
                   <el-option label="全量测试 (API 协议 + 性能 + 准确率)" value="full" />
-                  <el-option label="仅 API 协议规范校验" value="gateway" />
-                  <el-option label="仅性能测试" value="perf" />
-                  <el-option label="仅准确率测试" value="accuracy" />
-                  <el-option label="快速冒烟测试" value="quick" />
+                  <el-option label="API 协议规范校验" value="gateway" />
+                  <el-option label="性能测试" value="perf" />
+                  <el-option label="准确率测试" value="accuracy" />
                   <el-option label="自定义" value="custom" />
-                </el-select>
-              </el-form-item>
-
-              <el-form-item label="矩阵用例模板">
-                <el-select
-                  v-model="selectedTemplateIds"
-                  multiple
-                  collapse-tags
-                  collapse-tags-tooltip
-                  placeholder="选择测试模板（支持多选）"
-                  clearable
-                  style="width: 100%"
-                  @change="handleTemplateSelect"
-                >
-                  <el-option
-                    v-for="t in templates"
-                    :key="t.id"
-                    :label="`${t.name} (并发: ${(t.concurrencies || []).join('/')})`"
-                    :value="t.id"
-                  />
                 </el-select>
               </el-form-item>
 
@@ -154,7 +133,7 @@
                         <span>#{{ m.idx }} {{ m.name }}</span>
                         <div>
                           <el-tag size="small" type="info">{{ m.size_category }}</el-tag>
-                          <el-tag v-if="isModelDisabled(m)" size="small" type="warning" style="margin-left: 6px">不可混选</el-tag>
+                          <el-tag v-if="isModelDisabled(m)" size="small" type="warning" style="margin-left: 6px">{{ modelDisableReason(m) }}</el-tag>
                         </div>
                       </div>
                     </el-option>
@@ -224,22 +203,13 @@
               <template #header>
                 <div class="card-header-title">
                   <span class="card-icon-tag">3</span>
-                  <span>高级参数与结果通知</span>
+                  <span>结果通知</span>
                 </div>
               </template>
 
               <el-form-item label="通知邮箱">
                 <el-input v-model="form.config.notify_email" placeholder="输入接收通知邮箱" clearable />
               </el-form-item>
-
-              <template v-if="!isExternalModelSelected">
-                <el-form-item label="部署端口">
-                  <el-input v-model.number="form.config.container_port" placeholder="默认 8300" />
-                </el-form-item>
-                <el-form-item label="显存占用">
-                  <el-input v-model="form.config.gpu_memory_utilization" placeholder="默认 0.8" />
-                </el-form-item>
-              </template>
             </el-card>
           </div>
         </el-col>
@@ -331,6 +301,26 @@
                 外部 API 端点模型将使用【自定义 HTTP】异步流式压测（同样输出 ITL/TPOT 指标），无法使用容器内原生 vLLM bench。
               </el-alert>
               <template v-if="form.config.perf_enabled">
+                <el-form-item label="矩阵用例模板">
+                  <el-select
+                    v-model="selectedTemplateIds"
+                    multiple
+                    collapse-tags
+                    collapse-tags-tooltip
+                    placeholder="选择测试模板（支持多选），自动填充下方轮次策略"
+                    clearable
+                    style="width: 100%"
+                    @change="handleTemplateSelect"
+                  >
+                    <el-option
+                      v-for="t in templates"
+                      :key="t.id"
+                      :label="`${t.name} (并发: ${(t.concurrencies || []).join('/')})`"
+                      :value="t.id"
+                    />
+                  </el-select>
+                </el-form-item>
+
                 <el-form-item label="压测框架">
                   <el-radio-group v-model="form.config.benchmark_framework">
                     <el-radio label="auto">自动</el-radio>
@@ -487,7 +477,7 @@
                     </span>
                     <span v-else>
                       <el-tag size="small" type="info" style="margin-right: 4px;">抽样模式</el-tag>
-                      每个已选数据集抽取 <b>{{ form.config.acc_limit || 200 }}</b> 题进行评测。
+                      每个已选数据集抽取 <b>{{ form.config.acc_limit }}</b> 题进行评测。
                     </span>
                   </div>
                 </el-form-item>
@@ -675,18 +665,18 @@ const editId = computed(() => (route.query.edit ? parseInt(route.query.edit) : n
 const profileLabelMap = {
   full: '全量测试',
   gateway: 'API 协议校验',
-  perf: '仅性能测试',
-  accuracy: '仅准确率测试',
+  perf: '性能测试',
+  accuracy: '准确率测试',
   quick: '快速冒烟测试',
   custom: '自定义测试',
 }
 
 function makeDefaultRound() {
   return {
-    input_len: 512,
-    output_lens_str: '128,512',
+    input_len: '',
+    output_lens_str: '',
     concurrencies_str: '',
-    num_prompts: 100,
+    num_prompts: '',
   }
 }
 
@@ -734,7 +724,7 @@ const handleTemplateSelect = (tplIds) => {
 
 const form = reactive({
   name: '',
-  profile: 'full',
+  profile: 'custom',
   device_id: null,
   device_ids: [],
   template_id: null,
@@ -744,21 +734,19 @@ const form = reactive({
   is_full_acc: false,
   config: {
     model_slugs: [],
-    gateway_enabled: true,
-    gateway_protocols: ['openai', 'anthropic', 'responses'],
+    gateway_enabled: false,
+    gateway_protocols: [],
     test_longctx: false,
     feature_enabled: false,
     feature_items: [],
-    perf_enabled: true,
+    perf_enabled: false,
     benchmark_framework: 'auto',
-    perf_rounds_config: [makeDefaultRound()],
+    perf_rounds_config: [],
     per_model_config: {},
-    acc_enabled: true,
-    acc_datasets: ['mmlu', 'ceval', 'gsm8k', 'arc'],
-    acc_limit: 200,
+    acc_enabled: false,
+    acc_datasets: [],
+    acc_limit: null,
     notify_email: '',
-    container_port: 8300,
-    container_startup_timeout: 7200,
   },
 })
 
@@ -766,7 +754,7 @@ const handleFullAccChange = (val) => {
   if (val) {
     form.config.acc_limit = 0
   } else {
-    form.config.acc_limit = 200
+    form.config.acc_limit = null
   }
 }
 
@@ -779,15 +767,7 @@ const availableTaskDevices = computed(() => {
   if (containerModels.length === 0) {
     return onlineDevices.value
   }
-  return onlineDevices.value.filter((d) => {
-    return containerModels.every((m) => {
-      if (!m.device_configs || m.device_configs.length === 0) {
-        return m.status === 'PASS'
-      }
-      const dc = m.device_configs.find((c) => c.device_id === d.id)
-      return dc ? dc.status === 'PASS' : m.status === 'PASS'
-    })
-  })
+  return onlineDevices.value.filter((d) => containerModels.every((m) => isModelPassOnDevice(m, d.id)))
 })
 
 const passModels = computed(() =>
@@ -888,6 +868,12 @@ function removePmRound(index) {
 
 const savePmConfig = () => {
   if (!pmDialogModel.value) return
+  const badRound = pmForm.perf_rounds_config.some((r) =>
+    !Number.isInteger(Number(r.input_len)) || Number(r.input_len) < 1
+    || !r.output_lens_str || !r.concurrencies_str
+    || !Number.isInteger(Number(r.num_prompts)) || Number(r.num_prompts) < 1
+  )
+  if (badRound) return ElMessage.warning('轮次参数不完整，请填写输入/输出 Token、并发梯度与请求总数')
   if (!form.config.per_model_config) form.config.per_model_config = {}
   form.config.per_model_config[pmDialogModel.value.slug] = {
     benchmark_framework: pmForm.benchmark_framework,
@@ -928,18 +914,54 @@ function maskKey(key) {
   return key.slice(0, 4) + '****' + key.slice(-4)
 }
 
-function isModelDisabled(m) {
-  const selectedSlugs = form.config.model_slugs || []
-  if (selectedSlugs.length === 0) return false
-  const mIsExternal = Boolean(m.is_external) || Boolean(m.api_base)
-  if (isExternalModelSelected.value && !mIsExternal) {
-    return true
-  }
-  if (hasDeviceSelected.value && mIsExternal) {
-    return true
-  }
-  return false
+function isModelPassOnDevice(m, deviceId) {
+  // 与后端 create_task 校验规则完全一致: 必须存在该设备的专属配置且状态为 PASS
+  const dc = (m.device_configs || []).find((c) => c.device_id === deviceId)
+  return Boolean(dc) && dc.status === 'PASS'
 }
+
+function modelDisableReason(m) {
+  const selectedSlugs = form.config.model_slugs || []
+  const mIsExternal = Boolean(m.is_external) || Boolean(m.api_base)
+  // 选了目标设备: 容器模型必须在所有已选设备上验证 PASS
+  const deviceIds = form.device_ids || []
+  if (!mIsExternal && deviceIds.length > 0) {
+    if (!deviceIds.every((id) => isModelPassOnDevice(m, id))) {
+      return '未在该设备验证'
+    }
+  }
+  if (selectedSlugs.length > 0) {
+    if (isExternalModelSelected.value && !mIsExternal) {
+      return '不可混选'
+    }
+    if (hasDeviceSelected.value && mIsExternal) {
+      return '不可混选'
+    }
+  }
+  return ''
+}
+
+function isModelDisabled(m) {
+  return modelDisableReason(m) !== ''
+}
+
+// 切换目标设备时，自动移除已选但未在新设备验证 PASS 的模型
+watch(() => form.device_ids, () => {
+  const deviceIds = form.device_ids || []
+  if (deviceIds.length === 0 || !form.config.model_slugs || form.config.model_slugs.length === 0) return
+  const valid = form.config.model_slugs.filter((slug) => {
+    const m = (models.value || []).find((x) => x.slug === slug)
+    if (!m) return true
+    const mIsExternal = Boolean(m.is_external) || Boolean(m.api_base)
+    if (mIsExternal) return true
+    return deviceIds.every((id) => isModelPassOnDevice(m, id))
+  })
+  if (valid.length !== form.config.model_slugs.length) {
+    const removed = form.config.model_slugs.filter((s) => !valid.includes(s))
+    form.config.model_slugs = valid
+    ElMessage.warning(`已自动移除未在所选设备验证 PASS 的模型: ${removed.join('、')}`)
+  }
+})
 
 const isAllExternalSelected = computed(() => {
   return (
@@ -1036,11 +1058,60 @@ const handleProfileChange = (profile) => {
 
 const handleSubmit = async () => {
   if (!form.name) return ElMessage.warning('请输入任务名称')
+  if (form.config.gateway_enabled && (!form.config.gateway_protocols || form.config.gateway_protocols.length === 0)) {
+    return ElMessage.warning('已开启网关校验，请至少勾选一个协议')
+  }
+  if (form.config.perf_enabled && (!form.config.perf_rounds_config || form.config.perf_rounds_config.length === 0)) {
+    return ElMessage.warning('已开启性能压测，请先添加轮次策略')
+  }
+  if (form.config.perf_enabled) {
+    const badRound = (form.config.perf_rounds_config || []).some((r) =>
+      !Number.isInteger(Number(r.input_len)) || Number(r.input_len) < 1
+      || !r.output_lens_str || !r.concurrencies_str
+      || !Number.isInteger(Number(r.num_prompts)) || Number(r.num_prompts) < 1
+    )
+    if (badRound) return ElMessage.warning('压测轮次参数不完整（输入 Token / 输出 Token / 并发梯度 / 请求总数需为正整数）')
+  }
+  if (form.config.acc_enabled && (!form.config.acc_datasets || form.config.acc_datasets.length === 0)) {
+    return ElMessage.warning('已开启准确率评测，请勾选评测集')
+  }
+  if (form.config.acc_enabled && !form.is_full_acc && (!form.config.acc_limit || form.config.acc_limit < 1)) {
+    return ElMessage.warning('已开启准确率评测，请填写数据集抽样数量（或勾选全量评测）')
+  }
   creating.value = true
   try {
     const finalConfig = { ...form.config }
     if (!finalConfig.acc_datasets || finalConfig.acc_datasets.length === 0) {
       finalConfig.acc_enabled = false
+    }
+    // 压测轮次数字段强制转为整数，避免 v-model.number 残留字符串导致后端 422
+    // (NaN 序列化成 null 同样会 422，无效值回退默认；perf 开启时空值已被上方校验拦截)
+    const toIntSafe = (v, dflt) => {
+      const n = Number.parseInt(v, 10)
+      return Number.isNaN(n) ? dflt : n
+    }
+    if (Array.isArray(finalConfig.perf_rounds_config)) {
+      finalConfig.perf_rounds_config = finalConfig.perf_rounds_config.map((r) => ({
+        ...r,
+        input_len: toIntSafe(r.input_len, 512),
+        num_prompts: toIntSafe(r.num_prompts, 300),
+      }))
+    }
+    if (finalConfig.per_model_config) {
+      const pmc = {}
+      for (const k of Object.keys(finalConfig.per_model_config)) {
+        const v = finalConfig.per_model_config[k] || {}
+        const rounds = Array.isArray(v.perf_rounds_config) ? v.perf_rounds_config : []
+        pmc[k] = {
+          ...v,
+          perf_rounds_config: rounds.map((r) => ({
+            ...r,
+            input_len: toIntSafe(r.input_len, 512),
+            num_prompts: toIntSafe(r.num_prompts, 300),
+          })),
+        }
+      }
+      finalConfig.per_model_config = pmc
     }
     const payload = {
       name: form.name,
@@ -1061,7 +1132,12 @@ const handleSubmit = async () => {
       router.push(`/task/${task.id}`)
     }
   } catch (e) {
-    ElMessage.error((editId.value ? '更新' : '创建') + '失败: ' + (e.response?.data?.detail || e.message))
+    const d = e.response?.data?.detail
+    let msg
+    if (typeof d === 'string') msg = d
+    else if (Array.isArray(d)) msg = d.map((x) => `${(x.loc || []).join('.')}: ${x.msg}`).join('; ')
+    else msg = e.message
+    ElMessage.error((editId.value ? '更新' : '创建') + '失败: ' + msg)
   } finally {
     creating.value = false
   }
@@ -1092,19 +1168,17 @@ onMounted(async () => {
         form.device_id = task.device_id || null
         const cfg = task.config || {}
         form.config.model_slugs = cfg.model_slugs || []
-        form.config.perf_enabled = cfg.perf_enabled ?? true
+        form.config.perf_enabled = cfg.perf_enabled ?? false
         form.config.benchmark_framework = cfg.benchmark_framework || 'auto'
         form.config.per_model_config = (cfg.per_model_config && typeof cfg.per_model_config === 'object')
           ? cfg.per_model_config : {}
         form.config.perf_rounds_config =
           cfg.perf_rounds_config && cfg.perf_rounds_config.length
             ? cfg.perf_rounds_config
-            : [makeDefaultRound()]
-        form.config.acc_enabled = cfg.acc_enabled ?? true
-        form.config.acc_datasets = cfg.acc_datasets || ['mmlu', 'ceval', 'gsm8k', 'arc']
-        form.config.acc_limit = cfg.acc_limit || 200
-        form.config.container_port = cfg.container_port || 8300
-        form.config.gpu_memory_utilization = cfg.gpu_memory_utilization || ''
+            : []
+        form.config.acc_enabled = cfg.acc_enabled ?? false
+        form.config.acc_datasets = cfg.acc_datasets || []
+        form.config.acc_limit = cfg.acc_limit ?? null
         form.config.notify_email = cfg.notify_email || ''
       }
     } catch (e) {

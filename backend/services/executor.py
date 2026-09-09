@@ -239,6 +239,84 @@ def _wait_gpu_free(runner: RemoteRunner, min_free_mib: float = 81920, max_wait: 
     return False
 
 
+def _get_gpu_total_mib(runner: RemoteRunner) -> float:
+    """获取系统总内存 (MiB)。Jetson 统一内存读 /proc/meminfo，标准 GPU 读 nvidia-smi。"""
+    try:
+        r = runner.run_shell(
+            "nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null",
+            timeout=5,
+        )
+        val = (r.stdout or "").strip().split("\n")[0].strip()
+        if val and val != "[N/A]" and val.lstrip("-").isdigit():
+            return float(val)
+    except Exception:
+        pass
+    try:
+        r = runner.run_shell("grep MemTotal /proc/meminfo", timeout=3)
+        return int(r.stdout.split()[1]) / 1024.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_gpu_top_consumers(runner: RemoteRunner, top: int = 3) -> str:
+    """获取 GPU 显存占用最高的进程描述（用于报错提示），失败返回空串。"""
+    try:
+        r = runner.run_shell(
+            "nvidia-smi --query-compute-apps=pid,used_memory --format=csv,noheader 2>/dev/null",
+            timeout=5,
+        )
+        items = []
+        for line in (r.stdout or "").strip().splitlines():
+            parts = [p.strip() for p in line.split(",")]
+            if len(parts) != 2:
+                continue
+            pid, mem = parts
+            try:
+                mem_f = float(mem.replace("MiB", "").strip())
+            except ValueError:
+                continue
+            cmd_r = runner.run_shell(f"ps -p {pid} -o args= 2>/dev/null", timeout=3)
+            name = (cmd_r.stdout or "").strip() or f"pid {pid}"
+            if len(name) > 60:
+                name = name[:57] + "..."
+            items.append((mem_f, name))
+        items.sort(reverse=True)
+        return "；".join(f"{name} 占 {mem/1024:.0f} GiB" for mem, name in items[:top])
+    except Exception:
+        return ""
+
+
+def check_gpu_memory(runner: RemoteRunner, docker_cmd: str) -> tuple[bool, str]:
+    """
+    启动容器前检查目标机内存是否足够 vLLM 预分配。
+    vLLM 按 gpu_memory_utilization × 总内存 预分配；非 vLLM 命令(llama.cpp 等)不做限制。
+    返回 (ok, 错误提示)。读不到总量时不拦截。
+    """
+    try:
+        if "vllm" not in (docker_cmd or "").lower():
+            return True, ""
+        m = re.search(r"--gpu-memory-utilization\s+([\d.]+)", docker_cmd or "")
+        util = float(m.group(1)) if m else 0.8
+        total_mib = _get_gpu_total_mib(runner)
+        if total_mib <= 0:
+            return True, ""
+        free_mib = _get_gpu_free_mib(runner)
+        required_mib = total_mib * util
+        if free_mib < required_mib:
+            msg = (f"目标机 [{runner.host_label}] 内存不足: vLLM 需预分配约 {required_mib/1024:.0f} GiB "
+                   f"(gpu-memory-utilization={util} × 总内存 {total_mib/1024:.0f} GiB)，"
+                   f"当前仅剩 {free_mib/1024:.1f} GiB。")
+            tops = _get_gpu_top_consumers(runner)
+            if tops:
+                msg += f" 显存占用大户: {tops}。"
+            msg += " 请先停止占用内存的服务/容器后重试。"
+            return False, msg
+        return True, ""
+    except Exception:
+        return True, ""
+
+
 
 def _stop_container(runner: RemoteRunner, log_callback=None):
     """停止并删除旧容器，强杀僵尸子进程，深度释放 GPU 显存与系统内存，等待 GPU 完全空闲"""
@@ -246,8 +324,8 @@ def _stop_container(runner: RemoteRunner, log_callback=None):
     runner.run_shell("sudo docker rm -f aoni_benchmark_runner test_eager test_vl_live debug_gemma27b_file 2>/dev/null || true", timeout=5)
     runner.run_shell("sudo docker ps -a --filter name=test_ --filter name=debug_ -q | xargs -r sudo docker rm -f 2>/dev/null || true", timeout=5)
 
-    # 第 2 步：杀掉占用推理端口的进程
-    runner.run_shell("fuser -k 8300/tcp 2>/dev/null || true", timeout=3)
+    # 第 2 步：杀掉占用推理端口的进程（含 MIM 容器固定服务端口 25535）
+    runner.run_shell("fuser -k 8300/tcp 2>/dev/null || true; fuser -k 25535/tcp 2>/dev/null || true", timeout=3)
 
     # 第 3 步：强制回收所有僵尸 CUDA 进程（排除 Xorg / gnome）
     runner.run_shell(
@@ -278,6 +356,13 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
         cmd = docker_cmd.strip()
         cmd = cmd.replace("&quot;", '"').replace("&amp;", "&")
         cmd = cmd.replace("\\\n", " ").replace("\\", " ")
+
+        # ── 内存预检: vLLM 需预分配 gpu_memory_utilization × 总内存，不足直接友好报错 ──
+        mem_ok, mem_msg = check_gpu_memory(runner, cmd)
+        if not mem_ok:
+            log_callback("ERROR", "", mem_msg, "container")
+            return False, mem_msg
+
         cmd = re.sub(r"\s+-([it]{1,2})\b", "", cmd)
         cmd = re.sub(r"\s+--rm\b", "", cmd)
 
@@ -346,10 +431,11 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
             if "-e PIP_FIND_LINKS=" not in cmd:
                 cmd = re.sub(r"(docker run\b)", r"\1 -e PIP_FIND_LINKS=file:///models/python_packages -e PIP_NO_INDEX=1", cmd, count=1)
 
-        if "-e VLLM_USE_V1=" not in cmd:
+        if "-e VLLM_USE_V1=" not in cmd and "mxcr.metax-tech.com/" not in cmd:
             cmd = re.sub(r"(docker run\b)", r"\1 -e VLLM_USE_V1=0", cmd, count=1)
 
         is_llama_cpp = "llama_cpp" in cmd or "llama-cpp" in cmd
+        is_mim = "mxcr.metax-tech.com/" in cmd  # MIM 官方镜像: 固定 entrypoint，禁止通用 vLLM 参数注入
         if runner.is_remote:
             cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "sudo docker run", cmd)
             cmd = re.sub(r"\s+-d\b", "", cmd)
@@ -357,13 +443,14 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
             cmd = re.sub(r"\s+--rm\b", "", cmd)
             cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
             cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-            if is_llama_cpp:
+            if is_llama_cpp or is_mim:
                 cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
             else:
                 cmd = re.sub(r"(sudo docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
-            # 清除重复的 --shm-size，然后统一追加一个
-            cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
-            cmd = re.sub(r"(sudo docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
+            # 清除重复的 --shm-size，然后统一追加一个（MIM 镜像保留自带的 100gb）
+            if not is_mim:
+                cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
+                cmd = re.sub(r"(sudo docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
         else:
             cmd = re.sub(r"(sudo\s+)?docker\s+run\b", "docker run", cmd)
             cmd = re.sub(r"\s+-d\b", "", cmd)
@@ -371,15 +458,16 @@ def _start_container(runner: RemoteRunner, docker_cmd: str, port: int, log_callb
             cmd = re.sub(r"\s+--rm\b", "", cmd)
             cmd = re.sub(r"\s+--restart\s+\S+", "", cmd)
             cmd = re.sub(r"\s+--name\s+\S+", "", cmd)
-            if is_llama_cpp:
+            if is_llama_cpp or is_mim:
                 cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME}", cmd, count=1)
             else:
                 cmd = re.sub(r"(docker run)\b", f"\\1 -d --name {CONTAINER_NAME} --memory 112g --memory-swap 112g", cmd, count=1)
-            # 清除重复的 --shm-size，然后统一追加一个
-            cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
-            cmd = re.sub(r"(docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
+            # 清除重复的 --shm-size，然后统一追加一个（MIM 镜像保留自带的 100gb）
+            if not is_mim:
+                cmd = re.sub(r"\s+--shm-size\s+\S+", "", cmd)
+                cmd = re.sub(r"(docker run)\b", r"\1 --shm-size 16g", cmd, count=1)
         cmd = re.sub(r"--port\s+\d+", f"--port {port}", cmd)
-        if not is_llama_cpp:
+        if not is_llama_cpp and not is_mim:
             if "--trust-remote-code" not in cmd:
                 cmd += " --trust-remote-code"
             if ("-vl-" in cmd.lower() or "gemma-3" in cmd.lower() or "gemma-4" in cmd.lower()) and "--limit-mm-per-prompt" not in cmd:
@@ -541,6 +629,21 @@ from sqlalchemy import select
 from backend.models import ModelInfo
 
 
+def _resolve_service_port(db: Session, model_slug: str, docker_cmd: str, config: dict) -> int:
+    """推理服务端口解析优先级: docker 命令 --port > 模型 service_port > 任务配置 container_port > 8300
+    （MIM 导入的模型无 --port 参数，依赖 service_port=25535）"""
+    m = re.search(r'--port\s+(\d+)', docker_cmd or '')
+    if m:
+        return int(m.group(1))
+    try:
+        mi = db.execute(select(ModelInfo).where(ModelInfo.slug == model_slug)).scalar_one_or_none()
+        if mi is not None and getattr(mi, "service_port", None):
+            return int(mi.service_port)
+    except Exception:
+        pass
+    return config.get("container_port", 8300)
+
+
 def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: dict, log_callback):
     """执行单个模型的完整测试流水线"""
 
@@ -559,8 +662,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
     docker_cmd = model_run.docker_command
 
     # 优先从 docker 命令中解析实际端口（兼容 llama-server --port 8080 等非标端口）
-    _port_in_cmd = re.search(r'--port\s+(\d+)', docker_cmd or '')
-    port = int(_port_in_cmd.group(1)) if _port_in_cmd else config.get("container_port", 8300)
+    port = _resolve_service_port(db, model_slug, docker_cmd, config)
 
     # 查验模型是否为已部署外部 API 接入模式
     model_info = db.execute(select(ModelInfo).where(ModelInfo.slug == model_slug)).scalar_one_or_none()
@@ -596,7 +698,8 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
         runner.current_model_slug = model_slug
         ok, container_id = _start_container(runner, docker_cmd, port, log_callback)
         if not ok:
-            log_callback("ERROR", model_slug, "容器启动失败，测试终止", "container")
+            fail_detail = container_id or "容器启动失败，测试终止"
+            log_callback("ERROR", model_slug, fail_detail, "container")
             model_run.stage_status["deploying"] = StageStatus.FAILED.value
             model_run.stage_status["validating"] = StageStatus.SKIPPED.value
             model_run.stage_status["gateway_testing"] = StageStatus.SKIPPED.value
@@ -605,7 +708,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
             model_run.stage_status["reporting"] = StageStatus.SKIPPED.value
             model_run.status = ModelStage.FAILED.value
             model_run.progress = 100
-            model_run.progress_detail = "容器启动失败，测试终止"
+            model_run.progress_detail = fail_detail
             model_run.completed_at = datetime.utcnow()
             db.commit()
             return
@@ -654,7 +757,7 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
             elif "repo id must be in the form" in log_txt.lower():
                 detail_reason = "模型加载路径格式校验报错，请核查容器配置"
             else:
-                detail_reason = "推理服务 8300 端口未按时就绪 (详情见控制台日志)"
+                detail_reason = f"推理服务 {port} 端口未按时就绪 (详情见控制台日志)"
 
             model_run.progress_detail = detail_reason
             model_run.completed_at = datetime.utcnow()
@@ -823,9 +926,8 @@ def _run_gateway_stage(db: Session, model_run: ModelRun, config: dict, log_callb
     db.query(GatewayResult).filter_by(model_run_id=model_run.id).delete()
     db.commit()
 
-    _port_in_cmd = re.search(r'--port\s+(\d+)', model_run.docker_command or '')
-    port = int(_port_in_cmd.group(1)) if _port_in_cmd else config.get("container_port", 8300)
     model_slug = model_run.model_slug
+    port = _resolve_service_port(db, model_slug, model_run.docker_command, config)
 
     api_cfg = _get_model_api_config(db, model_slug, runner, port, model_run.model_name)
     base_url = api_cfg["base_url"]
@@ -867,9 +969,8 @@ def _run_feature_stage(db: Session, model_run: ModelRun, config: dict, log_callb
     db.query(FeatureResult).filter_by(model_run_id=model_run.id).delete()
     db.commit()
 
-    _port_in_cmd = re.search(r'--port\s+(\d+)', model_run.docker_command or '')
-    port = int(_port_in_cmd.group(1)) if _port_in_cmd else config.get("container_port", 8300)
     model_slug = model_run.model_slug
+    port = _resolve_service_port(db, model_slug, model_run.docker_command, config)
 
     api_cfg = _get_model_api_config(db, model_slug, runner, port, model_run.model_name)
     base_url = api_cfg["base_url"]
@@ -929,9 +1030,8 @@ def _run_feature_stage(db: Session, model_run: ModelRun, config: dict, log_callb
 # ============================================================
 
 def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
-    # 优先从 docker 命令中解析实际端口（兼容 llama-server --port 8080 等非标端口）
-    _port_in_cmd = re.search(r'--port\s+(\d+)', model_run.docker_command or '')
-    port = int(_port_in_cmd.group(1)) if _port_in_cmd else config.get("container_port", 8300)
+    # 优先从 docker 命令中解析实际端口（兼容 llama-server --port 8080 / MIM service_port 等非标端口）
+    port = _resolve_service_port(db, model_run.model_slug, model_run.docker_command or '', config)
 
     # 从 Docker 启动命令中解析模型的最大上下文限制 (默认为 4096)
     max_model_len = 4096
@@ -1006,12 +1106,22 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
             log_callback("INFO", model_run.model_slug, "  ⚙ 已选择【原生 vLLM 压测】", "perf")
             use_fallback = False
 
-    # 预先计算并解析总压测项数
+    # 预先计算并解析总压测项数（跳过未填写完整的/非法的轮次，避免脏数据导致流水线崩溃）
     parsed_rounds = []
     total_steps = 0
     for rd in rounds_config:
-        input_len = int(rd.get("input_len", 512))
-        num_prompts = int(rd.get("num_prompts", 300))
+        try:
+            input_len = int(rd.get("input_len"))
+        except (TypeError, ValueError):
+            log_callback("WARNING", model_run.model_slug,
+                         f"  ⚠ 压测轮次 input_len 非法 ({rd.get('input_len')!r})，跳过该轮次", "perf")
+            continue
+        try:
+            num_prompts = int(rd.get("num_prompts"))
+        except (TypeError, ValueError):
+            log_callback("WARNING", model_run.model_slug,
+                         f"  ⚠ 压测轮次 num_prompts 非法 ({rd.get('num_prompts')!r})，跳过该轮次", "perf")
+            continue
         output_lens_str = rd.get("output_lens_str", "128,512")
         concurrencies_str = rd.get("concurrencies_str", "")
 
@@ -1690,7 +1800,7 @@ def _log_evalscope_details(work_dir: Path, log_callback, model_slug: str):
 
 
 def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
-    port = config.get("container_port", 8300)
+    port = _resolve_service_port(db, model_run.model_slug, model_run.docker_command or '', config)
     datasets = config.get("acc_datasets") or []
     if not datasets:
         log_callback("INFO", model_run.model_slug, "未指定任何准确率评测数据集，已自动跳过准确率评测阶段", "accuracy")
@@ -2183,8 +2293,7 @@ def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict,
     if not acc_start_time:
         acc_start_time = time.time()
 
-    _port_in_cmd = re.search(r'--port\s+(\d+)', model_run.docker_command or '')
-    port = int(_port_in_cmd.group(1)) if _port_in_cmd else config.get("container_port", 8300)
+    port = _resolve_service_port(db, model_run.model_slug, model_run.docker_command or '', config)
     api_cfg = _get_model_api_config(db, model_run.model_slug, runner, port, model_run.model_name)
     api_url = api_cfg["chat_url"]
     api_key = api_cfg["api_key"]
