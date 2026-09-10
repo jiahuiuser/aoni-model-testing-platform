@@ -1113,11 +1113,14 @@ const handleSubmit = async () => {
       }
       finalConfig.per_model_config = pmc
     }
+    const allExternal = isAllExternalSelected.value
     const payload = {
       name: form.name,
       profile: form.profile,
-      device_id: form.device_ids && form.device_ids.length > 0 ? form.device_ids[0] : form.device_id,
-      device_ids: form.device_ids,
+      device_id: allExternal
+        ? null
+        : (form.device_ids && form.device_ids.length > 0 ? form.device_ids[0] : form.device_id),
+      device_ids: allExternal ? [] : form.device_ids,
       template_id: form.template_id,
       scheduled_at: form.is_scheduled && form.scheduled_at ? form.scheduled_at : null,
       config: finalConfig,

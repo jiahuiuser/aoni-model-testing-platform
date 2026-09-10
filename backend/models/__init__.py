@@ -36,6 +36,7 @@ class ModelInfo(Base):
     model_endpoint_name = Column(String(255), nullable=True, comment="远程 API 服务模型标识名")
     image_id = Column(Integer, ForeignKey("docker_images.id", ondelete="SET NULL"), nullable=True, comment="关联的推理镜像（镜像管理）")
     service_port = Column(Integer, nullable=True, comment="推理服务端口（缺省用平台默认 8400/8300）")
+    ext_env_desc = Column(Text, nullable=True, comment="外部 API 接入的环境/引擎说明（由用户填写，报告中优先展示）")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     image_ref = relationship("DockerImage", foreign_keys=[image_id])

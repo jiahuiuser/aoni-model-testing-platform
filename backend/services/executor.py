@@ -329,6 +329,22 @@ def check_gpu_memory(runner: RemoteRunner, docker_cmd: str) -> tuple[bool, str]:
 
 def _stop_container(runner: RemoteRunner, log_callback=None):
     """停止并删除旧容器，强杀僵尸子进程，深度释放 GPU 显存与系统内存，等待 GPU 完全空闲"""
+    # 第 0 步：先探测是否存在平台管理的容器。
+    # 仅当确实存在由平台下发的测试容器时，才允许后续回收 CUDA 计算进程，
+    # 避免外部 API/无容器任务(device=None 走本地 runner)误杀本机手动部署的服务
+    # (如用户自行启动的 MiniCPM5 / vllm 原生服务)。
+    had_managed_container = False
+    try:
+        res = runner.run_shell(
+            "sudo docker ps -a -q --filter name=aoni_benchmark_runner "
+            "--filter name=test_ --filter name=debug_ 2>/dev/null | wc -l",
+            timeout=5,
+        )
+        count = (res.stdout or "").strip()
+        had_managed_container = count not in ("", "0")
+    except Exception:
+        pass
+
     # 第 1 步：强制删除所有相关容器
     runner.run_shell("sudo docker rm -f aoni_benchmark_runner test_eager test_vl_live debug_gemma27b_file 2>/dev/null || true", timeout=5)
     runner.run_shell("sudo docker ps -a --filter name=test_ --filter name=debug_ -q | xargs -r sudo docker rm -f 2>/dev/null || true", timeout=5)
@@ -336,12 +352,14 @@ def _stop_container(runner: RemoteRunner, log_callback=None):
     # 第 2 步：杀掉占用推理端口的进程（含 MIM 容器固定服务端口 25535）
     runner.run_shell("fuser -k 8300/tcp 2>/dev/null || true; fuser -k 25535/tcp 2>/dev/null || true", timeout=3)
 
-    # 第 3 步：强制回收所有僵尸 CUDA 进程（排除 Xorg / gnome）
-    runner.run_shell(
-        "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null "
-        "| xargs -r -I{} sh -c 'kill -9 {} 2>/dev/null || true'",
-        timeout=5,
-    )
+    # 第 3 步：仅在确认平台确实管理了测试容器时才回收 CUDA 计算进程（排除 Xorg / gnome）
+    # 避免无差别 kill -9 本机手动部署的外部 API / vllm 服务。
+    if had_managed_container:
+        runner.run_shell(
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null "
+            "| xargs -r -I{} sh -c 'kill -9 {} 2>/dev/null || true'",
+            timeout=5,
+        )
 
     # 第 4 步：清理系统页缓存和 slab（优先通过免密特权容器或 sysctl 彻底释放）
     try:
@@ -1874,10 +1892,6 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     # 校正为服务端真实注册的模型 ID (容器部署场景 model_name 可能是带空格的显示名, 直接调用会 404)
     eval_model_name = _resolve_verified_model_id(api_cfg, eval_model_name, log_callback, model_run.model_slug)
 
-    # 请求超时 300s: 慢速外部 API (如 15 tok/s × 512 tokens ≈ 34s/题) 需要更长超时，
-    # 30s 会导致所有请求超时重试 → 0 进度、无题目明细
-    gen_config = json.dumps({"temperature": 0.0, "max_tokens": 512, "do_sample": False, "timeout": 300})
-
     work_dir = DATA_DIR / "evalscope_reports" / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_t{model_run.task_id}_mr{model_run.id}"
     work_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1999,6 +2013,22 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
         ds_log_file = ds_work_dir / "evalscope_stdout.log"
         with open(ds_log_file, "w") as f:
             f.write("")
+
+        # 按数据集自适应 max_tokens：数学/推理类(AIME/GPQA/Math/LongBench等)需要足够 token
+        # 让模型推理完并输出 \boxed{}/最终答案，否则被截断后 extract 只能从残缺文本抓"最后一个
+        # 数字"导致 AIME 等评分全 0；普通选择题保持较小上限以节省时间。
+        ds_lower = ds_item["ds"].lower()
+        reasoning_bytes = any(
+            kw in ds_lower
+            for kw in ("aime", "gpqa", "math", "olympiad", "minerva", "longbench",
+                       "bigcodebench", "humaneval", "mbpp", "code", "gsm8k", "bbh")
+        )
+        max_tokens = 4096 if reasoning_bytes else 1024
+        gen_config = json.dumps(
+            {"temperature": 0.0, "max_tokens": max_tokens, "do_sample": False, "timeout": 300}
+        )
+        log_callback("DEBUG", model_run.model_slug,
+                     f"  数据集 {mapped} 生成上限 max_tokens={max_tokens}（推理类自动放宽以避免截断丢分）", "accuracy")
 
         single_cmd = [evalscope_bin, "eval", "--model", eval_model_name,
                       "--eval-type", "openai_api", "--api-url", api_url,

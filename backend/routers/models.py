@@ -43,6 +43,7 @@ class ModelCreate(BaseModel):
     api_base: str = ""
     api_key: str = "EMPTY"
     model_endpoint_name: str = ""
+    ext_env_desc: str = ""
     image_id: int | None = None
 
 
@@ -56,6 +57,7 @@ class ModelUpdate(BaseModel):
     api_base: str | None = None
     api_key: str | None = None
     model_endpoint_name: str | None = None
+    ext_env_desc: str | None = None
     image_id: int | None = None
 
 
@@ -219,6 +221,7 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
         "api_base": m.api_base or "",
         "api_key": m.api_key or "EMPTY",
         "model_endpoint_name": m.model_endpoint_name or "",
+        "ext_env_desc": m.ext_env_desc or "",
         "image_id": m.image_id,
         "image_tag": m.image_ref.image_tag if getattr(m, "image_ref", None) else None,
         "image_name": m.image_ref.name if getattr(m, "image_ref", None) else None,
@@ -308,6 +311,7 @@ def api_create_model(data: ModelCreate, db: Session = Depends(get_db)):
         api_base=data.api_base,
         api_key=data.api_key or "EMPTY",
         model_endpoint_name=data.model_endpoint_name or data.name,
+        ext_env_desc=data.ext_env_desc,
         status="PASS" if data.is_external else "NEW",
     )
     # 关联镜像管理: 绑定镜像并同步命令镜像段
@@ -576,6 +580,7 @@ def api_update_model(slug: str, data: ModelUpdate, db: Session = Depends(get_db)
     if data.api_base is not None: m.api_base = data.api_base
     if data.api_key is not None: m.api_key = data.api_key
     if data.model_endpoint_name is not None: m.model_endpoint_name = data.model_endpoint_name
+    if data.ext_env_desc is not None: m.ext_env_desc = data.ext_env_desc
     # 关联镜像管理: 绑定镜像并同步命令镜像段
     if data.image_id is not None:
         _apply_model_image(db, m, data.image_id, data.docker_command)

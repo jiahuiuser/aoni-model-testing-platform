@@ -240,6 +240,17 @@
                   </div>
                 </div>
               </el-form-item>
+              <el-form-item label="环境/引擎说明">
+                <el-input
+                  v-model="form.ext_env_desc"
+                  type="textarea"
+                  :rows="2"
+                  placeholder="选填：远端服务的引擎版本 / GPU型号 / 显存 / 集群信息等，报告中优先展示。例如：vLLM 0.26.1 / 2×A100 80GB / FP8"
+                />
+                <div style="font-size:12px;color:#909399;margin-top:3px;width:100%;">
+                  报告会优先显示此说明；留空则尝试探测远端，探测不到记为「未知（由服务端提供）」。
+                </div>
+              </el-form-item>
             </template>
 
             <template v-else>
@@ -947,6 +958,7 @@ const form = ref({
   api_base: '',
   api_key: 'EMPTY',
   model_endpoint_name: '',
+  ext_env_desc: '',
 })
 
 const handleTestConnection = async () => {
@@ -1040,6 +1052,7 @@ const showAddDialog = () => {
     api_base: '',
     api_key: 'EMPTY',
     model_endpoint_name: '',
+    ext_env_desc: '',
     image_id: null,
   }
   oldImageTag.value = null
@@ -1062,6 +1075,7 @@ const openEditModel = (row) => {
     api_base: target.api_base || '',
     api_key: target.api_key || 'EMPTY',
     model_endpoint_name: target.model_endpoint_name || '',
+    ext_env_desc: target.ext_env_desc || '',
     image_id: target.image_id || null,
   }
   oldImageTag.value = target.image_tag || detectImageToken(target.docker_command)

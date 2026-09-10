@@ -164,11 +164,51 @@ def api_update_task(
         task.name = data.name
     if data.profile is not None:
         task.profile = data.profile
-    if data.device_id is not None:
+    # 用 exclude_unset 区分"未提供"与"显式传 null"：
+    # "device_id" 在请求体中出现即生效，传 null 表示清空设备(切换为外部 API 接入)
+    provided = data.model_dump(exclude_unset=True)
+    if "device_id" in provided:
         task.device_id = data.device_id
     if data.config is not None:
         task.config = data.config
     db.commit()
+    # 设备变更时，重建所有子模型(model_runs)的设备绑定
+    # (device_id / device_name / docker_command)，与 create_task 生成逻辑保持一致，
+    # 否则重跑时仍沿用旧设备的绑定与专属命令，导致"修改执行设备"不生效
+    if "device_id" in provided:
+        from backend.models import ModelInfo, ModelDeviceConfig
+        from sqlalchemy import select
+        try:
+            device = task.device
+            device_config_map = {}
+            if task.device_id:
+                configs = db.execute(
+                    select(ModelDeviceConfig).where(
+                        ModelDeviceConfig.device_id == task.device_id
+                    )
+                ).scalars().all()
+                device_config_map = {dc.model_id: dc for dc in configs}
+            device_name = device.name if device else "独立/云端环境"
+            for mr in task.model_runs:
+                mi = db.get(ModelInfo, mr.model_id) if mr.model_id else None
+                if mi is None:
+                    mi = db.execute(
+                        select(ModelInfo).where(ModelInfo.slug == mr.model_slug)
+                    ).scalar_one_or_none()
+                dc = device_config_map.get(mi.id) if mi else None
+                is_ext = bool(mi and (mi.is_external or mi.api_base))
+                if is_ext:
+                    api_target = (mi.api_base if mi and mi.api_base else "外部 API")
+                    mr_dev = f"外部 API 接入 ({api_target})"
+                else:
+                    mr_dev = device_name
+                docker_cmd = (mi.docker_command if mi else None) or (dc.docker_command if dc else "") or (mr.docker_command or "")
+                mr.device_id = task.device_id
+                mr.device_name = mr_dev
+                mr.docker_command = docker_cmd
+            db.commit()
+        except Exception:
+            db.rollback()
     db.refresh(task)
     return _task_to_out(task)
 

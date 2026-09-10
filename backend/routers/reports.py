@@ -21,6 +21,81 @@ def check_report_access(mr: ModelRun, user: User):
         raise HTTPException(403, "权限拒绝：您无权查阅或删除其他用户的测试报告")
 
 
+# --------------------------------------------------------------------- #
+# 外部 API 接入环境/引擎探测（三层逻辑第 1 层：能探测到的真值，否则留空）
+# --------------------------------------------------------------------- #
+_ext_probe_cache: dict = {}
+_ext_probe_lock = threading.Lock()
+
+
+def _ext_probe_ttl_key(api_base: str) -> str:
+    return api_base.rstrip("/")
+
+
+def _probe_external_api(api_base: str, api_key: str = "EMPTY", model_id: str = "") -> dict:
+    """只读探测外部 OpenAI 兼容端点，尽量取回引擎/模型/上下文的真实值。
+
+    探测不到或失败时返回空 dict（由报告三层逻辑回退），绝不抛出异常。
+    带 TTL 缓存（60s），避免高并发重复探测拖慢报告生成。
+    """
+    key = _ext_probe_ttl_key(api_base or "")
+    if not key:
+        return {}
+    now = datetime.datetime.utcnow().timestamp()
+    with _ext_probe_lock:
+        cached = _ext_probe_cache.get(key)
+        if cached and now - cached[0] < 60:
+            return cached[1]
+
+    import requests as _req
+    info: dict = {}
+
+    def _headers():
+        h = {"Accept": "application/json"}
+        if api_key and api_key != "EMPTY":
+            h["Authorization"] = f"Bearer {api_key}"
+        return h
+
+    try:
+        # 根地址：api_base 可能是 ".../v1" 或裸 "host:port"
+        base = key
+        root = base[:-3] if base.endswith("/v1") else base
+        # /version → vLLM 返回 {"version": "x.y.z"}、SGLang/TGI 等可能返回空/404
+        try:
+            r = _req.get(f"{root}/version", headers=_headers(), timeout=3)
+            if r.status_code == 200:
+                vj = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                if isinstance(vj, dict) and vj.get("version"):
+                    info["engine"] = "vLLM"
+                    info["engine_version"] = str(vj["version"])
+        except Exception:
+            pass
+        # /v1/models → 模型清单，附带 meta(可能含 max_model_len)
+        try:
+            r = _req.get(f"{key}/models", headers=_headers(), timeout=3)
+            if r.status_code == 200:
+                mdl = r.json().get("data", []) if r.headers.get("content-type", "").startswith("application/json") else []
+                for m in mdl:
+                    if isinstance(m, dict) and (not model_id or m.get("id") == model_id or m.get("id") == model_id.lstrip("/")):
+                        info["served_model_name"] = m.get("id")
+                        meta = m.get("meta") or {}
+                        if not info.get("engine") and (meta.get("reasoning") is not None or meta.get("max_model_len") or meta.get("architecture")):
+                            info["engine"] = "vLLM"
+                        if meta.get("max_model_len"):
+                            info["max_model_len"] = meta["max_model_len"]
+                        if meta.get("architecture"):
+                            info["architecture"] = meta["architecture"]
+                        break
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    with _ext_probe_lock:
+        _ext_probe_cache[key] = (now, info)
+    return info
+
+
 @router.get("/tasks")
 def api_list_report_tasks(
     db: Session = Depends(get_db),
@@ -660,6 +735,26 @@ def api_download_report(
     except Exception:
         _mi_q = None
     _is_ext = bool(_mi_q and (_mi_q.is_external or _mi_q.api_base)) or not (mr.docker_command or "").strip()
+
+    # ---- 外部 API 三层信息：第1层主动探测真值 + 第2层用户说明 + 第3层如实标注 ----
+    ext_probe: dict = {}
+    ext_user_desc = ""
+    ext_api_base = ""
+    ext_served_name = ""
+    ext_engine = None
+    ext_engine_ver = None
+    ext_max_len = None
+    if _is_ext and _mi_q:
+        ext_api_base = (_mi_q.api_base or "").strip()
+        ext_user_desc = (_mi_q.ext_env_desc or "").strip()
+        ext_probe = _probe_external_api(
+            ext_api_base, _mi_q.api_key or "EMPTY", _mi_q.model_endpoint_name or ""
+        )
+        ext_served_name = ext_probe.get("served_model_name") or (_mi_q.model_endpoint_name or "")
+        ext_engine = ext_probe.get("engine")
+        ext_engine_ver = ext_probe.get("engine_version")
+        ext_max_len = ext_probe.get("max_model_len")
+
     if d_info["engine"] == "llama_cpp" and not _is_ext:
         _bench_tool = "llama.cpp 推理引擎（HTTP OpenAI 兼容压测）"
         _req_mode = "多路并发流式压测（固定长度随机 Prompt）"
@@ -732,10 +827,15 @@ def api_download_report(
     lines.append(f"# {mr.model_name} 推理性能测试报告")
     lines.append("")
     lines.append(f"> 测试日期：{test_date}")
-    lines.append(f"> 测试平台：{dev_name}")
+    if _is_ext:
+        lines.append(f"> 测试平台：外部 API 接入")
+    else:
+        lines.append(f"> 测试平台：{dev_name}")
     if _is_ext:
         lines.append(f"> 测试工具：外部 API 接入（未在本地容器执行压测）")
         lines.append(f"> 部署方式：外部 API 接入")
+        if ext_api_base:
+            lines.append(f"> 接入地址：`{ext_api_base}`")
     elif is_llama:
         lines.append(f"> 测试工具：llama.cpp Benchmark（`llama-server` OpenAI 兼容 API 压测）")
         lines.append(f"> 部署引擎：`llama.cpp`（`{d_info['image_repo']}:{d_info['image_tag']}`）")
@@ -1019,30 +1119,56 @@ def api_download_report(
     lines.append("")
 
     # 3. 容器启动命令与参数配置
-    lines.append("## 3. 容器启动命令与参数配置")
+    lines.append("## 3. 活动启动方式与接入配置")
     lines.append("")
-    lines.append("### 3.1 容器镜像")
-    lines.append("")
-    lines.append("| 项目 | 值 |")
-    lines.append("|------|-----|")
-    lines.append(f"| 镜像仓库 | `{d_info['image_repo']}` |")
-    lines.append(f"| 镜像 Tag | `{d_info['image_tag']}` |")
-    lines.append(f"| 容器名 | `{mr.container_name or d_info['container_name']}` |")
-    lines.append(f"| 容器运行时 | `{d_info['runtime']}`（GPU 直通） |")
-    lines.append(f"| ShmSize | `{d_info['shm_size']}` |")
-    lines.append(f"| 重启策略 | `{d_info['restart_policy']}` |")
-    lines.append(f"| 端口映射 | 服务端口 `{mr.port or d_info['port']}` |")
-    lines.append("")
-    lines.append("### 3.2 数据卷挂载")
-    lines.append("")
-    lines.append("| 宿主机路径 | 容器内路径 | 读写 |")
-    lines.append("|------------|------------|------|")
-    if d_info["volumes"]:
-        for v in d_info["volumes"]:
-            lines.append(f"| `{v['host']}` | `{v['container']}` | `{v['mode']}` |")
+    if _is_ext:
+        # 外部 API 接入：无本地容器/镜像/数据卷，如实标注接入信息与三层环境信息
+        lines.append("### 3.1 外部 API 接入")
+        lines.append("")
+        lines.append("| 项目 | 值 |")
+        lines.append("|------|-----|")
+        lines.append(f"| 接入方式 | `外部 API 接入（非本地容器部署）` |")
+        lines.append(f"| 接入地址 | `{ext_api_base or '外部 API'}` |")
+        lines.append(f"| 远程模型标识 | `{ext_served_name or '未知（由服务端提供）'}` |")
+        lines.append(f"| 引擎 | `{ext_engine or '未知（由服务端提供）'}` |")
+        if ext_engine_ver:
+            lines.append(f"| 引擎版本 | `{ext_engine_ver}` |")
+        if ext_max_len:
+            lines.append(f"| 上下文长度 (max_model_len) | `{ext_max_len}` |")
+        if ext_user_desc:
+            lines.append(f"| 环境/引擎说明 | `{ext_user_desc}` |")
+        lines.append("")
+        lines.append(f"> 说明：外部 API 部署在远端服务上，平台未下发容器，**远端硬件的 GPU/CPU/内存、镜像及引擎版本由服务端提供**，平台无法探测的部分如实标注为「未知」；环境/引擎说明由部署方在模型配置中填写。")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        # 跳过容器启动命令部分，直接进入性能与服务展示
+        _skip_container_sections = True
     else:
-        lines.append(f"| `~/models` | `/models` | RW |")
-    lines.append("")
+        _skip_container_sections = False
+    if not _skip_container_sections:
+        lines.append("### 3.1 容器镜像")
+        lines.append("")
+        lines.append("| 项目 | 值 |")
+        lines.append("|------|-----|")
+        lines.append(f"| 镜像仓库 | `{d_info['image_repo']}` |")
+        lines.append(f"| 镜像 Tag | `{d_info['image_tag']}` |")
+        lines.append(f"| 容器名 | `{mr.container_name or d_info['container_name']}` |")
+        lines.append(f"| 容器运行时 | `{d_info['runtime']}`（GPU 直通） |")
+        lines.append(f"| ShmSize | `{d_info['shm_size']}` |")
+        lines.append(f"| 重启策略 | `{d_info['restart_policy']}` |")
+        lines.append(f"| 端口映射 | 服务端口 `{mr.port or d_info['port']}` |")
+        lines.append("")
+        lines.append("### 3.2 数据卷挂载")
+        lines.append("")
+        lines.append("| 宿主机路径 | 容器内路径 | 读写 |")
+        lines.append("|------------|------------|------|")
+        if d_info["volumes"]:
+            for v in d_info["volumes"]:
+                lines.append(f"| `{v['host']}` | `{v['container']}` | `{v['mode']}` |")
+        else:
+            lines.append(f"| `~/models` | `/models` | RW |")
+        lines.append("")
     # 3.3 容器启动命令（实际执行）: 若本地已存在对应权重目录，执行器会置 MODEL_OSS=False 并注入 --model（与 executor 本地优先逻辑一致）
     _disp_cmd = docker_cmd
     try:
@@ -1068,22 +1194,23 @@ def api_download_report(
             continue
         _disp_lines.append(_ln2)
     _disp_cmd_clean = "\n".join(_disp_lines).strip()
-    lines.append("### 3.3 容器启动命令（实际执行）")
-    lines.append("")
-    if _is_ext or not _disp_cmd_clean:
-        lines.append("*外部 API 接入模型，无本地容器部署命令。*")
-    else:
-        lines.append("```bash")
-        lines.append(_disp_cmd_clean)
-        lines.append("```")
+    if not _skip_container_sections:
+        lines.append("### 3.3 容器启动命令（实际执行）")
         lines.append("")
-        lines.append("> 上述为容器实际加载与服务参数（`--model` 加载权重路径、`--port` 服务端口等）；内部调度平台的环境变量（`MODEL_OSS`/`ENGINE_URI` 等 TOS 拉取/本地切换开关）已省略。")
-    lines.append("   ")
-    lines.append("---")
-    lines.append("")
+        if _is_ext or not _disp_cmd_clean:
+            lines.append("*外部 API 接入模型，无本地容器部署命令。*")
+        else:
+            lines.append("```bash")
+            lines.append(_disp_cmd_clean)
+            lines.append("```")
+            lines.append("")
+            lines.append("> 上述为容器实际加载与服务参数（`--model` 加载权重路径、`--port` 服务端口等）；内部调度平台的环境变量（`MODEL_OSS`/`ENGINE_URI` 等 TOS 拉取/本地切换开关）已省略。")
+        lines.append("   ")
+        lines.append("---")
+        lines.append("")
 
     # 3. 服务配置（按部署引擎动态输出）
-    if is_llama:
+    if not _skip_container_sections and is_llama:
         lines.append("## 4. llama.cpp 服务配置")
         lines.append("")
         lines.append("### 4.1 服务参数")
@@ -1112,7 +1239,7 @@ def api_download_report(
             lines.append(f"- **GPU 卸载**：`{d_info['gpu_layers']}`")
         lines.append("- **Decode 策略**：原生自回归逐 Token 生成。")
         lines.append("")
-    else:
+    elif not _skip_container_sections:
         lines.append("## 4. vLLM 服务配置")
         lines.append("")
         lines.append("### 4.1 服务参数")
@@ -1158,13 +1285,38 @@ def api_download_report(
         else:
             lines.append("未开启投机解码（Speculative Decoding），采用原生自回归 Decode 策略，预分配 KV Cache。")
         lines.append("")
-    lines.append("---")
-    lines.append("")
+    if not _skip_container_sections:
+        lines.append("---")
+        lines.append("")
 
     # 4. 版本与环境配置
     lines.append("## 5. 版本与环境配置")
     lines.append("")
-    lines.append("### 5.1 软件栈版本（容器内）")
+    if _skip_container_sections:
+        # 外部 API 接入：版本与环境由探针+用户说明+如实标注 三层逻辑给出
+        lines.append("### 5.1 外部 API 服务信息（由服务端提供）")
+        lines.append("")
+        lines.append("| 项目 | 值 |")
+        lines.append("|------|-----|")
+        lines.append(f"| 引擎 | `{ext_engine or '未知（由服务端提供）'}` |")
+        lines.append(f"| 引擎版本 | `{ext_engine_ver or '未知（由服务端提供）'}` |")
+        lines.append(f"| 上下文长度 (max_model_len) | `{ext_max_len or '未知（由服务端提供）'}` |")
+        lines.append(f"| 接入地址 | `{ext_api_base or '外部 API'}` |")
+        lines.append(f"| 远程模型标识 | `{ext_served_name or '未知（由服务端提供）'}` |")
+        if ext_user_desc:
+            lines.append("")
+            lines.append("**部署方环境/引擎说明**")
+            lines.append("")
+            lines.append("> " + ext_user_desc.replace("\n", "  \n"))
+        lines.append("")
+        lines.append("> 说明：外部 API 部署于远端，其 GPU/CPU/内存、操作系统、镜像与软件栈由服务端提供，平台无法探测的项如实标注为「未知」；引擎及版本为平台通过 `/version`、`/v1/models` 等只读接口探测到的实时真值（若服务端暴露）。")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+        _skip_env_sections = True
+    else:
+        _skip_env_sections = False
+        lines.append("### 5.1 软件栈版本（容器内）")
     lines.append("")
     lines.append("| 组件 | 版本 |")
     lines.append("|------|------|")
@@ -1189,18 +1341,19 @@ def api_download_report(
     lines.append("")
     lines.append("> 说明：上表 vLLM/llama.cpp、Python、PyTorch、CUDA 版本为从**对应部署镜像**（见『容器镜像』行）读取/采集的运行时版本快照。")
     lines.append("")
-    lines.append("### 5.2 宿主机系统环境")
-    lines.append("")
-    lines.append("| 项目 | 值 |")
-    lines.append("|------|-----|")
-    lines.append(f"| 操作系统 | `{env_probe.get('os_version') or 'Linux'}` |")
-    lines.append(f"| 硬件平台 | `{dev_name}` (`{dev_host}`) |")
-    lines.append(f"| GPU / NPU 规格 | `{gpu_spec}` |")
-    lines.append(f"| CPU 核心数 | `{cpu_spec}` |")
-    lines.append(f"| 物理内存 | `{mem_total_gb} GB 统一内存` |")
-    lines.append("")
-    lines.append("---")
-    lines.append("")
+    if not _skip_env_sections:
+        lines.append("### 5.2 宿主机系统环境")
+        lines.append("")
+        lines.append("| 项目 | 值 |")
+        lines.append("|------|-----|")
+        lines.append(f"| 操作系统 | `{env_probe.get('os_version') or 'Linux'}` |")
+        lines.append(f"| 硬件平台 | `{dev_name}` (`{dev_host}`) |")
+        lines.append(f"| GPU / NPU 规格 | `{gpu_spec}` |")
+        lines.append(f"| CPU 核心数 | `{cpu_spec}` |")
+        lines.append(f"| 物理内存 | `{mem_total_gb} GB 统一内存` |")
+        lines.append("")
+        lines.append("---")
+        lines.append("")
 
     # 5. 模型配置
     lines.append("## 6. 模型配置")
@@ -1215,7 +1368,11 @@ def api_download_report(
     lines.append(f"| 量化方式 | `{quant_desc}` |")
     lines.append(f"| 参数规模分类 | `{mr.size_category or 'small_medium'}` |")
     lines.append(f"| 运行阶段状态 | `{mr.status}` |")
-    lines.append(f"| 本地存放路径 | `{'/models/' + d_info['actual_model_name'] if d_info.get('actual_model_name') else '/models/' + mr.model_slug}` |")
+    if _skip_container_sections and _is_ext:
+        lines.append(f"| 部署方式 | `外部 API 接入（非本地容器部署）` |")
+        lines.append(f"| 模型来源 | `远程 API（无本地权重路径）` |")
+    else:
+        lines.append(f"| 本地存放路径 | `{'/models/' + d_info['actual_model_name'] if d_info.get('actual_model_name') else '/models/' + mr.model_slug}` |")
     lines.append(f"| 测试任务 | `{mr.task.name if mr.task else 'N/A'}` |")
     lines.append(f"| 执行账号 | `{mr.task.user.username if (mr.task and mr.task.user) else 'admin'}` |")
     lines.append("")
