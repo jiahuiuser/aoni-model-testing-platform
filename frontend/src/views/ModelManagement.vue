@@ -251,6 +251,19 @@
                   报告会优先显示此说明；留空则尝试探测远端，探测不到记为「未知（由服务端提供）」。
                 </div>
               </el-form-item>
+              <el-form-item label="最大上下文长度">
+                <el-input-number
+                  v-model="form.max_model_len"
+                  :min="1024"
+                  :step="1024"
+                  :max="1048576"
+                  style="width: 100%"
+                  placeholder="请输入模型上下文 tokens"
+                />
+                <div style="font-size:12px;color:#909399;margin-top:3px;width:100%;">
+                  必填建议：平台据此裁剪压测的输入/输出长度（默认按 4096 计算，会导致长文本压测被错误截断）。例如 MiniCPM5-2B 可填 131072。
+                </div>
+              </el-form-item>
             </template>
 
             <template v-else>
@@ -959,6 +972,7 @@ const form = ref({
   api_key: 'EMPTY',
   model_endpoint_name: '',
   ext_env_desc: '',
+  max_model_len: null,
 })
 
 const handleTestConnection = async () => {
@@ -1053,6 +1067,7 @@ const showAddDialog = () => {
     api_key: 'EMPTY',
     model_endpoint_name: '',
     ext_env_desc: '',
+    max_model_len: null,
     image_id: null,
   }
   oldImageTag.value = null
@@ -1076,6 +1091,7 @@ const openEditModel = (row) => {
     api_key: target.api_key || 'EMPTY',
     model_endpoint_name: target.model_endpoint_name || '',
     ext_env_desc: target.ext_env_desc || '',
+    max_model_len: target.max_model_len ?? null,
     image_id: target.image_id || null,
   }
   oldImageTag.value = target.image_tag || detectImageToken(target.docker_command)

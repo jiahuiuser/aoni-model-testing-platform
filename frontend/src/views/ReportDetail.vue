@@ -37,7 +37,7 @@
             <el-tag size="small" type="primary">{{ report.profile || 'full' }}</el-tag>
           </el-descriptions-item>
 
-          <el-descriptions-item label="目标算力节点">
+          <el-descriptions-item label="目标计算服务">
             <el-tag size="small" type="success">{{ report.device_name || 'NVIDIA AGX Thor (本机)' }}</el-tag>
             <span style="font-size:12px;color:#6b7280;margin-left:6px">({{ report.device_host || '127.0.0.1' }})</span>
           </el-descriptions-item>
@@ -45,7 +45,12 @@
             <span style="font-weight:600;color:#1e293b">{{ report.gpu_info || 'NVIDIA AGX Thor (64GB LPDDR5X)' }}</span>
           </el-descriptions-item>
           <el-descriptions-item label="CPU & 统一内存">
-            <span>{{ report.cpu_cores || 12 }} 核 ARM / {{ report.memory_gb || 64 }} GB 统一内存</span>
+            <template v-if="!report.is_external">
+              <span>{{ report.cpu_cores || 12 }} 核 ARM / {{ report.memory_gb || 64 }} GB 统一内存</span>
+            </template>
+            <template v-else>
+              <span>外部 API（远端，由服务端提供）</span>
+            </template>
           </el-descriptions-item>
 
           <el-descriptions-item label="最大上下文长度 (Max Len)">
@@ -58,10 +63,19 @@
             <el-tag size="small" type="info">{{ report.gpu_layers || 'N/A (GPU全量)' }}</el-tag>
           </el-descriptions-item>
 
-          <el-descriptions-item label="模型启动部署命令" :span="3">
-            <div class="command-code-block" style="background:#0f172a;color:#38bdf8;padding:8px 12px;border-radius:6px;font-family:monospace;font-size:12px;overflow-x:auto;">
-              <code>{{ report.docker_command || 'vllm serve --port 8300 --max-model-len 4096 --gpu-memory-utilization 0.85' }}</code>
-            </div>
+          <el-descriptions-item label="模型接入方式" :span="3">
+            <template v-if="!report.is_external">
+              <div class="command-code-block" style="background:#0f172a;color:#38bdf8;padding:8px 12px;border-radius:6px;font-family:monospace;font-size:12px;overflow-x:auto;">
+                <code>{{ report.docker_command || 'vllm serve --port 8300 --max-model-len 4096 --gpu-memory-utilization 0.85' }}</code>
+              </div>
+            </template>
+            <template v-else>
+              <span style="font-size:12px;color:#059669;font-weight:600">外部 API 接入（无本地容器部署） → </span>
+              <span style="font-weight:600;color:#1e293b">{{ report.api_base || '未配置 api_base' }}</span>
+              <template v-if="report.served_model_name">
+                <el-tag size="small" type="info" style="margin-left:6px">远端模型标识：{{ report.served_model_name }}</el-tag>
+              </template>
+            </template>
           </el-descriptions-item>
 
           <el-descriptions-item label="测试时间与状态" :span="3">
@@ -172,7 +186,11 @@ import { ref, computed, onMounted, nextTick } from 'vue'
 import { useRoute } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import { apiGetReport, apiDownloadReportMarkdown } from '../api'
-import * as echarts from 'echarts'
+import * as echarts from 'echarts/core'
+import { BarChart, LineChart } from 'echarts/charts'
+import { TitleComponent, TooltipComponent, LegendComponent, GridComponent } from 'echarts/components'
+import { CanvasRenderer } from 'echarts/renderers'
+echarts.use([BarChart, LineChart, TitleComponent, TooltipComponent, LegendComponent, GridComponent, CanvasRenderer])
 
 const route = useRoute()
 const report = ref(null)

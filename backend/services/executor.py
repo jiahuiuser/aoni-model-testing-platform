@@ -692,8 +692,10 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
     port = _resolve_service_port(db, model_slug, docker_cmd, config)
 
     # 查验模型是否为已部署外部 API 接入模式
+    # 统一判定口径：is_external 或 api_base 任一存在即视为外部 API（与 _get_model_api_config/task_manager 一致），
+    # 否则只填了 api_base 而没开 is_external 的模型会被误当成容器部署而失败。
     model_info = db.execute(select(ModelInfo).where(ModelInfo.slug == model_slug)).scalar_one_or_none()
-    is_external = model_info and bool(model_info.is_external)
+    is_external = model_info and bool(model_info.is_external or model_info.api_base)
 
     if is_external:
         api_target = model_info.api_base or f"http://{runner.api_host}:{port}/v1"
@@ -862,7 +864,9 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
     model_run.progress = 100
     model_run.completed_at = datetime.utcnow()
     db.commit()
-    _stop_container(runner, log_callback=log_callback)
+    # 仅对容器部署模型执行容器清理；外部 API 模型无平台容器，不触碰本机 docker/端口/页缓存
+    if not is_external:
+        _stop_container(runner, log_callback=log_callback)
     log_callback("INFO", model_slug, "========== 测试完成 ==========", "system")
 
 
@@ -1066,9 +1070,18 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
     # 优先从 docker 命令中解析实际端口（兼容 llama-server --port 8080 / MIM service_port 等非标端口）
     port = _resolve_service_port(db, model_run.model_slug, model_run.docker_command or '', config)
 
-    # 从 Docker 启动命令中解析模型的最大上下文限制 (默认为 4096)
+    # 模型最大上下文长度 (tokens)，优先级：
+    #   1) 模型配置 max_model_len（外部 API 接入必填；容器部署可显式覆盖）
+    #   2) docker 启动命令 --max-model-len
+    #   3) 默认 4096
     max_model_len = 4096
-    if model_run.docker_command:
+    try:
+        _mi = db.execute(select(ModelInfo).where(ModelInfo.slug == model_run.model_slug)).scalar_one_or_none()
+    except Exception:
+        _mi = None
+    if _mi and _mi.max_model_len:
+        max_model_len = int(_mi.max_model_len)
+    elif model_run.docker_command:
         m_len = re.search(r"--max-model-len\s+(\d+)", model_run.docker_command)
         if m_len:
             max_model_len = int(m_len.group(1))
@@ -1165,12 +1178,14 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
         if not output_lens:
             output_lens = [128, 512]
 
-        # 动态自适应剪裁：若用例 input_len 超过模型规格上限，自动收缩 input_len
-        if input_len >= max_model_len * 0.80:
+        # 动态自适应剪裁：仅当用例 input_len 真正逼近上下文上限时才收缩 input_len
+        if input_len >= max_model_len - 512:
             input_len = max(128, int(max_model_len * 0.40))
 
-        # 计算该模型当前 input_len 下安全输出上限，并对用例做去重处理
-        safe_output_limit = max(64, int(max_model_len * 0.80 - input_len))
+        # 尊重显式配置的输出长度：仅当 input+output 真正超过上下文时才截断，
+        # 仅预留少量余量(512 tokens)给停止符/结束符，不再强制保留 20% 余量
+        # （避免外部 API / 大上下文模型的长输出被无谓砍短）
+        safe_output_limit = max(64, max_model_len - input_len - 512)
         output_lens = sorted(list(set(min(out_l, safe_output_limit) for out_l in output_lens if out_l > 0)))
         if not output_lens:
             output_lens = [safe_output_limit]
@@ -2532,11 +2547,20 @@ _running_evalscope_procs: dict[int, subprocess.Popen] = {}
 
 
 def stop_task_containers(task):
-    """强行清理该任务占用的 Docker 测试容器与关联的 evalscope 后台进程，彻底释放 GPU 显存与系统资源"""
+    """强行清理该任务占用的 Docker 测试容器与关联的 evalscope 后台进程，彻底释放 GPU 显存与系统资源。
+
+    仅当任务确实在平台下发过容器（有目标设备且存在非空 docker 命令的 model_run）时才执行容器清理；
+    纯外部 API 接入的任务无平台容器，跳过容器清理，避免后端本机被 docker rm / fuser -k / 清页缓存误伤
+    （该类任务仍会清理其关联的 evalscope 后台进程）。
+    """
     try:
         device = task.device if task else None
-        runner = RemoteRunner(device)
-        _stop_container(runner)
+        managed_any = bool(device) and any(
+            (mr.docker_command or "").strip() for mr in (task.model_runs or [])
+        )
+        if managed_any:
+            runner = RemoteRunner(device)
+            _stop_container(runner)
     except Exception:
         pass
     try:

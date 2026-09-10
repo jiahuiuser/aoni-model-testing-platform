@@ -313,8 +313,30 @@ def api_get_report(
     dev_name = mr.device_name or (dev.name if dev else "NVIDIA AGX Thor (本机)")
     gpu_spec = (dev.gpu_info if dev and dev.gpu_info else "NVIDIA AGX Thor (Blackwell Tensor Cores / 64GB Unified)")
 
-    docker_cmd = mr.docker_command or "vllm serve --port 8300 --max-model-len 4096 --gpu-memory-utilization 0.85"
-    engine_params = parse_docker_env_params(docker_cmd)
+    # 外部 API 接入模型：不虚构本机容器/Jetson 的引擎、GPU、CPU、内存与上下文长度，
+    # 改为如实展示接入地址、远端模型标识与真实接入信息（引擎/上下文尽量探测真值）
+    try:
+        _mi_ext = db.query(ModelInfo).filter_by(slug=mr.model_slug).first()
+    except Exception:
+        _mi_ext = None
+    is_ext = bool(_mi_ext and (_mi_ext.is_external or _mi_ext.api_base)) or not (mr.docker_command or "").strip()
+
+    docker_cmd = mr.docker_command or ""
+    engine_params = parse_docker_env_params(docker_cmd or "vllm serve --port 8300 --max-model-len 4096 --gpu-memory-utilization 0.85")
+
+    if is_ext:
+        ext_api_base = (_mi_ext.api_base if _mi_ext and _mi_ext.api_base else "").strip()
+        ext_probe = _probe_external_api(ext_api_base, (_mi_ext.api_key if _mi_ext else "EMPTY"), (_mi_ext.model_endpoint_name if _mi_ext else ""))
+        ext_served = ext_probe.get("served_model_name") or (_mi_ext.model_endpoint_name if _mi_ext else "") or ""
+        ext_max_len = ext_probe.get("max_model_len") or (_mi_ext.max_model_len if _mi_ext else None)
+        # JSON 报告：外部 API 用真实接入信息，不显示本机 Jetson 假值
+        dev_name = "外部 API 接入"
+        gpu_spec = "外部 API（远端服务，硬件由服务端提供）"
+        docker_cmd = docker_cmd or f"外部 API 接入 ({ext_api_base or '未配置 api_base'})"
+        returned_max_len = f"{ext_max_len} tokens" if ext_max_len else ("外部 API（未知，由服务端提供）" if not ext_api_base else "外部 API（未知，由服务端提供）")
+    else:
+        dev_name = mr.device_name or (dev.name if dev else "NVIDIA AGX Thor (本机)")
+        returned_max_len = engine_params["max_model_len"]
 
     return {
         "id": mr.id,
@@ -328,13 +350,16 @@ def api_get_report(
         "size_category": mr.size_category or "small_medium",
         "status": (mr.status.value if hasattr(mr.status, "value") else str(mr.status or "unknown")),
         "device_name": dev_name,
-        "device_host": dev.host if dev else "127.0.0.1",
+        "device_host": (dev.host if dev else "127.0.0.1") if not is_ext else (ext_api_base or "外部 API"),
         "gpu_info": gpu_spec,
-        "cpu_cores": dev.cpu_cores if (dev and dev.cpu_cores) else 12,
-        "memory_gb": dev.memory_gb if (dev and dev.memory_gb) else 64.0,
+        "cpu_cores": (dev.cpu_cores if (dev and dev.cpu_cores) else 12) if not is_ext else None,
+        "memory_gb": (dev.memory_gb if (dev and dev.memory_gb) else 64.0) if not is_ext else None,
+        "is_external": is_ext,
+        "api_base": (_mi_ext.api_base if _mi_ext else None),
+        "served_model_name": ext_served if is_ext else None,
         "docker_command": docker_cmd,
-        "max_model_len": engine_params["max_model_len"],
-        "gpu_memory_utilization": engine_params["gpu_memory_utilization"],
+        "max_model_len": returned_max_len,
+        "gpu_memory_utilization": engine_params["gpu_memory_utilization"] if not is_ext else "外部 API（远端，未知）",
         "gpu_layers": engine_params["gpu_layers"],
         "started_at": mr.started_at.isoformat() if mr.started_at else None,
         "completed_at": mr.completed_at.isoformat() if mr.completed_at else None,
@@ -754,6 +779,8 @@ def api_download_report(
         ext_engine = ext_probe.get("engine")
         ext_engine_ver = ext_probe.get("engine_version")
         ext_max_len = ext_probe.get("max_model_len")
+        # 外部 API：摘要/结论等处不再引用本机 Jetson 设备名
+        dev_name = "外部 API 接入"
 
     if d_info["engine"] == "llama_cpp" and not _is_ext:
         _bench_tool = "llama.cpp 推理引擎（HTTP OpenAI 兼容压测）"
@@ -1575,8 +1602,13 @@ def api_download_report(
     lines.append("")
     
     # ---- 结论整体尽可能基于真实数据；数据不足时如实声明，不做臆断 ----
-    max_len_val = d_info.get("max_model_len", "40960 tokens")
-    gpu_util_val = d_info.get("gpu_memory_utilization", "80.0%")
+    if _is_ext:
+        # 外部 API：不引用 docker 命令解析出的假 max_model_len / 显存配置值
+        max_len_val = f"{ext_max_len} tokens" if ext_max_len else "由服务端提供（未知）"
+        gpu_util_val = "外部 API 接入（远端，由服务端提供）"
+    else:
+        max_len_val = d_info.get("max_model_len", "40960 tokens")
+        gpu_util_val = d_info.get("gpu_memory_utilization", "80.0%")
     max_c = max(concurrencies, default=4)
     n = 1
 
@@ -1591,10 +1623,16 @@ def api_download_report(
             f"本次评测未获取到有效性能数据（完成率 {pass_rate}），因此**不对吞吐/延迟作出结论**。{reliability_clause}，建议定位压测失败原因后复测。"
         )
         n += 1
-        lines.append(
-            f"{n}. **配置记录**：已登记部署参数 `--max-model-len` 为 `{max_len_val}`，显存分配方式为 `{gpu_util_val}`。"
-            "由于缺乏有效性能样本，暂不输出 Prefill/并发调度等基于实测的优化结论。"
-        )
+        if _is_ext:
+            lines.append(
+                f"{n}. **配置记录**：通过**外部 API 接入**（`{ext_api_base or '未配置 api_base'}`），远程模型标识 `{ext_served_name or '未知'}`，"
+                f"上下文长度 `{max_len_val}`；远端引擎/显存由服务端提供。"
+            )
+        else:
+            lines.append(
+                f"{n}. **配置记录**：已登记部署参数 `--max-model-len` 为 `{max_len_val}`，显存分配方式为 `{gpu_util_val}`。"
+            )
+        lines.append("由于缺乏有效性能样本，暂不输出 Prefill/并发调度等基于实测的优化结论。")
         n += 1
     else:
         spec_clause = "基于标准 KV Cache 预分配模式"
@@ -1614,7 +1652,7 @@ def api_download_report(
                 elif _k == "lo":
                     _c_briefs.append(f"「长输出」推荐 `Input={_r.input_len}/Output={_r.output_len}/C={_r.concurrency}`（吞吐 {_r.throughput_tok_s:.1f} tok/s）")
             lines.append(
-                f"{n}. **场景化选型结论**：在 `{dev_name}` 算力节点上，`{mr.model_name}`（{spec_clause}）评测完成率 {pass_rate}，{reliability_clause}。"
+                f"{n}. **场景化选型结论**：在 `{dev_name}`{'服务器' if _is_ext else '算力节点'}上，`{mr.model_name}`（{spec_clause}）评测完成率 {pass_rate}，{reliability_clause}。"
                 f"针对不同业务场景推荐最佳配置：{'；'.join(_c_briefs)}。"
                 + (f"可作为参考的多路聚合峰值吞吐约 {max_tput:.1f} tok/s（{_conc_clause.rstrip('。')}）。" if _conc_clause else "")
             )
@@ -1624,12 +1662,15 @@ def api_download_report(
                 throughput_clause = f"实测峰值输出吞吐达 **{max_tput:.2f} tok/s**，"
             else:
                 throughput_clause = ""
+            perf_config_clause = (
+                f"接入上下文长度 `{max_len_val}`，引擎/显存由服务端提供。" if _is_ext
+                else f"当前配置 `--max-model-len` 为 `{max_len_val}`，显存分配方式为 `{gpu_util_val}`。"
+            )
             lines.append(
-                f"{n}. **整体部署与吞吐表现**：在 `{dev_name}` 算力节点上，模型 `{mr.model_name}` {spec_clause} 运行。"
+                f"{n}. **整体部署与吞吐表现**：在 `{dev_name}` 服务上，模型 `{mr.model_name}` {spec_clause} 运行。"
                 f"{throughput_clause}"
                 + (f"{_conc_clause} " if _conc_clause else "")
-                + f"最佳首字延迟控制在 **{min_ttft:.2f} ms**。当前配置 `--max-model-len` 为 `{max_len_val}`，"
-                f"显存分配方式为 `{gpu_util_val}`。{reliability_clause}。"
+                + f"最佳首字延迟控制在 **{min_ttft:.2f} ms**。{perf_config_clause}{reliability_clause}。"
                 + ("因此本次结论**仅供参考，不作为最终选型依据**。" if completion_ratio < 0.9 else "")
             )
             n += 1
