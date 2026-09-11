@@ -974,7 +974,9 @@ def api_download_report(
     lines.append("| 项目 | 内容 |")
     lines.append("|------|------|")
     lines.append(f"| 被测模型 | `{mr.model_name}`（Slug: `{mr.model_slug}`，架构: {arch_desc}，量化: {quant_desc}） |")
-    if is_llama:
+    if _is_ext:
+        lines.append(f"| 服务框架 | 外部 API 接入（服务框架为 `{ext_engine or '未知（由服务端提供）'}`） |")
+    elif is_llama:
         lines.append("| 服务框架 | llama.cpp（`llama-server`，OpenAI 兼容 API） |")
     else:
         lines.append("| 服务框架 | vLLM（`vllm serve`，OpenAI 兼容 API） |")
@@ -1062,7 +1064,18 @@ def api_download_report(
             f"> 注：以上为实测执行过的性能用例组合。每组合以 `{_bench_tool}` 执行；压测方式：{_req_mode}。"
         )
         lines.append("")
-        if not is_llama:
+        if _is_ext:
+            # 外部 API：无本地容器、不跑本机 vllm bench；压测由平台用自定义 HTTP(aiohttp) 异步流式打外部端点
+            lines.append("**压测方式示意**（外部 API 接入，平台通过 OpenAI 兼容接口以 `aiohttp` 异步流式并发压测）：")
+            lines.append("")
+            lines.append("```text")
+            lines.append(f"平台自定义 HTTP 压测  →  {ext_api_base or '外部 API 接入地址'}")
+            lines.append("OpenAI 兼容 POST /chat/completions（stream=true）")
+            lines.append("并发: aiohttp 连接池并发发送 · 随机固定 input/output 长度 Prompt")
+            lines.append("指标: Out Tok/s · Req/s · TTFT(mean/p99) · TPOT(mean/p99) · ITL(mean/p99)")
+            lines.append("```")
+            lines.append("")
+        elif not is_llama:
             lines.append("**压测命令示意**（以 输入=512/输出=256/并发=8 组合为例，其余组合仅替换对应参数）：")
             lines.append("")
             lines.append("```bash")
@@ -1129,7 +1142,9 @@ def api_download_report(
     _n2 += 1
     lines.append(f"### 2.{_n2} 测试方法说明")
     lines.append("")
-    if is_llama:
+    if _is_ext:
+        lines.append("- **部署与压测工具**：外部 API 接入（`{0}`），平台通过其 OpenAI 兼容 `/v1/chat/completions` 对接；未在本地容器部署，压测由平台以 `aiohttp` 异步流式并发发送固定 input/output 长度的随机 Prompt，测量各并发档位下的吞吐与延迟。".format(ext_api_base or "外部 API 接入地址"))
+    elif is_llama:
         lines.append("- **部署与压测工具**：使用 llama.cpp（`llama-server` OpenAI 兼容 API）加载 GGUF 权重；通过 OpenAI 兼容 `/v1/chat/completions` 并发发送固定 input/output 长度的随机 Prompt，测量各并发档位下的吞吐与延迟。")
     else:
         lines.append(f"- **部署与压测工具**：使用 vLLM（`vllm serve`）提供 OpenAI 兼容服务；{_req_mode}，测量各并发档位下的吞吐与延迟。")
@@ -1344,30 +1359,33 @@ def api_download_report(
     else:
         _skip_env_sections = False
         lines.append("### 5.1 软件栈版本（容器内）")
-    lines.append("")
-    lines.append("| 组件 | 版本 |")
-    lines.append("|------|------|")
-    def _ver_clean(v):
-        """去掉 git commit / CUDA build 后缀这类碎片，只保留语义版本（如 0.26.1rc1.dev403 / 2.13.0）。"""
-        if not v:
-            return v
-        return str(v).split("+", 1)[0].strip()
-    vllm_ver = _ver_clean(iv["vllm"] or env_probe.get("vllm_version") or (f"Nightly（以镜像 {d_info['image_tag']} 为准）" if d_info.get('image_tag') else "-"))
-    py_ver = _ver_clean(iv["python"] or env_probe.get("python_version") or "-")
-    torch_ver = _ver_clean(iv["torch"] or env_probe.get("torch_version") or "-")
-    cuda_ver = _ver_clean(iv["cuda"] or env_probe.get("cuda_version") or "-")
-    if is_llama:
-        lines.append(f"| llama.cpp | `{iv['llama'] or ('以镜像 ' + str(d_info.get('image_tag', '')) + ' 为准')}` |")
-    else:
-        lines.append(f"| vLLM | `{vllm_ver}` |")
-    lines.append(f"| 容器镜像 | `{d_info['image_repo']}:{d_info['image_tag']}` |")
-    lines.append(f"| Python | `{py_ver}` |")
-    lines.append(f"| PyTorch | `{torch_ver}` |")
-    if cuda_ver != "-":
-        lines.append(f"| CUDA（容器） | `CUDA {cuda_ver}` |")
-    lines.append("")
-    lines.append("> 说明：上表 vLLM/llama.cpp、Python、PyTorch、CUDA 版本为从**对应部署镜像**（见『容器镜像』行）读取/采集的运行时版本快照。")
-    lines.append("")
+    if not _skip_env_sections:
+        # 容器软件栈版本（vLLM/llama.cpp、镜像、Python/PyTorch/CUDA）：仅容器部署模型输出，
+        # 外部 API 接入无本地容器/镜像，不输出（避免把本地部署镜像版本、CUDA 当外部服务环境泄漏给客户）。
+        lines.append("")
+        lines.append("| 组件 | 版本 |")
+        lines.append("|------|------|")
+        def _ver_clean(v):
+            """去掉 git commit / CUDA build 后缀这类碎片，只保留语义版本（如 0.26.1rc1.dev403 / 2.13.0）。"""
+            if not v:
+                return v
+            return str(v).split("+", 1)[0].strip()
+        vllm_ver = _ver_clean(iv["vllm"] or env_probe.get("vllm_version") or (f"Nightly（以镜像 {d_info['image_tag']} 为准）" if d_info.get('image_tag') else "-"))
+        py_ver = _ver_clean(iv["python"] or env_probe.get("python_version") or "-")
+        torch_ver = _ver_clean(iv["torch"] or env_probe.get("torch_version") or "-")
+        cuda_ver = _ver_clean(iv["cuda"] or env_probe.get("cuda_version") or "-")
+        if is_llama:
+            lines.append(f"| llama.cpp | `{iv['llama'] or ('以镜像 ' + str(d_info.get('image_tag', '')) + ' 为准')}` |")
+        else:
+            lines.append(f"| vLLM | `{vllm_ver}` |")
+        lines.append(f"| 容器镜像 | `{d_info['image_repo']}:{d_info['image_tag']}` |")
+        lines.append(f"| Python | `{py_ver}` |")
+        lines.append(f"| PyTorch | `{torch_ver}` |")
+        if cuda_ver != "-":
+            lines.append(f"| CUDA（容器） | `CUDA {cuda_ver}` |")
+        lines.append("")
+        lines.append("> 说明：上表 vLLM/llama.cpp、Python、PyTorch、CUDA 版本为从**对应部署镜像**（见『容器镜像』行）读取/采集的运行时版本快照。")
+        lines.append("")
     if not _skip_env_sections:
         lines.append("### 5.2 宿主机系统环境")
         lines.append("")
@@ -1429,6 +1447,9 @@ def api_download_report(
                 lines.append(f"实际加载权重文件：`{d_info['llama_model_file']}`")
         except Exception:
             lines.append("本地权重已就绪（详见容器命令 `--model /models/<MODEL_NAME>`）。")
+    elif _is_ext:
+        # 外部 API 接入：模型位于远端服务，无本地权重、无容器，不虚构文件清单/TOS 拉取过程
+        lines.append("*该模型通过外部 API 接入（`{0}`），远端由服务端托管，平台无本地权重，无容器加载过程。*".format(ext_api_base or "外部 API 接入地址"))
     else:
         # 本地既无对应模型目录，也未找到物理权重文件时，如实说明（不虚构文件清单）
         lines.append("*未在本地检测到该模型的权重目录。*")
