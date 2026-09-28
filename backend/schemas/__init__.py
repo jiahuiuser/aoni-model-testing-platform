@@ -24,6 +24,8 @@ class ModelInfoOut(BaseModel):
 
 class PerfRoundConfig(BaseModel):
     input_len: int = 512
+    # 输入 Token 多值（逗号分隔），与输出/并发做笛卡尔积；为空时回退单值 input_len（兼容旧任务）
+    input_lens_str: Optional[str] = None
     output_lens_str: str = "128,512"
     concurrencies_str: str = ""
     num_prompts: int = 300
@@ -60,6 +62,10 @@ class TaskConfig(BaseModel):
     acc_enabled: bool = True
     acc_datasets: List[str] = ["mmlu", "ceval", "gsm8k", "arc"]
     acc_limit: Optional[int] = 200
+    acc_dataset_limits: Dict[str, Any] = Field(default_factory=dict)
+    acc_batch_size: Optional[int] = 2
+    acc_dataset_batch_size: Dict[str, Any] = Field(default_factory=dict)
+    tool_call_tests: List[str] = Field(default_factory=list)
     notify_email: Optional[str] = None
     container_port: int = 8300
     container_startup_timeout: int = 7200
@@ -92,6 +98,9 @@ class TestTemplateCreate(BaseModel):
     concurrencies: List[int] = Field(default_factory=lambda: [1, 4, 8, 16, 32])
     datasets: List[str] = Field(default_factory=lambda: ["mmlu", "ceval"])
     acc_limit: int = 200
+    acc_dataset_limits: Dict[str, Any] = Field(default_factory=dict)
+    acc_batch_size: int = 2
+    acc_dataset_batch_size: Dict[str, Any] = Field(default_factory=dict)
 
 
 class DockerImageCreate(BaseModel):

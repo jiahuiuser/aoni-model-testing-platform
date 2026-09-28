@@ -326,11 +326,17 @@ const selectedDatasets = ref([])
 
 const difficultyFilter = ref('all')
 
+// 分组维度与后端难度词表对齐：ultra = high + extreme
+const DIFFICULTY_BANDS = {
+  ultra: ['high', 'extreme'],
+  hard: ['hard'],
+  standard: ['standard'],
+}
+
 const filteredDatasets = computed(() => {
-  if (!difficultyFilter.value || difficultyFilter.value === 'all') {
-    return datasets.value
-  }
-  return datasets.value.filter(d => d.difficulty === difficultyFilter.value)
+  const band = DIFFICULTY_BANDS[difficultyFilter.value]
+  if (!band) return datasets.value
+  return datasets.value.filter(d => band.includes(d.difficulty))
 })
 
 useDragSelect(templateTableRef, templates)
@@ -498,7 +504,8 @@ const submitDownloadDataset = async () => {
     showDownloadDialog.value = false
     loadDatasets()
   } catch (err) {
-    ElMessage.error('网络下载失败')
+    const detail = err?.response?.data?.detail
+    ElMessage.error(detail || '网络下载失败')
   } finally {
     downloading.value = false
   }

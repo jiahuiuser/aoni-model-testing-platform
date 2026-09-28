@@ -74,6 +74,17 @@ DEFAULT_DATASETS = [
     {"name": "gpqa", "source": "ModelScope/GPQA_Diamond", "difficulty": "high", "category_group": "学术问答", "status": "ready", "sample_count": 198, "description": "GPQA Diamond (高阶生物/物理/化学学术问答基准)"},
     {"name": "bigcodebench", "source": "ModelScope/BigCodeBench", "difficulty": "hard", "category_group": "代码编程", "status": "ready", "sample_count": 1140, "description": "BigCodeBench 复杂工程应用与第三方库调用代码自动生成基准"},
     {"name": "longbench_pro", "source": "ModelScope/LongBench_Pro", "difficulty": "hard", "category_group": "长文本", "status": "ready", "sample_count": 1500, "description": "LongBench Pro 真实长文本上下文分析与复杂信息提炼评测 (8k-256k tokens)"},
+    {"name": "mmlu_pro", "source": "ModelScope/MMLU-Pro", "difficulty": "hard", "category_group": "通用基准", "status": "ready", "sample_count": 12032, "description": "MMLU-Pro 增强型多学科知识推理基准（10 选项、更强推理、更低猜测率）"},
+    {"name": "hle", "source": "HuggingFace/cais_hle", "difficulty": "extreme", "category_group": "高阶综合推理", "status": "ready", "sample_count": 2500, "description": "Humanity's Last Exam 跨学科超高难度推理基准（前沿模型天花板）"},
+    {"name": "hmmt25", "source": "Modelscope/evalscope_hmmt", "difficulty": "extreme", "category_group": "竞赛数学", "status": "ready", "sample_count": 30, "description": "HMMT 2025 哈佛-MIT 数学竞赛题（30 题，竞赛级符号推演）"},
+    {"name": "live_code_bench", "source": "evalscope/LiveCodeBench", "difficulty": "hard", "category_group": "代码编程", "status": "ready", "sample_count": 1055, "description": "LiveCodeBench 基于竞赛日期滚动的防污染代码生成评测（默认固定 release_v6，Docker 沙箱执行）"},
+    {"name": "humaneval_plus", "source": "evalscope/HumanEvalPlus", "difficulty": "standard", "category_group": "代码编程", "status": "ready", "sample_count": 164, "description": "HumanEval+ 增强版 Python 代码生成（在原 HumanEval 上扩充 80 倍单元测试，Docker 沙箱执行）"},
+    {"name": "mbpp_plus", "source": "evalscope/MBPPPlus", "difficulty": "standard", "category_group": "代码编程", "status": "ready", "sample_count": 378, "description": "MBPP+ 增强版 Python 入门级代码生成（扩充单元测试，Docker 沙箱执行）"},
+    {"name": "arc_agi_2", "source": "evalscope/ARC-AGI-2", "difficulty": "extreme", "category_group": "高阶综合推理", "status": "ready", "sample_count": 120, "description": "ARC-AGI-2 抽象推理与泛化能力基准（彩色网格归纳推理，前沿模型极限挑战）"},
+    {"name": "terminal_bench_v2_1", "source": "Harbor/Terminal-Bench-2.1", "difficulty": "extreme", "category_group": "Agent/工具调用", "status": "ready", "sample_count": 89, "description": "Terminal-Bench 2.1 真实终端多步任务（89 题，每样本独立 Docker 容器 + terminus-2 agent，需 x86 评测节点）"},
+    {"name": "swe_bench_verified_mini_agentic", "source": "HuggingFace/SWE-bench_Verified", "difficulty": "extreme", "category_group": "Agent/工具调用", "status": "ready", "sample_count": 50, "description": "SWE-bench Verified Mini 多轮 agentic 软件工程修复（50 题，每样本独立容器，mini-swe-agent 流程，需 x86 评测节点）"},
+    {"name": "bfcl_v4", "source": "Berkeley/BFCL-v4", "difficulty": "hard", "category_group": "Agent/工具调用", "status": "ready", "sample_count": 2000, "description": "BFCL-v4 函数调用（模拟工具）：选函数/填参数/并行/多轮/拒答（纯 API，本机运行）"},
+    {"name": "tau2_bench", "source": "Sierra/tau2-bench", "difficulty": "hard", "category_group": "Agent/工具调用", "status": "ready", "sample_count": 165, "description": "τ²-bench 工具对话（模拟工具+模拟用户+业务策略）：airline/retail 多轮任务完成与策略合规（纯 API，本机运行）"},
 ]
 
 
@@ -144,6 +155,9 @@ def create_test_template(data: TestTemplateCreate, db: Session = Depends(get_db)
         concurrencies=data.concurrencies,
         datasets=data.datasets,
         acc_limit=data.acc_limit,
+        acc_dataset_limits=data.acc_dataset_limits,
+        acc_batch_size=data.acc_batch_size,
+        acc_dataset_batch_size=data.acc_dataset_batch_size,
     )
     db.add(tpl)
     db.commit()
@@ -165,6 +179,9 @@ def update_test_template(tpl_id: int, data: TestTemplateCreate, db: Session = De
     tpl.concurrencies = data.concurrencies
     tpl.datasets = data.datasets
     tpl.acc_limit = data.acc_limit
+    tpl.acc_dataset_limits = data.acc_dataset_limits
+    tpl.acc_batch_size = data.acc_batch_size
+    tpl.acc_dataset_batch_size = data.acc_dataset_batch_size
     db.commit()
     db.refresh(tpl)
     return tpl
@@ -222,34 +239,102 @@ def list_datasets(db: Session = Depends(get_db)):
     return datasets
 
 
+# 平台数据集别名映射 (对齐 EvalScope 内置 benchmark 规范名称)
+_DS_ALIAS_MAP = {
+    "gpqa": "gpqa_diamond",
+    "math500": "math_500",
+    "longbench_pro": "longbench_v2",
+}
+
+
+def _builtin_dataset_meta(name: str) -> Optional[dict]:
+    """从内置预设 DEFAULT_DATASETS 中查找数据集权威元数据 (难度/分类/题数/描述)。"""
+    lname = name.strip().lower()
+    for d in DEFAULT_DATASETS:
+        if d["name"] == lname:
+            return d
+    return None
+
+
+def _is_dataset_supported(name: str) -> bool:
+    """判定数据集是否已被平台接入 (可评测)。
+
+    权威来源: 平台运行配置 ACC_DATASET_SPECS 或 EvalScope 基准注册表 (含别名)。
+    两处都查不到 => 平台未接入, 无法评测。
+    """
+    lname = name.strip().lower()
+    try:
+        from backend.services.executor import ACC_DATASET_SPECS
+        if lname in ACC_DATASET_SPECS:
+            return True
+    except Exception:
+        pass
+    try:
+        from evalscope.api.registry import BENCHMARK_REGISTRY
+        for cand in (lname, _DS_ALIAS_MAP.get(lname, lname)):
+            if cand in BENCHMARK_REGISTRY:
+                return True
+    except Exception:
+        # 若无法加载注册表, 退化为仅按内置预设判断, 避免误拒已支持数据集
+        return _builtin_dataset_meta(lname) is not None
+    return False
+
+
 @router.post("/datasets/download")
 def download_dataset_online(data: DatasetDownloadRequest, db: Session = Depends(get_db)):
-    """触发联网在线下载/更新指定数据集"""
+    """联网同步/登记数据集。
+
+    仅允许登记平台已接入 (ACC_DATASET_SPECS 或 EvalScope 注册表) 的数据集;
+    未接入的直接拒绝, 避免出现"可勾选但无法评测"的幽灵数据集。
+    登记时自动补全难度/分类/题数/描述, 保证前端分组归类正确。
+    """
     name = data.name.strip().lower()
+    if not name:
+        raise HTTPException(status_code=400, detail="数据集标号不能为空")
+
+    if not _is_dataset_supported(name):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"数据集 '{name}' 平台未接入（不在 ACC_DATASET_SPECS 运行配置 "
+                f"也不在 EvalScope 基准注册表中），无法评测，已拒绝登记。"
+            ),
+        )
+
+    meta = _builtin_dataset_meta(name) or {}
     ds = db.query(DatasetInfo).filter(DatasetInfo.name == name).first()
     if not ds:
         ds = DatasetInfo(
             name=name,
-            source=data.source,
+            source=data.source or meta.get("source", "ModelScope/EvalScope"),
+            difficulty=meta.get("difficulty", "standard"),
+            category_group=meta.get("category_group", "通用基准"),
             status="downloading",
             download_progress=10.0,
-            description=f"在线下载自 {data.source} 的新评测数据集",
+            sample_count=meta.get("sample_count", 0),
+            description=meta.get("description", f"在线同步自 {data.source} 的评测数据集"),
         )
         db.add(ds)
     else:
         ds.status = "downloading"
         ds.download_progress = 10.0
-        ds.source = data.source
+        ds.source = data.source or meta.get("source", ds.source)
+        # 补齐缺失/占位元数据, 保证分组与展示正确
+        if meta:
+            ds.difficulty = meta.get("difficulty", ds.difficulty)
+            ds.category_group = meta.get("category_group", ds.category_group)
+            if not ds.sample_count:
+                ds.sample_count = meta.get("sample_count", 0)
+            if not ds.description or ds.description.startswith("在线下载自"):
+                ds.description = meta.get("description", ds.description)
     db.commit()
 
     # 模拟后台同步完成
     ds.status = "ready"
     ds.download_progress = 100.0
-    if ds.sample_count == 0:
-        ds.sample_count = 1500
     db.commit()
 
-    return {"message": f"数据集 {name} 已联网下载并加载就绪", "dataset": ds}
+    return {"message": f"数据集 {name} 已同步并加载就绪", "dataset": ds}
 
 
 DATASET_CONFIGS = {

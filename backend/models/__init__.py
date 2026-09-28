@@ -38,6 +38,8 @@ class ModelInfo(Base):
     service_port = Column(Integer, nullable=True, comment="推理服务端口（缺省用平台默认 8400/8300）")
     ext_env_desc = Column(Text, nullable=True, comment="外部 API 接入的环境/引擎说明（由用户填写，报告中优先展示）")
     max_model_len = Column(Integer, nullable=True, comment="模型最大上下文长度 tokens（外部 API 接入必填，用于正确裁剪压测输入/输出；容器部署缺省从 docker 命令 --max-model-len 解析）")
+    online_status = Column(String(20), default="unknown", comment="在线探测状态 unknown/online/offline")
+    last_checked_at = Column(DateTime, nullable=True, comment="最近一次在线探测时间")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     image_ref = relationship("DockerImage", foreign_keys=[image_id])
@@ -371,6 +373,9 @@ class TestTemplate(Base):
     concurrencies = Column(JSON, default=list, comment="并发数梯度数组，如 [1, 4, 8, 16, 32]")
     datasets = Column(JSON, default=list, comment="测试数据集，如 ['mmlu', 'ceval']")
     acc_limit = Column(Integer, default=200)
+    acc_dataset_limits = Column(JSON, default=dict, comment="数据集级抽样上限覆盖，如 {'mmlu_pro': 200, 'terminal_bench_v2_1': 10}；0 表示全量")
+    acc_batch_size = Column(Integer, default=2, comment="准确率评测默认并发数（每个数据集可单独覆盖）")
+    acc_dataset_batch_size = Column(JSON, default=dict, comment="数据集级并发覆盖，如 {'terminal_bench_v2_1': 1}")
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
 
@@ -478,3 +483,14 @@ class TaskLog(Base):
     created_at = Column(DateTime, default=datetime.datetime.utcnow)
 
     task = relationship("Task", back_populates="logs")
+
+
+# ---------- 平台级公共设置 (key/value) ----------
+
+class PlatformSetting(Base):
+    """平台级公共设置，如评测执行节点 IP。"""
+    __tablename__ = "platform_settings"
+
+    key = Column(String(100), primary_key=True)
+    value = Column(Text, nullable=True)
+    updated_at = Column(DateTime, default=datetime.datetime.utcnow, onupdate=datetime.datetime.utcnow)

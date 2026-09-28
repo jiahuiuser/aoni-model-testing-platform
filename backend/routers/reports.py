@@ -1012,9 +1012,27 @@ def api_download_report(
     for _rd in _rd_source:
         try:
             _npv = int(_rd.get("num_prompts") or 0)
-            _c_in = int(_rd.get("input_len") or 0)
-            if _npv and _c_in:
-                _cfg_rounds.append((_c_in, _npv))
+            # 输入 Token 可能为逗号多值（新任务），回退单值 input_len（旧任务）
+            _raw_ins = _rd.get("input_lens_str")
+            _c_ins = []
+            if _raw_ins:
+                for _tok in str(_raw_ins).split(","):
+                    _tok = _tok.strip()
+                    if not _tok:
+                        continue
+                    try:
+                        _c_ins.append(int(float(_tok)))
+                    except (ValueError, TypeError):
+                        continue
+            if not _c_ins:
+                try:
+                    _c_ins = [int(_rd.get("input_len") or 0)]
+                except (ValueError, TypeError):
+                    _c_ins = []
+            if _npv:
+                for _c_in in _c_ins:
+                    if _c_in:
+                        _cfg_rounds.append((_c_in, _npv))
             for _ol in (_rd.get("output_lens_str") or "").split(","):
                 _ol_s = _ol.strip()
                 if _npv and _ol_s.isdigit():

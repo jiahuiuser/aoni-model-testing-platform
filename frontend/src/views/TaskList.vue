@@ -153,7 +153,7 @@
           </el-descriptions-item>
           <el-descriptions-item label="并发与 Token 轮次设置">
             <div v-for="(rd, idx) in (currentConfigTask.config?.perf_rounds_config || [])" :key="idx" class="round-detail-item">
-              <span>输入长度: <b>{{ rd.input_len }}</b> tokens</span> |
+              <span>输入长度: <b>{{ rd.input_lens_str || rd.input_len }}</b> tokens</span> |
               <span>输出场景: <b>{{ rd.output_lens_str }}</b> (短/长文本)</span> |
               <span>并发梯度: <b>{{ rd.concurrencies_str || '自动阶梯并发' }}</b></span> |
               <span>单轮请求数: <b>{{ rd.num_prompts || 100 }}</b></span>

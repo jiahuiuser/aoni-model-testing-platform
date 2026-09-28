@@ -225,6 +225,8 @@ def _model_to_dict(m: ModelInfo, device_id: int | None = None) -> dict:
         "model_endpoint_name": m.model_endpoint_name or "",
         "ext_env_desc": m.ext_env_desc or "",
         "max_model_len": m.max_model_len,
+        "online_status": getattr(m, "online_status", None) or "unknown",
+        "last_checked_at": m.last_checked_at.isoformat() if getattr(m, "last_checked_at", None) else None,
         "image_id": m.image_id,
         "image_tag": m.image_ref.image_tag if getattr(m, "image_ref", None) else None,
         "image_name": m.image_ref.name if getattr(m, "image_ref", None) else None,
@@ -264,6 +266,88 @@ def _load_model_with_configs(db: Session, slug: str) -> ModelInfo | None:
         .options(joinedload(ModelInfo.device_configs).joinedload(ModelDeviceConfig.device))
         .where(ModelInfo.slug == slug)
     ).unique().scalar_one_or_none()
+
+
+# ============================================================
+#  模型在线状态探测
+# ============================================================
+
+def _probe_online_impl(api_base: str, api_key: str, timeout: float = 5.0) -> dict:
+    """对 OpenAI 兼容端点做轻量在线探测，返回 {status, message, latency_ms}。"""
+    import requests
+    raw_url = (api_base or "").strip().rstrip("/")
+    if not raw_url:
+        return {"status": "offline", "message": "未配置 API Base", "latency_ms": None}
+    headers = {}
+    if api_key and api_key != "EMPTY":
+        headers["Authorization"] = f"Bearer {api_key}"
+    if raw_url.endswith("/v1"):
+        candidates = [f"{raw_url}/models", f"{raw_url}/health", raw_url[:-3] + "/health"]
+    else:
+        candidates = [f"{raw_url}/v1/models", f"{raw_url}/models", f"{raw_url}/v1/health", f"{raw_url}/health"]
+    last_error = None
+    for url in candidates:
+        try:
+            t0 = time.time()
+            r = requests.get(url, headers=headers, timeout=timeout)
+            latency_ms = round((time.time() - t0) * 1000, 1)
+            if r.status_code == 200:
+                return {"status": "online", "message": f"在线 (HTTP 200, {latency_ms}ms)", "latency_ms": latency_ms}
+            if r.status_code in (401, 403):
+                return {"status": "offline", "message": f"端点可达但鉴权失败 (HTTP {r.status_code})", "latency_ms": latency_ms}
+            last_error = f"HTTP {r.status_code}"
+        except Exception as e:
+            last_error = str(e)
+    return {"status": "offline", "message": f"不可达: {last_error or '连接超时'}", "latency_ms": None}
+
+
+def _check_model_online(db: Session, m: ModelInfo) -> dict:
+    """探测单个模型在线状态并持久化。外部 API 走端点探测；容器模型按关联/在线设备判定。"""
+    if m.is_external or m.api_base:
+        res = _probe_online_impl(m.api_base or "", m.api_key or "EMPTY")
+    else:
+        dev = None
+        for dc in m.device_configs:
+            if dc.device is not None:
+                dev = dc.device
+                if dc.device.status == "online":
+                    break
+        if dev is None:
+            dev = db.execute(select(Device).where(Device.status == "online")).scalars().first()
+        if dev is not None and dev.status == "online":
+            res = {"status": "online", "message": f"目标设备在线 ({dev.name or dev.host})", "latency_ms": None}
+        else:
+            res = {"status": "offline", "message": "未找到在线目标设备", "latency_ms": None}
+    m.online_status = res["status"]
+    m.last_checked_at = datetime.utcnow()
+    db.commit()
+    return {"slug": m.slug, **res, "checked_at": m.last_checked_at.isoformat()}
+
+
+class CheckOnlineRequest(BaseModel):
+    slugs: list[str] = []
+
+
+@router.post("/check-online")
+def api_check_online(data: CheckOnlineRequest, db: Session = Depends(get_db)):
+    """批量探测模型在线状态并写库（供创建任务前校验/模型列表批量检测）。"""
+    results = []
+    for slug in (data.slugs or []):
+        m = _load_model_with_configs(db, slug)
+        if not m:
+            results.append({"slug": slug, "status": "unknown", "message": "模型不存在", "latency_ms": None})
+            continue
+        results.append(_check_model_online(db, m))
+    return {"results": results}
+
+
+@router.post("/{slug}/check-online")
+def api_check_model_online(slug: str, db: Session = Depends(get_db)):
+    """探测单个模型在线状态并写库。"""
+    m = _load_model_with_configs(db, slug)
+    if not m:
+        raise HTTPException(404, "模型不存在")
+    return _check_model_online(db, m)
 
 
 # ============================================================

@@ -166,7 +166,19 @@
           <template #header>
             <div style="display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;">
               <span style="font-weight:700">实时控制台日志</span>
-              <div style="display: flex; align-items: center; gap: 8px;">
+              <div style="display: flex; align-items: center; gap: 8px; flex-wrap: wrap;">
+                <template v-if="logModelOptions.length > 0">
+                  <span style="font-size: 13px; color: #606266; font-weight: 600;">模型:</span>
+                  <el-select v-model="logModelFilter" size="small" style="width: 220px;" @change="handleLogModelChange">
+                    <el-option label="全部模型 (混合时间线)" value="all" />
+                    <el-option
+                      v-for="opt in logModelOptions"
+                      :key="opt.slug"
+                      :label="opt.label"
+                      :value="opt.slug"
+                    />
+                  </el-select>
+                </template>
                 <span style="font-size: 13px; color: #606266; font-weight: 600;">日志输出档次:</span>
                 <el-radio-group v-model="logVerbosity" size="small">
                   <el-radio-button label="low">精简 (摘要级)</el-radio-button>
@@ -181,6 +193,7 @@
             <el-tab-pane label="容器" name="container" />
             <el-tab-pane label="vLLM" name="vllm" />
             <el-tab-pane label="网关测试" name="gateway" />
+            <el-tab-pane label="功能测试" name="feature" />
             <el-tab-pane label="性能测试" name="perf" />
             <el-tab-pane label="准确率测试" name="accuracy" />
           </el-tabs>
@@ -227,7 +240,7 @@
             </el-descriptions-item>
             <el-descriptions-item label="并发与场景配置">
               <div v-for="(rd, idx) in (task.config?.perf_rounds_config || [])" :key="idx" style="margin-bottom:4px">
-                <span>输入长度: <b>{{ rd.input_len }}</b> | </span>
+                <span>输入长度: <b>{{ rd.input_lens_str || rd.input_len }}</b> | </span>
                 <span>输出场景: <b>{{ rd.output_lens_str }}</b> (短/长文本) | </span>
                 <span>并发梯度: <b>{{ rd.concurrencies_str || '阶梯并发' }}</b> | </span>
                 <span>单轮请求数: <b>{{ rd.num_prompts || 100 }}</b></span>
@@ -301,6 +314,7 @@ const logContainer = ref(null)
 const mainTab = ref('execution')
 const logTab = ref('all')
 const logVerbosity = ref('medium') // 'low' | 'medium' | 'high'
+const logModelFilter = ref('all') // 'all' | model_slug
 const isUserScrolledUp = ref(false)
 
 // 容器原生 Dump 日志弹窗状态
@@ -366,8 +380,34 @@ const lastLogId = ref(0)
 let pollTimer = null
 
 const moduleLabel = (m) => {
-  const map = { container: '[容器]', vllm: '[vLLM]', perf: '[性能]', accuracy: '[准确率]', system: '[系统]' }
+  const map = { container: '[容器]', vllm: '[vLLM]', perf: '[性能]', accuracy: '[准确率]', gateway: '[网关]', feature: '[功能]', system: '[系统]' }
   return map[m] || ''
+}
+
+// 日志模型下拉选项（按模型去重，保持 model_runs 顺序）
+const logModelOptions = computed(() => {
+  const seen = new Set()
+  const opts = []
+  for (const mr of (modelRuns.value || [])) {
+    const slug = mr.model_slug
+    if (!slug || seen.has(slug)) continue
+    seen.add(slug)
+    const name = mr.model_name || ''
+    opts.push({
+      slug,
+      label: name && name.toLowerCase() !== slug.toLowerCase() ? `${name} (${slug})` : slug,
+    })
+  }
+  return opts
+})
+
+// 切换查看的模型日志：清空已加载日志与游标，重新拉取该模型的完整时间线
+const handleLogModelChange = async () => {
+  logs.value = []
+  lastLogId.value = 0
+  isUserScrolledUp.value = false
+  await pollLogs()
+  scrollToBottom(true)
 }
 
 const filteredLogs = computed(() => {
@@ -442,7 +482,18 @@ const parseDetail = (detail) => {
 
 const taskTimeSummary = computed(() => {
   if (!modelRuns.value || modelRuns.value.length === 0) return ''
-  const runningRun = modelRuns.value.find(r => r.status && r.status !== 'done')
+  // 并行执行：同任务内可能有多个模型同时运行，需要聚合展示
+  const activeRuns = modelRuns.value.filter(r => r.status && r.status !== 'done' && r.status !== 'failed')
+  if (activeRuns.length > 1) {
+    const parts = activeRuns.map(r => {
+      const d = parseDetail(r.progress_detail)
+      const pct = typeof r.progress === 'number' ? `${r.progress}%` : ''
+      const eta = d.eta ? `剩余 ${d.eta}` : (d.elapsed ? `已用 ${d.elapsed}` : '测试中')
+      return `${r.model_name} ${pct}${pct ? ' / ' : ''}${eta}`
+    })
+    return `并行运行中 (${activeRuns.length} 个模型): ${parts.join('；')}`
+  }
+  const runningRun = activeRuns[0] || modelRuns.value.find(r => r.status && r.status !== 'done')
   if (runningRun) {
     const detail = parseDetail(runningRun.progress_detail)
     if (detail.eta) {
@@ -554,7 +605,8 @@ const pollLogs = async () => {
   if (!taskId.value || taskId.value === 'undefined') return
   try {
     const afterId = lastLogId.value > 0 ? lastLogId.value : null
-    const newLogs = await apiGetTaskLogs(taskId.value, null, afterId ? 500 : 50000, afterId)
+    const modelSlug = logModelFilter.value === 'all' ? null : logModelFilter.value
+    const newLogs = await apiGetTaskLogs(taskId.value, modelSlug, afterId ? 500 : 50000, afterId)
     if (newLogs && newLogs.length > 0) {
       if (lastLogId.value > 0 && newLogs[0].id < lastLogId.value) {
         logs.value = []

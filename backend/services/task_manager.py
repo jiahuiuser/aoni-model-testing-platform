@@ -486,50 +486,113 @@ def _execute_task_pipeline(task_id: int, generation: int | None = None):
         # 修复: 按创建顺序(id)执行, 保持 config.model_slugs 的优先顺序
         # (之前按 model_idx 排序会覆盖创建时已排定的 Qwen 优先顺序, 导致 Qwen 反被排后)
         model_runs = sorted(task.model_runs, key=lambda m: m.id)
-        for model_run in model_runs:
-            try:
-                _check_pause(task_id)
-                # 代际检查: 已被新一代流水线取代（如删除后重建同 id 任务），立即退出
-                if generation is not None and is_pipeline_stale(task_id):
-                    _add_log(db, task_id, "INFO", model_run.model_slug, "检测到任务已被删除/重建，旧流水线自动退出", "system")
-                    return
-                # 断点续跑保护：如果该模型已成功完成且无失败记录，则直接跳过该模型
-                has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (model_run.stage_status or {}).values())
-                has_error_detail = any(kw in (model_run.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止"])
-                if model_run.status in (ModelStage.DONE.value, "done") and not has_failed_stage and not has_error_detail:
-                    _add_log(db, task_id, "INFO", model_run.model_slug, f"[{model_run.model_name}] 已测试成功 (断点跳过)", "system")
-                    continue
+        model_ids = [m.id for m in model_runs]
+        task_cfg = task.config or {}
 
-                _add_log(db, task_id, "INFO", model_run.model_slug,
-                         f"[{model_run.model_name}] 开始测试", "system")
-                run_model_pipeline(db, task_id, model_run, task.config,
-                                   lambda lvl, slug, msg, mod="system": _add_log(db, task_id, lvl, slug, msg, mod))
-            except InterruptedError:
-                _add_log(db, task_id, "INFO", model_run.model_slug, "任务已收到取消/中断指令，流水线终止", "system")
-                return
-            except Exception as e:
-                import traceback
-                tb = traceback.format_exc()
-                _add_log(db, task_id, "ERROR", model_run.model_slug, f"流水线异常终止: {str(e)}", "system")
-                _add_log(db, task_id, "ERROR", model_run.model_slug, f"异常堆栈: {tb[:500]}", "system")
-                # 标记为 FAILED（原来错误地标记为 DONE）
-                model_run.status = ModelStage.FAILED.value
-                model_run.stage_status["acc_testing"] = StageStatus.FAILED.value
-                model_run.progress = 100
-                model_run.progress_detail = f"流水线异常终止: {str(e)[:100]}"
-                model_run.completed_at = datetime.utcnow()
-                db.commit()
-                # 清理容器，释放 GPU/内存，保证下一个模型能正常启动
+        # 外部 API 模型之间不占用本机资源，可并行下发；
+        # 容器模型共用固定容器名与全局清理逻辑，无法共存，仍保持串行。
+        def _is_external_slug(slug: str) -> bool:
+            try:
+                from backend.models import ModelInfo
+                mi = db.query(ModelInfo).filter_by(slug=slug).first()
+                return bool(mi and (mi.is_external or mi.api_base))
+            except Exception:
+                return False
+
+        parallel_ok = len(model_ids) > 1 and all(_is_external_slug(m.model_slug) for m in model_runs)
+
+        def _run_single(mr_id: int) -> str:
+            """在独立线程/独立 session 中执行单个模型的完整流水线。"""
+            sdb = session_factory()
+            try:
+                mrun = sdb.get(ModelRun, mr_id)
+                if mrun is None:
+                    return "ok"
                 try:
-                    from backend.services.executor import _stop_container
-                    from backend.services.executor import RemoteRunner
-                    _runner = RemoteRunner(model_run.task.device if model_run.task else None)
-                    _stop_container(_runner)
-                    _add_log(db, task_id, "INFO", model_run.model_slug, "异常后容器已清理，继续下一个模型", "system")
-                except Exception as cleanup_err:
-                    _add_log(db, task_id, "WARNING", model_run.model_slug, f"容器清理失败: {cleanup_err}", "system")
+                    _check_pause(task_id)
+                    # 代际检查: 已被新一代流水线取代（如删除后重建同 id 任务），立即退出
+                    if generation is not None and is_pipeline_stale(task_id):
+                        _add_log(sdb, task_id, "INFO", mrun.model_slug, "检测到任务已被删除/重建，旧流水线自动退出", "system")
+                        return "stale"
+                    # 断点续跑保护：如果该模型已成功完成且无失败记录，则直接跳过该模型
+                    has_failed_stage = any(v in (StageStatus.FAILED.value, "failed") for v in (mrun.stage_status or {}).values())
+                    has_error_detail = any(kw in (mrun.progress_detail or "") for kw in ["跳过", "超时", "失败", "终止"])
+                    if mrun.status in (ModelStage.DONE.value, "done") and not has_failed_stage and not has_error_detail:
+                        _add_log(sdb, task_id, "INFO", mrun.model_slug, f"[{mrun.model_name}] 已测试成功 (断点跳过)", "system")
+                        return "ok"
+                    _add_log(sdb, task_id, "INFO", mrun.model_slug, f"[{mrun.model_name}] 开始测试", "system")
+                    run_model_pipeline(sdb, task_id, mrun, task_cfg,
+                                       lambda lvl, slug, msg, mod="system": _add_log(sdb, task_id, lvl, slug, msg, mod))
+                    return "ok"
+                except InterruptedError:
+                    try:
+                        sdb.rollback()
+                    except Exception:
+                        pass
+                    _add_log(sdb, task_id, "INFO", mrun.model_slug, "任务已收到取消/中断指令，流水线终止", "system")
+                    return "interrupted"
+                except Exception as e:
+                    import traceback
+                    tb = traceback.format_exc()
+                    # 先回滚被污染的会话，避免后续写库继续抛 PendingRollbackError
+                    try:
+                        sdb.rollback()
+                    except Exception:
+                        pass
+                    _add_log(sdb, task_id, "ERROR", mrun.model_slug, f"流水线异常终止: {str(e)}", "system")
+                    _add_log(sdb, task_id, "ERROR", mrun.model_slug, f"异常堆栈: {tb[:500]}", "system")
+                    # 标记为 FAILED（原来错误地标记为 DONE）
+                    try:
+                        mr2 = sdb.get(ModelRun, mr_id)
+                        if mr2 is not None:
+                            mr2.status = ModelStage.FAILED.value
+                            ss = dict(mr2.stage_status or {})
+                            ss["acc_testing"] = StageStatus.FAILED.value
+                            mr2.stage_status = ss
+                            mr2.progress = 100
+                            mr2.progress_detail = f"流水线异常终止: {str(e)[:100]}"
+                            mr2.completed_at = datetime.utcnow()
+                            sdb.commit()
+                    except Exception:
+                        try:
+                            sdb.rollback()
+                        except Exception:
+                            pass
+                    # 清理容器，释放 GPU/内存
+                    try:
+                        from backend.services.executor import _stop_container
+                        from backend.services.executor import RemoteRunner
+                        _dev = mrun.task.device if getattr(mrun, "task", None) else None
+                        _stop_container(RemoteRunner(_dev))
+                        _add_log(sdb, task_id, "INFO", mrun.model_slug, "异常后容器已清理", "system")
+                    except Exception as cleanup_err:
+                        _add_log(sdb, task_id, "WARNING", mrun.model_slug, f"容器清理失败: {cleanup_err}", "system")
+                    return "failed"
+            finally:
+                sdb.close()
+
+        interrupted = False
+        if parallel_ok:
+            from concurrent.futures import ThreadPoolExecutor
+            _add_log(db, task_id, "INFO", None,
+                     f"检测到 {len(model_ids)} 个外部 API 模型，启用并行测试", "system")
+            with ThreadPoolExecutor(max_workers=min(len(model_ids), 3)) as ex:
+                results = list(ex.map(_run_single, model_ids))
+            interrupted = any(r == "interrupted" for r in results)
+        else:
+            for mid in model_ids:
+                r = _run_single(mid)
+                if r == "interrupted":
+                    interrupted = True
+                    break
+
+        if interrupted:
+            return
 
         # 统计子模型执行结果，精准判定 Task 主任务最终状态 (防盲目覆盖 completed)
+        # 各模型在独立 session 中提交，这里需重新读取最新状态
+        db.expire_all()
+        model_runs = sorted(db.query(ModelRun).filter_by(task_id=task_id).all(), key=lambda m: m.id)
         total_runs = len(model_runs)
         failed_runs = 0
         for mr in model_runs:

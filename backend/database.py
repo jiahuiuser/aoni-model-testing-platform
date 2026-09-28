@@ -49,10 +49,24 @@ def init_db():
             "model_endpoint_name VARCHAR(255)",
             "image_id INTEGER",
             "service_port INTEGER",
+            "online_status VARCHAR(20) DEFAULT 'unknown'",
+            "last_checked_at DATETIME",
         ]:
             try:
                 from sqlalchemy import text
                 conn.execute(text(f"ALTER TABLE models ADD COLUMN {col_def}"))
+                conn.commit()
+            except Exception:
+                pass
+
+        for col_def in [
+            "acc_dataset_limits JSON",
+            "acc_batch_size INTEGER DEFAULT 2",
+            "acc_dataset_batch_size JSON",
+        ]:
+            try:
+                from sqlalchemy import text
+                conn.execute(text(f"ALTER TABLE test_templates ADD COLUMN {col_def}"))
                 conn.commit()
             except Exception:
                 pass

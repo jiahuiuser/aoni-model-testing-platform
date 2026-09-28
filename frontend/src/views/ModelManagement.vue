@@ -46,6 +46,17 @@
             </el-button>
           </div>
         </el-popover>
+
+        <!-- 批量在线检测 -->
+        <el-button
+          v-if="selectedModels.length > 0"
+          type="warning"
+          plain
+          :loading="checkingBatch"
+          @click="handleCheckOnlineBatch"
+        >
+          <el-icon><Connection /></el-icon> 检测在线 ({{ selectedModels.length }})
+        </el-button>
       </div>
 
       <div class="toolbar-right">
@@ -144,6 +155,19 @@
         </template>
       </el-table-column>
 
+      <el-table-column label="在线状态" width="110" align="center">
+        <template #default="{ row }">
+          <el-tooltip :content="onlineTooltip(row)" placement="top">
+            <el-tag
+              :type="row.online_status === 'online' ? 'success' : row.online_status === 'offline' ? 'danger' : 'info'"
+              size="small" effect="light"
+            >
+              {{ row.online_status === 'online' ? '在线' : row.online_status === 'offline' ? '离线' : '未检测' }}
+            </el-tag>
+          </el-tooltip>
+        </template>
+      </el-table-column>
+
       <el-table-column label="设备绑定情况" min-width="210">
         <template #default="{ row }">
           <div class="device-config-tags">
@@ -165,9 +189,12 @@
       </el-table-column>
 
       <!-- 快捷操作列 -->
-      <el-table-column label="操作" width="200" align="center">
+      <el-table-column label="操作" width="250" align="center">
         <template #default="{ row }">
           <div style="display:flex;gap:6px;justify-content:center;">
+            <el-button size="small" type="warning" plain :loading="checkingSlug === row.slug" @click.stop="handleCheckOnline(row)">
+              <el-icon><Connection /></el-icon> 检测
+            </el-button>
             <el-button size="small" type="success" plain @click.stop="openRunTestDialog(row)">
               <el-icon><Promotion /></el-icon> 验证
             </el-button>
@@ -993,6 +1020,55 @@ const handleTestConnection = async () => {
     ElMessage.error(e.response?.data?.detail || '无法连接到指定的 API 服务')
   } finally {
     testingConnection.value = false
+  }
+}
+
+// ---------- 模型在线状态检测 ----------
+const checkingSlug = ref('')
+const checkingBatch = ref(false)
+
+const onlineTooltip = (row) => {
+  if (row.online_status === 'online') return '端点/设备在线' + (row.last_checked_at ? `（${row.last_checked_at}）` : '')
+  if (row.online_status === 'offline') return '不可达' + (row.last_checked_at ? `（${row.last_checked_at}）` : '')
+  return '尚未检测，点击「检测」获取实时状态'
+}
+
+const applyOnlineResults = (results) => {
+  const map = {}
+  ;(results || []).forEach((r) => { map[r.slug] = r })
+  models.value = models.value.map((m) => (map[m.slug] ? { ...m, online_status: map[m.slug].status, last_checked_at: map[m.slug].checked_at || m.last_checked_at } : m))
+  return results || []
+}
+
+const handleCheckOnline = async (row) => {
+  checkingSlug.value = row.slug
+  try {
+    const res = await api.post(`/models/${row.slug}/check-online`)
+    applyOnlineResults([res.data])
+    if (res.data.status === 'online') ElMessage.success(`${row.name || row.slug}: 在线`)
+    else ElMessage.warning(`${row.name || row.slug}: ${res.data.message || '不可达'}`)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '在线检测失败')
+  } finally {
+    checkingSlug.value = ''
+  }
+}
+
+const handleCheckOnlineBatch = async () => {
+  if (!selectedModels.value.length) return
+  checkingBatch.value = true
+  try {
+    const slugs = selectedModels.value.map((m) => m.slug)
+    const res = await api.post('/models/check-online', { slugs })
+    const results = applyOnlineResults(res.data?.results)
+    const online = results.filter((r) => r.status === 'online').length
+    const offline = results.filter((r) => r.status !== 'online')
+    if (offline.length === 0) ElMessage.success(`全部在线（${online} 个）`)
+    else ElMessage.warning(`在线 ${online} 个，离线/不可达 ${offline.length} 个：${offline.map((r) => r.slug).join('、')}`)
+  } catch (e) {
+    ElMessage.error(e.response?.data?.detail || '批量在线检测失败')
+  } finally {
+    checkingBatch.value = false
   }
 }
 

@@ -844,7 +844,8 @@ def run_model_pipeline(db: Session, task_id: int, model_run: ModelRun, config: d
 
     # Stage 5: 准确率测试
     acc_datasets = config.get("acc_datasets") or []
-    is_acc_enabled = bool(config.get("acc_enabled", False)) and len(acc_datasets) > 0
+    tool_call_tests = config.get("tool_call_tests") or []
+    is_acc_enabled = bool(config.get("acc_enabled", False)) and (len(acc_datasets) > 0 or len(tool_call_tests) > 0)
     if is_acc_enabled:
         _check_stale()
         model_run.status = ModelStage.ACC_TESTING
@@ -1066,6 +1067,100 @@ def _run_feature_stage(db: Session, model_run: ModelRun, config: dict, log_callb
 #  性能测试
 # ============================================================
 
+def _clip_round_lens(raw_input_len, raw_output_lens, max_model_len):
+    """按 max_model_len 自适应裁剪单个输入及其可用输出长度列表。"""
+    eff_input = raw_input_len
+    # 动态自适应剪裁：仅当用例 input 真正逼近上下文上限时才收缩
+    if eff_input >= max_model_len - 512:
+        eff_input = max(128, int(max_model_len * 0.40))
+    # 尊重显式配置的输出长度：仅当 input+output 真正超过上下文时才截断，
+    # 仅预留少量余量(512 tokens)给停止符/结束符，不再强制保留 20% 余量
+    # （避免外部 API / 大上下文模型的长输出被无谓砍短）
+    safe_output_limit = max(64, max_model_len - eff_input - 512)
+    clipped = sorted(list(set(min(out_l, safe_output_limit) for out_l in raw_output_lens if out_l > 0)))
+    if not clipped:
+        clipped = [safe_output_limit]
+    return eff_input, clipped
+
+
+def _parse_input_lens_field(rd: dict):
+    """解析输入 Token 多值字符串；为空/非法则回退单值 input_len（旧任务兼容）。
+
+    逐个 token 解析：单个非法值（如手误）仅被忽略，不影响其余合法值。
+    """
+    raw = rd.get("input_lens_str")
+    vals = []
+    if raw:
+        for tok in str(raw).split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                vals.append(int(float(tok)))
+            except (TypeError, ValueError):
+                continue
+    if not vals:
+        try:
+            vals = [int(rd.get("input_len"))]
+        except (TypeError, ValueError):
+            vals = []
+    return sorted(list(set(v for v in vals if v > 0)))
+
+
+def _expand_perf_rounds(rounds_config, max_model_len, size_category, log_callback=None, model_slug=""):
+    """把任务配置的压测轮次展开为逐项执行列表（输入 Token 多值 × 输出长度 × 并发梯度）。
+
+    返回 (parsed_rounds, total_steps)；同一配置轮次下的多个输入共享 round_num/请求数/并发/输出。
+    """
+    parsed_rounds = []
+    total_steps = 0
+    round_idx = 0
+    for rd in rounds_config:
+        input_lens = _parse_input_lens_field(rd)
+        if not input_lens:
+            if log_callback:
+                log_callback("WARNING", model_slug,
+                             f"  ⚠ 压测轮次输入 Token 非法 ({rd.get('input_lens_str') or rd.get('input_len')!r})，跳过该轮次", "perf")
+            continue
+        try:
+            num_prompts = int(rd.get("num_prompts"))
+        except (TypeError, ValueError):
+            if log_callback:
+                log_callback("WARNING", model_slug,
+                             f"  ⚠ 压测轮次 num_prompts 非法 ({rd.get('num_prompts')!r})，跳过该轮次", "perf")
+            continue
+        output_lens_str = rd.get("output_lens_str", "128,512")
+        concurrencies_str = rd.get("concurrencies_str", "")
+
+        try:
+            output_lens = [int(x.strip()) for x in output_lens_str.split(",") if x.strip()]
+        except (ValueError, AttributeError):
+            output_lens = [128, 512]
+        if not output_lens:
+            output_lens = [128, 512]
+
+        if concurrencies_str:
+            try:
+                concurrencies = [int(x.strip()) for x in concurrencies_str.split(",") if x.strip()]
+            except ValueError:
+                concurrencies = get_concurrency_for_category(size_category)
+        else:
+            concurrencies = get_concurrency_for_category(size_category)
+
+        round_idx += 1
+        for _il in input_lens:
+            _eff_il, _clipped_out = _clip_round_lens(_il, output_lens, max_model_len)
+            parsed_rounds.append({
+                "round_num": round_idx, "input_len": _eff_il, "num_prompts": num_prompts,
+                "output_lens": _clipped_out, "concurrencies": concurrencies,
+            })
+            total_steps += len(_clipped_out) * len(concurrencies)
+
+    if total_steps == 0:
+        total_steps = 1
+    return parsed_rounds, total_steps
+
+
 def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
     # 优先从 docker 命令中解析实际端口（兼容 llama-server --port 8080 / MIM service_port 等非标端口）
     port = _resolve_service_port(db, model_run.model_slug, model_run.docker_command or '', config)
@@ -1153,59 +1248,12 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
             use_fallback = False
 
     # 预先计算并解析总压测项数（跳过未填写完整的/非法的轮次，避免脏数据导致流水线崩溃）
-    parsed_rounds = []
-    total_steps = 0
-    for rd in rounds_config:
-        try:
-            input_len = int(rd.get("input_len"))
-        except (TypeError, ValueError):
-            log_callback("WARNING", model_run.model_slug,
-                         f"  ⚠ 压测轮次 input_len 非法 ({rd.get('input_len')!r})，跳过该轮次", "perf")
-            continue
-        try:
-            num_prompts = int(rd.get("num_prompts"))
-        except (TypeError, ValueError):
-            log_callback("WARNING", model_run.model_slug,
-                         f"  ⚠ 压测轮次 num_prompts 非法 ({rd.get('num_prompts')!r})，跳过该轮次", "perf")
-            continue
-        output_lens_str = rd.get("output_lens_str", "128,512")
-        concurrencies_str = rd.get("concurrencies_str", "")
-
-        try:
-            output_lens = [int(x.strip()) for x in output_lens_str.split(",") if x.strip()]
-        except (ValueError, AttributeError):
-            output_lens = [128, 512]
-        if not output_lens:
-            output_lens = [128, 512]
-
-        # 动态自适应剪裁：仅当用例 input_len 真正逼近上下文上限时才收缩 input_len
-        if input_len >= max_model_len - 512:
-            input_len = max(128, int(max_model_len * 0.40))
-
-        # 尊重显式配置的输出长度：仅当 input+output 真正超过上下文时才截断，
-        # 仅预留少量余量(512 tokens)给停止符/结束符，不再强制保留 20% 余量
-        # （避免外部 API / 大上下文模型的长输出被无谓砍短）
-        safe_output_limit = max(64, max_model_len - input_len - 512)
-        output_lens = sorted(list(set(min(out_l, safe_output_limit) for out_l in output_lens if out_l > 0)))
-        if not output_lens:
-            output_lens = [safe_output_limit]
-
-        if concurrencies_str:
-            try:
-                concurrencies = [int(x.strip()) for x in concurrencies_str.split(",") if x.strip()]
-            except ValueError:
-                concurrencies = get_concurrency_for_category(model_run.size_category or "small_medium")
-        else:
-            concurrencies = get_concurrency_for_category(model_run.size_category or "small_medium")
-
-        parsed_rounds.append({
-            "input_len": input_len, "num_prompts": num_prompts,
-            "output_lens": output_lens, "concurrencies": concurrencies
-        })
-        total_steps += len(output_lens) * len(concurrencies)
-
-    if total_steps == 0:
-        total_steps = 1
+    # 输入 Token 支持逗号多值，与输出长度、并发梯度做笛卡尔积；
+    # 旧任务仅有单值 input_len，或无 input_lens_str 时自动回退，保持兼容。
+    parsed_rounds, total_steps = _expand_perf_rounds(
+        rounds_config, max_model_len, model_run.size_category or "small_medium",
+        log_callback=log_callback, model_slug=model_run.model_slug,
+    )
 
     perf_start_time = time.time()
     completed_steps = 0
@@ -1215,9 +1263,8 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
     log_callback("INFO", model_run.model_slug,
                  f"性能测试启动: 共 {total_steps} 项压测组合 | 开始时间: {datetime.now().strftime('%H:%M:%S')}", "perf")
 
-    round_num = 0
     for pr in parsed_rounds:
-        round_num += 1
+        round_num = pr["round_num"]
         input_len = pr["input_len"]
         num_prompts = pr["num_prompts"]
         output_lens = pr["output_lens"]
@@ -1257,13 +1304,13 @@ def _run_perf_stage(db: Session, model_run: ModelRun, config: dict, log_callback
                                  f"  ⚡ 原生压测指令: {bench_cmd_preview}", "perf")
                     log_callback("INFO", model_run.model_slug,
                                  f"  HTTP 连通性压测: {api_cfg['chat_url']}", "perf")
-                    result = _run_http_benchmark(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, api_cfg=api_cfg)
+                    result = _run_http_benchmark(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, api_cfg=api_cfg, log_callback=log_callback, model_slug=model_run.model_slug)
                 else:
                     result = _run_vllm_bench_single(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, log_callback)
                     if result and result.get("error") == "native_bench_unavailable":
                         log_callback("WARNING", model_run.model_slug,
                                      "  ⚠ 原生 bench 在当前容器不可用，回退到自定义 HTTP 压测", "perf")
-                        result = _run_http_benchmark(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, api_cfg=None)
+                        result = _run_http_benchmark(runner, port, concurrency, input_len, output_len, num_prompts, vllm_model_name, api_cfg=None, log_callback=log_callback, model_slug=model_run.model_slug)
 
                 completed_steps += 1
                 elapsed_sec = time.time() - perf_start_time
@@ -1539,11 +1586,17 @@ def _run_vllm_bench_single(runner: RemoteRunner, port, concurrency, input_len, o
 
 
 def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, output_len,
-                        num_prompts, model_name, api_cfg: dict = None) -> dict | None:
+                        num_prompts, model_name, api_cfg: dict = None,
+                        log_callback=None, model_slug: str = "") -> dict | None:
     """HTTP API 压测（fallback / 外部 API 端点）— aiohttp 异步并发版。
 
     参考 model-testing-tool 的异步实现：用 asyncio + Semaphore 控并发，
     逐 token 记录 TTFT / ITL，并用 usage.completion_tokens 取精确输出 token 数。
+
+    兼容推理模型：token 到达判定同时识别 content / reasoning / reasoning_content / tool_calls
+    （vLLM 官方 benchmark 亦把 reasoning 与 content 一并计入生成 token）。对只发 content
+    的普通模型行为不变；对推理模型额外记录首答案 token 延迟与 reasoning 占比（仅日志/返回，
+    不新增 DB 列）。
     """
     import asyncio
     import aiohttp
@@ -1618,7 +1671,11 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
             }
             st = time.perf_counter()
             token_ts = []
+            first_content_ts = None
             usage_tokens = 0
+            usage_reasoning_tokens = 0
+            reason_chunks = 0
+            content_chunks = 0
             try:
                 async with session.post(url, json=payload, headers=headers,
                                         timeout=client_timeout) as resp:
@@ -1640,16 +1697,33 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
                             continue
                         now = time.perf_counter()
                         if chunk.get("usage"):
-                            usage_tokens = chunk["usage"].get("completion_tokens") or 0
+                            _usage = chunk["usage"] or {}
+                            usage_tokens = _usage.get("completion_tokens") or 0
+                            _details = _usage.get("completion_tokens_details") or {}
+                            usage_reasoning_tokens = _details.get("reasoning_tokens") or 0
                         choices = chunk.get("choices") or []
                         if choices:
                             delta = choices[0].get("delta") or {}
-                            if delta.get("content"):
+                            # 兼容推理模型：content / reasoning / reasoning_content / tool_calls
+                            # 任一非空即视为一次 token 到达（每 chunk 只记一次，避免双计）。
+                            # 空字符串（如开头 role chunk）仍视为无 token，与旧行为一致。
+                            _has_content = bool(delta.get("content"))
+                            _has_reasoning = bool(delta.get("reasoning") or delta.get("reasoning_content"))
+                            _has_tool = bool(delta.get("tool_calls"))
+                            if _has_content or _has_reasoning or _has_tool:
                                 token_ts.append(now)
+                                if _has_reasoning:
+                                    reason_chunks += 1
+                                elif _has_content:
+                                    content_chunks += 1
+                                if _has_content and first_content_ts is None:
+                                    first_content_ts = now
                     if not token_ts:
                         return {"success": False, "error_msg": "未收到任何输出 token"}
                     n = len(token_ts)
                     ttft = token_ts[0] - st
+                    # 首答案 token 延迟（推理模型：首个 content token 到达；普通模型等于 ttft）
+                    ttft_answer = (first_content_ts - st) if first_content_ts is not None else None
                     latency = token_ts[-1] - st
                     # 逐 token 到达间隔 ITL
                     itl_vals = [token_ts[i] - token_ts[i - 1] for i in range(1, n)] if n > 1 else []
@@ -1657,8 +1731,10 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
                     # TPOT = (端到端 − TTFT) ÷ (输出token数 − 1)
                     tpot = ((latency - ttft) / (n - 1)) if n > 1 else 0.0
                     return {"success": True, "error_msg": "",
-                            "ttft": ttft, "itl": itl_mean, "itl_vals": itl_vals,
+                            "ttft": ttft, "ttft_answer": ttft_answer, "itl": itl_mean, "itl_vals": itl_vals,
                             "tpot": tpot,
+                            "reasoning_tokens": usage_reasoning_tokens,
+                            "reason_chunks": reason_chunks, "content_chunks": content_chunks,
                             "output_tokens": usage_tokens if usage_tokens > 0 else n}
             except Exception as err:
                 return {"success": False, "error_msg": str(err)}
@@ -1693,6 +1769,25 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
     tpots = [r["tpot"] for r in successes]
     itls = [r["itl"] for r in successes]
     total_out = sum(r.get("output_tokens", 0) for r in successes)
+    total_reasoning = sum(r.get("reasoning_tokens", 0) or 0 for r in successes)
+    total_reason_chunks = sum(r.get("reason_chunks", 0) or 0 for r in successes)
+    total_content_chunks = sum(r.get("content_chunks", 0) or 0 for r in successes)
+    _ans_ttfts = [r["ttft_answer"] for r in successes if r.get("ttft_answer") is not None]
+    mean_ttft_answer_ms = (sum(_ans_ttfts) / len(_ans_ttfts)) * 1000 if _ans_ttfts else None
+
+    # 推理模型可观测性：仅当确实出现 reasoning 时记录一次（对普通模型不打印，行为不变）
+    if log_callback and (total_reasoning > 0 or total_reason_chunks > 0):
+        if total_reasoning > 0:
+            _rdesc = f"reasoning 约 {total_reasoning} ({total_reasoning / total_out * 100:.0f}%)" if total_out else f"reasoning 约 {total_reasoning}"
+        else:
+            _tot_chunks = total_reason_chunks + total_content_chunks
+            _pct = (total_reason_chunks / _tot_chunks * 100) if _tot_chunks else 0.0
+            _rdesc = f"reasoning 段占比约 {_pct:.0f}%（服务端未返回 reasoning token 明细）"
+        _ans_msg = f"{mean_ttft_answer_ms:.0f} ms" if mean_ttft_answer_ms is not None else "未产出答案 token（输出预算被思考耗尽）"
+        log_callback("INFO", model_slug,
+                     f"  [推理模型] 本组合生成 {total_out} tokens，其中 {_rdesc}；"
+                     f"首生成 token {sum(ttfts)/len(ttfts)*1000:.0f} ms，首答案 token {_ans_msg} "
+                     f"(c={concurrency}, output={output_len})", "perf")
 
     return {
         "concurrency": concurrency,
@@ -1701,6 +1796,8 @@ def _run_http_benchmark(runner: RemoteRunner, port, concurrency, input_len, outp
         "mean_ttft_ms": (sum(ttfts) / len(ttfts)) * 1000,
         "median_ttft_ms": _pq(ttfts, 0.5) * 1000,
         "p99_ttft_ms": _pq(ttfts, 0.99) * 1000,
+        "mean_ttft_answer_ms": mean_ttft_answer_ms,
+        "reasoning_tokens": total_reasoning,
         "mean_tpot_ms": (sum(tpots) / len(tpots)) * 1000,
         "median_tpot_ms": _pq(tpots, 0.5) * 1000,
         "p99_tpot_ms": _pq(tpots, 0.99) * 1000,
@@ -1862,12 +1959,259 @@ def _log_evalscope_details(work_dir: Path, log_callback, model_slug: str):
         pass
 
 
+# 数据集级准确率特性表 (按 EvalScope 数据集名匹配)。
+# - subset_override: 固定子集。LiveCodeBench 列了 28 个相互重叠的 release，若照默认全跑会重复计数。
+# - agent: AgentAdapter 类基准，每题一个容器，需低并发 + 放宽空闲 watchdog + 透传 extra_params。
+# - sandbox: 代码类基准，需 Docker 沙箱执行，避免在宿主机直接跑模型生成代码。
+# - max_tokens: 覆盖默认生成上限 (难基准/推理模型需要更大预算)。
+ACC_DATASET_SPECS: dict = {
+    "live_code_bench": {
+        "subset_override": ["release_v6"],
+        "sandbox": True,
+        "max_tokens": 4096,
+    },
+    "humaneval_plus": {"sandbox": True, "max_tokens": 4096},
+    "mbpp_plus": {"sandbox": True, "max_tokens": 4096},
+    "terminal_bench_v2_1": {
+        "agent": True,
+        "exec": "remote",
+        "batch_size": 1,
+        "idle_timeout": 1800,
+        "max_tokens": 32768,
+        "extra_params": {
+            "environment_type": "docker",
+            "agent_name": "terminus-2",
+            "max_turns": 200,
+            "timeout_multiplier": 3.0,
+        },
+        # Qwen3.8 系推理模型：关闭 thinking，避免 reasoning 吃掉 JSON 指令预算
+        # 并提升对 terminus-2 “[analysis/plan/commands] JSON” 协议格式的遵循度
+        "gen_extra": {
+            "extra_body": {"chat_template_kwargs": {"enable_thinking": False}},
+        },
+    },
+    "swe_bench_verified_mini_agentic": {
+        "agent": True,
+        "exec": "remote",
+        "batch_size": 1,
+        "idle_timeout": 1800,
+        "max_tokens": 4096,
+        "extra_params": {
+            "build_docker_images": True,
+            "pull_remote_images_if_available": True,
+        },
+        "agent_config": {"mode": "native", "max_steps": 60, "command_timeout": 60.0},
+    },
+    # 纯 API 工具调用(模拟)，本机即可运行
+    "bfcl_v4": {
+        "batch_size": 4,
+        "max_tokens": 4096,
+        "subset_override": [
+            "simple_python", "simple_java", "simple_javascript",
+            "multiple", "parallel", "parallel_multiple", "irrelevance",
+            "live_simple", "live_multiple", "live_parallel",
+            "live_parallel_multiple", "live_irrelevance",
+            "multi_turn_base", "multi_turn_miss_func",
+            "multi_turn_miss_param", "multi_turn_long_context",
+        ],
+        "extra_params": {"is_fc_model": True, "underscore_to_dot": True},
+    },
+    "tau2_bench": {
+        "batch_size": 4,
+        "idle_timeout": 1200,
+        "max_tokens": 4096,
+        "subset_override": ["airline", "retail"],
+        "user_sim": True,
+    },
+    "hle": {"max_tokens": 8192, "judge": True, "extra_params": {"include_multi_modal": False}},
+    "arc_agi_2": {"max_tokens": 8192},
+    "hmmt25": {"max_tokens": 8192},
+}
+
+
+def _preheat_accuracy_assets(sampling_plan, log_callback, model_slug: str, workers: int = 4, task_id: int = 0):
+    """后台预热：并行预取数据集与容器镜像，减少正式评测时的等待。
+
+    尽力而为：任何子项失败都只记录日志，绝不阻塞或影响正式评测。
+    - 数据集：对注册表中带 ModelScope/HF 仓库标识的文本集调用 snapshot 下载预热。
+    - SWE-bench：先取实例清单，再并行 docker pull 对应 arm64 镜像。
+    - Terminal-Bench：镜像由 Harbor 按任务构建，这里不预拉（仅提示）。
+    """
+    import concurrent.futures as _cf
+    import threading as _threading
+    try:
+        workers = max(int(workers), 1)
+    except (TypeError, ValueError):
+        workers = 4
+
+    # 关键：后台线程写入日志必须使用独立 session，绝不能复用主流水线的 db session
+    # （SQLAlchemy Session 非线程安全，并发写同一 session 会导致 task_logs 主键冲突并污染主流水线）。
+    _log_lock = _threading.Lock()
+
+    def _plog(level: str, msg: str):
+        with _log_lock:
+            try:
+                from backend.database import session_factory
+                from backend.services.task_manager import _add_log
+                with session_factory() as sdb:
+                    _add_log(sdb, task_id, level, model_slug, msg, "accuracy")
+            except Exception:
+                pass
+
+    def _registry_dataset_id(mapped: str):
+        try:
+            from evalscope.api.registry import BENCHMARK_REGISTRY
+            m = BENCHMARK_REGISTRY.get(mapped)
+            return getattr(m, "dataset_id", None)
+        except Exception:
+            return None
+
+    def _warm_dataset(item):
+        name = item["ds"]
+        mapped = item["mapped"]
+        ds_id = _registry_dataset_id(mapped)
+        if not ds_id or str(ds_id).startswith("http"):
+            return  # 由各自框架在线获取（Harbor / HF），跳过
+        try:
+            from modelscope import snapshot_download as _ms_snap
+            _ms_snap(str(ds_id), repo_type="dataset")
+            _plog("INFO", f"  [预热] 数据集 {name} ({ds_id}) 已就绪")
+        except Exception as e:
+            _plog("WARNING", f"  [预热] 数据集 {name} 预取跳过: {str(e)[:90]}")
+
+    def _pull_swe_images(item):
+        if item["mapped"] != "swe_bench_verified_mini_agentic":
+            return
+        per = item.get("per_subset") or 0
+        n = per if per > 0 else 50
+        ids = []
+        try:
+            from modelscope import MsDataset
+            ds = MsDataset.load("evalscope/swe-bench-verified-mini", split="test")
+            ids = [r.get("instance_id") for r in ds if r.get("instance_id")][:n]
+        except Exception as e:
+            _plog("WARNING", f"  [预热] SWE 实例清单获取失败，跳过镜像预拉: {str(e)[:90]}")
+            return
+        if not ids:
+            return
+        try:
+            from evalscope.benchmarks.swe_bench.utils import get_remote_docker_image_from_id
+        except Exception:
+            return
+
+        def _pull_one(iid):
+            try:
+                img = get_remote_docker_image_from_id(iid, "swebench", "")
+                r = subprocess.run(["docker", "pull", img], capture_output=True, text=True, timeout=1800)
+                return (iid, img, r.returncode == 0)
+            except Exception:
+                return (iid, "", False)
+
+        ok = 0
+        with _cf.ThreadPoolExecutor(max_workers=min(workers, 4)) as ex:
+            for iid, img, success in ex.map(_pull_one, ids):
+                if success:
+                    ok += 1
+        _plog("INFO", f"  [预热] SWE-bench 镜像预拉完成: {ok}/{len(ids)} 成功")
+
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = []
+            for item in (sampling_plan or []):
+                futures.append(ex.submit(
+                    _pull_swe_images if item["mapped"] == "swe_bench_verified_mini_agentic" else _warm_dataset,
+                    item,
+                ))
+            for f in futures:
+                try:
+                    f.result()
+                except Exception:
+                    pass
+    except Exception as e:
+        _plog("WARNING", f"  [预热] 任务执行异常（忽略）: {str(e)[:90]}")
+
+
+def _configured_acc_datasets(config: dict) -> list:
+    """按配置顺序返回准确率评测涉及的平台数据集名（acc_datasets + tool_call_tests）。"""
+    ds_list = list(config.get("acc_datasets") or [])
+    for _t in (config.get("tool_call_tests") or []):
+        if _t not in ds_list:
+            ds_list.append(_t)
+    return ds_list
+
+
+def _finalize_acc_progress_detail(db: Session, model_run: ModelRun, config: dict, acc_start_time=None, elapsed_override=None):
+    """按数据库中已落库的 AccResult 权威重建准确率汇总文本。
+
+    断点续跑会跳过已有成绩的数据集；若汇总只统计本轮新评的数据集，就会漏掉这些数据集
+    （曾导致 "准确率测试 (5/5)" 却缺 GSM8K 的显示问题）。这里以 DB 为准重建，保证完整、顺序一致。
+    仅显示有效成绩，不写入「跳过/超时/失败/终止」等字眼（这些子串会被任务的失败判定误伤）。
+    """
+    ds_list = _configured_acc_datasets(config)
+    rows = db.query(AccResult).filter_by(model_run_id=model_run.id).all()
+    by = {}
+    for r in rows:
+        by[r.dataset.lower()] = r
+        by[r.dataset.lower().replace("_", "").replace("-", "")] = r
+
+    total = 0
+    done = 0
+    parts = []
+    seen = set()
+    for d in ds_list:
+        dl = d.lower()
+        if dl in seen:
+            continue
+        seen.add(dl)
+        r = by.get(dl) or by.get(dl.replace("_", "").replace("-", ""))
+        if r is None:
+            continue
+        total += 1
+        if r.accuracy is not None:
+            done += 1
+            parts.append(f"{d.upper()}: {r.accuracy:.2%}")
+
+    _start = acc_start_time
+    if _start is None and getattr(model_run, "started_at", None) is not None:
+        try:
+            _start = model_run.started_at.timestamp()
+        except Exception:
+            _start = None
+    if elapsed_override is not None:
+        elapsed_str = elapsed_override
+    else:
+        elapsed_str = _format_duration(time.time() - _start) if _start else ""
+
+    tail = " | ".join(parts) if parts else "暂无有效成绩"
+    model_run.progress_detail = f"准确率测试 ({done}/{total}) | 已用: {elapsed_str} | 结果: {tail}"
+    try:
+        model_run.progress = 60 + int(30 * (done / max(total, 1)))
+    except Exception:
+        pass
+
+
 def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner):
     port = _resolve_service_port(db, model_run.model_slug, model_run.docker_command or '', config)
-    datasets = config.get("acc_datasets") or []
+    datasets = list(config.get("acc_datasets") or [])
+    for _t in (config.get("tool_call_tests") or []):
+        if _t not in datasets:
+            datasets.append(_t)
     if not datasets:
         log_callback("INFO", model_run.model_slug, "未指定任何准确率评测数据集，已自动跳过准确率评测阶段", "accuracy")
         return
+
+    # 评测执行节点 (公共)：Terminal/SWE 等需 x86 容器的工具调用集在此远程节点执行
+    node_ip = ""
+    node_runner = None
+    try:
+        from backend.models import PlatformSetting
+        _row = db.get(PlatformSetting, "eval_node_ip")
+        node_ip = (_row.value or "").strip() if _row else ""
+        if node_ip:
+            from backend.routers.eval_tools import build_eval_node_runner
+            node_runner = build_eval_node_runner(node_ip)
+    except Exception as _ne:
+        log_callback("WARNING", model_run.model_slug, f"评测执行节点初始化失败: {_ne}", "accuracy")
 
     # 查验数据库中该 ModelRun 已保存且有效的 AccResult 记录（实现断点增量续跑）
     existing_accs = db.query(AccResult).filter_by(model_run_id=model_run.id).all()
@@ -1878,22 +2222,50 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             already_done_ds[r.dataset.lower().replace("_", "").replace("-", "")] = r.accuracy
 
     to_eval_datasets = []
+    resumed_ordered = []  # (数据集名, 成绩)：本轮因已有成绩而跳过，但仍需计入汇总
     for d in datasets:
         d_clean = d.lower().replace("_", "").replace("-", "")
         if d.lower() in already_done_ds or d_clean in already_done_ds:
             acc_val = already_done_ds.get(d.lower(), already_done_ds.get(d_clean))
             acc_str = f"{acc_val:.2%}" if isinstance(acc_val, float) else str(acc_val)
+            resumed_ordered.append((d.upper(), acc_val))
             log_callback("INFO", model_run.model_slug, f"  ⏩ [断点续跑] 数据集 {d.upper()} 已存在历史完成成绩 ({acc_str})，自动跳过重复测试", "accuracy")
         else:
             to_eval_datasets.append(d)
 
     if not to_eval_datasets:
         log_callback("INFO", model_run.model_slug, f"✅ 所有配置数据集 ({len(datasets)}个) 均已具备测试成绩，断点增量续跑完成！", "accuracy")
+        _finalize_acc_progress_detail(db, model_run, config)
+        db.commit()
         return
 
-    limit = config.get("acc_limit", 200)
-    if limit is None:
-        limit = 0
+    def _resolve_ds_limit(ds_name: str) -> int:
+        """数据集级抽样上限：优先 acc_dataset_limits，其次回退全局 acc_limit；0 表示全量。"""
+        m = config.get("acc_dataset_limits") or {}
+        v = m.get(ds_name)
+        if v is None:
+            v = m.get(ds_name.lower())
+        if v is None:
+            v = config.get("acc_limit", 200)
+        if v is None:
+            v = 0
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0
+
+    default_limit = config.get("acc_limit", 200)
+    if default_limit is None:
+        default_limit = 0
+
+    default_batch = config.get("acc_batch_size", 2)
+    if default_batch is None:
+        default_batch = 2
+    try:
+        default_batch = int(default_batch)
+    except (TypeError, ValueError):
+        default_batch = 2
+    batch_map = config.get("acc_dataset_batch_size") or {}
 
     acc_start_time = time.time()
     api_cfg = _get_model_api_config(db, model_run.model_slug, runner, port, model_run.model_name)
@@ -1922,18 +2294,18 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     except Exception:
         valid_registry_keys = None
 
-    normalized_datasets = []
+    normalized = []  # (平台数据集名, EvalScope 数据集名)
     for d in to_eval_datasets:
         mapped = dataset_alias_map.get(d.lower(), d.lower())
         if valid_registry_keys is not None:
             if mapped in valid_registry_keys:
-                normalized_datasets.append(mapped)
+                normalized.append((d, mapped))
             elif d.lower() in valid_registry_keys:
-                normalized_datasets.append(d.lower())
+                normalized.append((d, d.lower()))
             else:
                 log_callback("WARNING", model_run.model_slug, f"数据集 '{d}' 未在 EvalScope 基准库中注册，已自动跳过该项", "accuracy")
         else:
-            normalized_datasets.append(mapped)
+            normalized.append((d, mapped))
 
     evalscope_bin = _get_evalscope_bin()
 
@@ -1987,26 +2359,51 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
     # 按该数据集实际子集数拆算 per-subset limit，使每数据集总量 ≈ acc_limit；
     # 并过滤会超出模型上下文的超长子集 (如 longbench_v2 的 long 子集文档可达 2M token)，避免必然 400。
     sampling_plan = []
-    for d in normalized_datasets:
+    for orig, d in normalized:
+        spec = ACC_DATASET_SPECS.get(d, {})
+        ds_limit = _resolve_ds_limit(orig)
         meta = BENCHMARK_REGISTRY.get(d) if valid_registry_keys else None
         subsets = list(meta.subset_list) if (meta and getattr(meta, 'subset_list', None)) else []
-        if d == "longbench_v2" and subsets:
+        if spec.get("subset_override"):
+            subsets = list(spec["subset_override"])
+        elif d == "longbench_v2" and subsets:
             safe = [s for s in subsets if s != "long"]
             if safe:
                 subsets = safe
         num_subsets = max(len(subsets), 1)
         per_subset = 0
-        if limit > 0:
-            per_subset = (int(limit) + num_subsets - 1) // num_subsets
+        if ds_limit > 0:
+            per_subset = (int(ds_limit) + num_subsets - 1) // num_subsets
+        try:
+            batch_size = int(spec.get("batch_size") or batch_map.get(orig, batch_map.get(d, default_batch)) or default_batch)
+        except (TypeError, ValueError):
+            batch_size = default_batch
+        batch_size = max(batch_size, 1)
         sampling_plan.append({
-            "ds": d, "subsets": subsets, "num_subsets": num_subsets, "per_subset": per_subset,
+            "ds": orig, "mapped": d, "subsets": subsets, "num_subsets": num_subsets,
+            "per_subset": per_subset, "limit": ds_limit, "batch_size": batch_size,
+            "spec": spec, "exec": spec.get("exec", "local"),
         })
 
-    if limit > 0:
-        limit_desc = f"抽样模式 limit={limit}/数据集"
+    if default_limit > 0:
+        limit_desc = f"抽样模式 默认 limit={default_limit}/数据集 (可按数据集覆盖)"
     else:
         limit_desc = "全量题库不限上限评测"
     log_callback("INFO", model_run.model_slug, f"准确率评测计划 ({limit_desc})", "accuracy")
+
+    # 后台并行预热数据集与镜像（不阻塞评测；失败仅记日志）
+    if config.get("acc_preheat", True) and sampling_plan:
+        try:
+            _ph_workers = int(config.get("acc_preheat_workers", 4) or 4)
+            threading.Thread(
+                target=_preheat_accuracy_assets,
+                args=(sampling_plan, log_callback, model_run.model_slug, _ph_workers, model_run.task_id),
+                daemon=True,
+            ).start()
+            log_callback("INFO", model_run.model_slug,
+                         f"  [预热] 已在后台并行预取数据集与容器镜像（workers={_ph_workers}，不阻塞评测）", "accuracy")
+        except Exception as _pe:
+            log_callback("WARNING", model_run.model_slug, f"  [预热] 启动失败（忽略）: {_pe}", "accuracy")
 
     def _extract_acc(ds_name, metrics):
         mapped_ds = dataset_alias_map.get(ds_name.lower(), ds_name.lower())
@@ -2022,9 +2419,10 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                     return None
         return None
 
-    def _run_evalscope_one(ds_item, cur_ds_idx, total_ds, ds_work_dir):
+    def _run_evalscope_one(ds_item, cur_ds_idx, total_ds, ds_work_dir, remote_runner=None):
         """运行单数据集 evalscope (含实时监控线程)，返回 returncode"""
-        mapped = dataset_alias_map.get(ds_item["ds"].lower(), ds_item["ds"].lower())
+        mapped = ds_item["mapped"]
+        spec = ds_item.get("spec") or {}
         ds_log_file = ds_work_dir / "evalscope_stdout.log"
         with open(ds_log_file, "w") as f:
             f.write("")
@@ -2032,16 +2430,22 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
         # 按数据集自适应 max_tokens：数学/推理类(AIME/GPQA/Math/LongBench等)需要足够 token
         # 让模型推理完并输出 \boxed{}/最终答案，否则被截断后 extract 只能从残缺文本抓"最后一个
         # 数字"导致 AIME 等评分全 0；普通选择题保持较小上限以节省时间。
-        ds_lower = ds_item["ds"].lower()
+        # 难基准(HLE/ARC-AGI-2/HMMT)与 Agent 类通过 ACC_DATASET_SPECS.max_tokens 覆盖。
+        ds_lower = (ds_item["ds"] + " " + mapped).lower()
         reasoning_bytes = any(
             kw in ds_lower
             for kw in ("aime", "gpqa", "math", "olympiad", "minerva", "longbench",
-                       "bigcodebench", "humaneval", "mbpp", "code", "gsm8k", "bbh")
+                       "bigcodebench", "humaneval", "mbpp", "code", "gsm8k", "bbh",
+                       "hle", "mmlu_pro", "arc_agi", "hmmt", "musr", "zebralogic",
+                       "imo", "scicode", "livecode", "terminal", "swe_bench", "tau", "gaia", "bfcl")
         )
-        max_tokens = 4096 if reasoning_bytes else 1024
-        gen_config = json.dumps(
-            {"temperature": 0.0, "max_tokens": max_tokens, "do_sample": False, "timeout": 300}
-        )
+        max_tokens = int(spec.get("max_tokens") or (4096 if reasoning_bytes else 1024))
+        gen_dict = {"temperature": 0.0, "max_tokens": max_tokens, "do_sample": False, "timeout": 300}
+        # 数据集级生成参数覆盖/补充（如 terminus-2 需要关闭 thinking 以稳定输出 JSON 指令）
+        _gen_extra = spec.get("gen_extra")
+        if isinstance(_gen_extra, dict):
+            gen_dict.update(_gen_extra)
+        gen_config = json.dumps(gen_dict)
         log_callback("DEBUG", model_run.model_slug,
                      f"  数据集 {mapped} 生成上限 max_tokens={max_tokens}（推理类自动放宽以避免截断丢分）", "accuracy")
 
@@ -2049,18 +2453,45 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                       "--eval-type", "openai_api", "--api-url", api_url,
                       "--api-key", api_key, "--datasets", mapped,
                       "--generation-config", gen_config,
-                      "--eval-batch-size", "8",
+                      "--eval-batch-size", str(ds_item.get("batch_size", 8)),
                       "--ignore-errors",
                       "--work-dir", str(ds_work_dir)]
         if ds_item["per_subset"] > 0:
             single_cmd.extend(["--limit", str(ds_item["per_subset"])])
+        if spec.get("sandbox"):
+            # 代码类基准：在 Docker 沙箱内执行模型生成的代码，避免污染宿主机
+            single_cmd.extend(["--sandbox", json.dumps({"enabled": True, "engine": "docker"})])
+        ds_args = {}
         if ds_item["subsets"]:
-            single_cmd.extend(["--dataset-args", json.dumps({mapped: {"subset_list": ds_item["subsets"]}})])
+            ds_args["subset_list"] = ds_item["subsets"]
+        _extra = dict(spec.get("extra_params") or {})
+        if spec.get("user_sim"):
+            # τ²-bench：用被测模型自身作为"模拟用户"，保证两模型口径一致
+            _extra.update({"user_model": eval_model_name, "api_key": api_key, "api_base": api_url})
+        if _extra:
+            ds_args["extra_params"] = _extra
+        if ds_args:
+            single_cmd.extend(["--dataset-args", json.dumps({mapped: ds_args})])
+        if spec.get("judge"):
+            # HLE 等使用 LLM judge 评分：用被测模型自身作为裁判（两模型口径一致，公平可比）
+            single_cmd.extend([
+                "--judge-model-args",
+                json.dumps({"api_url": api_url, "api_key": api_key,
+                            "model_id": eval_model_name, "eval_type": "openai_api"}),
+                "--judge-worker-num", "2",
+            ])
+        if spec.get("agent_config"):
+            single_cmd.extend(["--agent-config", json.dumps(spec["agent_config"])])
 
         ds_desc = f"每子集≤{ds_item['per_subset']}×{ds_item['num_subsets']}子集" if ds_item["per_subset"] > 0 else "全量"
         log_callback("INFO", model_run.model_slug,
-                     f"  评测指令: evalscope eval --datasets {mapped} ({ds_desc}) [{cur_ds_idx+1}/{total_ds}]", "accuracy")
+                     f"  评测指令: evalscope eval --datasets {mapped} b={ds_item.get('batch_size')} "
+                     f"{'(沙箱)' if spec.get('sandbox') else ''}{'(agent)' if spec.get('agent') else ''} "
+                     f"({ds_desc}) [{cur_ds_idx+1}/{total_ds}]", "accuracy")
         log_callback("INFO", model_run.model_slug, f"  API 端点: {api_url}", "accuracy")
+
+        if remote_runner is not None and ds_item.get("exec") == "remote":
+            return _remote_exec_one(single_cmd, ds_item, ds_work_dir, remote_runner)
 
         proc = subprocess.Popen(
             single_cmd,
@@ -2188,9 +2619,10 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                     now = time.time()
                     # 暂停期间不触发抗挂机检测（SIGSTOP 冻结的进程不会产生日志）
                     from backend.services.task_manager import _pause_flags as _pf
-                    if now - last_activity_time > 600 and not _pf.get(model_run.task_id, False):
+                    _idle_timeout = int(spec.get("idle_timeout", 600) or 600)
+                    if now - last_activity_time > _idle_timeout and not _pf.get(model_run.task_id, False):
                         _mt_log("WARNING", model_run.model_slug,
-                                "  ⚠️ EvalScope 控制台超过 10 分钟未产生任何新日志，自动终止子进程以启动重试...", "accuracy")
+                                f"  ⚠️ EvalScope 控制台超过 {_idle_timeout // 60} 分钟未产生任何新日志，自动终止子进程以启动重试...", "accuracy")
                         if proc and proc.poll() is None:
                             proc.kill()
                         break
@@ -2228,11 +2660,182 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             out_text = f.read()
         return returncode, out_text
 
+    def _bootstrap_remote_eval(runner, log_callback, slug):
+        """确保评测执行节点具备运行 evalscope (+harbor/swebench/sandbox) 的环境。"""
+        marker = "$HOME/.aoni_eval_ready"
+        try:
+            chk = runner.run_shell(f"test -f {marker} && echo RDY || echo NOPE", timeout=20)
+            if "RDY" in (chk.stdout or ""):
+                return True
+        except Exception:
+            pass
+        log_callback("INFO", slug, "  [远程] 首次准备评测节点环境（安装 evalscope/harbor/swebench，耗时较长）...", "accuracy")
+        setup = (
+            "set -e; "
+            "python3 -m pip install --user --break-system-packages -q -U pip; "
+            "python3 -m pip install --user --break-system-packages -q "
+            "'evalscope==1.9.1' 'evalscope[terminal_bench]' 'evalscope[sandbox]' 'swebench==4.1.0'; "
+            "touch $HOME/.aoni_eval_ready && echo BOOTSTRAP_OK"
+        )
+        try:
+            r = runner.run_shell(setup, timeout=3000)
+            if r.returncode == 0 and "BOOTSTRAP_OK" in (r.stdout or ""):
+                log_callback("INFO", slug, "  [远程] 评测节点环境就绪", "accuracy")
+                return True
+            log_callback("WARNING", slug, f"  [远程] 环境安装可能未完成: {(r.stderr or r.stdout or '')[-300:]}", "accuracy")
+            return False
+        except Exception as e:
+            log_callback("WARNING", slug, f"  [远程] 环境安装异常: {str(e)[:200]}", "accuracy")
+            return False
+
+    def _remote_exec_one(local_cmd, ds_item, ds_work_dir, remote_runner):
+        """在评测执行节点上运行单数据集 evalscope：nohup 后台 + 轮询日志 + 拉回 report 分数。"""
+        import shlex
+        mapped = ds_item["mapped"]
+        spec = ds_item.get("spec") or {}
+        slug = model_run.model_slug
+
+        if not _bootstrap_remote_eval(remote_runner, log_callback, slug):
+            return -2, ""
+
+        # 节点 Docker 可用性检查（agent/沙箱类必需）
+        if spec.get("agent") or spec.get("sandbox"):
+            try:
+                d = remote_runner.run_shell("docker info >/dev/null 2>&1 && echo DOCKER_OK || echo NO_DOCKER", timeout=25)
+                if "DOCKER_OK" not in (d.stdout or ""):
+                    log_callback("WARNING", slug, "  [远程] 评测节点 Docker 不可用，无法运行容器类基准", "accuracy")
+                    return -3, ""
+            except Exception:
+                pass
+
+        tag = f"t{model_run.task_id}_mr{model_run.id}_{mapped}"
+        remote_base = f"$HOME/aoni_acc/{tag}"
+        remote_log_dir = "$HOME/aoni_acc/logs"
+        remote_log = f"{remote_log_dir}/{tag}.log"
+
+        # 改写命令：可执行文件指向远端 venv，work-dir 指向远端目录
+        cmd = [str(x) for x in local_cmd]
+        cmd[0] = "$HOME/.local/bin/evalscope"
+        for i, a in enumerate(cmd):
+            if a == "--work-dir" and i + 1 < len(cmd):
+                cmd[i + 1] = remote_base
+        env_keys = (
+            "NO_PROXY", "no_proxy", "HF_ENDPOINT", "DATASETS_MAX_RETRIES", "MODELSCOPE_MAX_RETRIES",
+            "HTTP_RETRIES", "REQUESTS_MAX_RETRIES", "HF_HUB_ENABLE_HF_TRANSFER",
+            "EVALSCOPE_ALLOW_CODE_EXECUTION", "EVALSCOPE_USE_SANDBOX", "BIGCODEBENCH_ALLOW_CODE_EXECUTION",
+        )
+        # 刻意不转发 *_PROXY：本机代理监听 127.0.0.1，转发到远端会被解析为远端自身的 127.0.0.1
+        # 导致连接被拒（远端节点本身可直连外网）。
+        env_pairs = [f"{k}={shlex.quote(str(eval_env[k]))}" for k in env_keys if eval_env.get(k)]
+        env_prefix = ("env " + " ".join(env_pairs)) if env_pairs else ""
+        # 注意：可执行文件与 work-dir 含 $HOME，必须保持“可被远端 shell 展开”，不能用 shlex.quote
+        # 单引号包裹（否则会变成字面量 $HOME 路径导致 env: ... 没有那个文件或目录）。
+        def _tok(a: str) -> str:
+            if a.startswith("$HOME/") or a == "$HOME":
+                return a
+            return shlex.quote(a)
+        cmd_tokens = ["$HOME/.local/bin/evalscope"] + [_tok(a) for a in cmd[1:]]
+        inner = (
+            "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy; "
+            + " ".join(cmd_tokens)
+            + f" > {remote_log} 2>&1; echo $? > {remote_log}.rc"
+        )
+        remote_launch = (
+            f"mkdir -p {remote_base} {remote_log_dir} && rm -f {remote_log} {remote_log}.rc && cd $HOME && "
+            f"nohup bash -c {shlex.quote((env_prefix + ' ' + inner).strip())} >/dev/null 2>&1 & echo LAUNCHED"
+        )
+        try:
+            remote_runner.run_shell(remote_launch, timeout=60)
+        except Exception as e:
+            log_callback("WARNING", slug, f"  [远程] 启动失败: {str(e)[:200]}", "accuracy")
+            return -1, ""
+
+        log_callback("INFO", slug, f"  [远程] 已在评测节点启动 {mapped}（nohup 后台执行）", "accuracy")
+
+        ds_log_file = ds_work_dir / "evalscope_stdout.log"
+        with open(ds_log_file, "w", encoding="utf-8") as _f:
+            _f.write("")
+
+        idle_timeout = int(spec.get("idle_timeout", 600) or 600)
+        last_off = 0
+        last_activity = time.time()
+        rc_code = -1
+        while True:
+            time.sleep(8)
+            from backend.services.task_manager import _cancel_flags
+            if _cancel_flags.get(model_run.task_id, False):
+                try:
+                    remote_runner.run_shell(f"pkill -f {shlex.quote('aoni_acc/' + tag)} || true", timeout=20)
+                except Exception:
+                    pass
+                rc_code = -1
+                break
+            try:
+                tail = remote_runner.run_shell(f"tail -c +{last_off + 1} {remote_log} 2>/dev/null; echo __AONI_END__", timeout=40)
+                txt = tail.stdout or ""
+                if "__AONI_END__" in txt:
+                    txt = txt.rsplit("__AONI_END__", 1)[0]
+                if txt:
+                    last_off += len(txt.encode("utf-8", errors="ignore"))
+                    last_activity = time.time()
+                    with open(ds_log_file, "a", encoding="utf-8") as _f:
+                        _f.write(txt)
+                    for line in txt.splitlines():
+                        if any(k in line.lower() for k in ("error", "evaluating", "failed", "finished", "score")):
+                            log_callback("INFO", slug, f"  [远程·{mapped}] {line.strip()[:220]}", "accuracy")
+                rc_probe = remote_runner.run_shell(f"cat {remote_log}.rc 2>/dev/null", timeout=20)
+                rc_txt = (rc_probe.stdout or "").strip()
+                if rc_txt.isdigit():
+                    rc_code = int(rc_txt)
+                    break
+                if time.time() - last_activity > idle_timeout:
+                    log_callback("WARNING", slug, f"  [远程] {mapped} 超过 {idle_timeout // 60} 分钟无新日志，终止远端任务", "accuracy")
+                    try:
+                        remote_runner.run_shell(f"pkill -f {shlex.quote('aoni_acc/' + tag)} || true", timeout=20)
+                    except Exception:
+                        pass
+                    rc_code = -1
+                    break
+            except Exception:
+                pass
+
+        # 拉回 report 分数（写到本地 ds_work_dir/reports，供 _parse_evalscope_output 解析）
+        try:
+            find_res = remote_runner.run_shell(
+                f"find {remote_base} -path '*/reports/*' -name '*.json' 2>/dev/null", timeout=40)
+            remote_reports = [l.strip() for l in (find_res.stdout or "").splitlines() if l.strip().endswith(".json")]
+            local_reports = ds_work_dir / "reports"
+            local_reports.mkdir(parents=True, exist_ok=True)
+            for rp in remote_reports:
+                cat = remote_runner.run_shell(f"cat {shlex.quote(rp)}", timeout=40)
+                if cat.returncode == 0 and cat.stdout:
+                    (local_reports / Path(rp).name).write_text(cat.stdout, encoding="utf-8")
+            # 题目明细（可选，用于 _log_evalscope_details）
+            if not remote_reports:
+                log_callback("WARNING", slug, f"  [远程] {mapped} 未找到 report JSON（可能未产出成绩）", "accuracy")
+        except Exception as e:
+            log_callback("WARNING", slug, f"  [远程] 拉取 report 失败: {str(e)[:200]}", "accuracy")
+
+        try:
+            with open(ds_log_file, encoding="utf-8", errors="ignore") as f:
+                out_text = f.read()
+        except Exception:
+            out_text = ""
+        return rc_code, out_text
+
     # ========== 逐数据集执行评测 ==========
-    total_ds_count = len(sampling_plan)
-    completed_ds_count = 0
-    acc_summary = []
+    # 汇总分母/结果需覆盖「断点续跑跳过」的已完成数据集，否则会漏报（如 GSM8K）
+    acc_map = {}
+    for _dname, _acc in resumed_ordered:
+        if isinstance(_acc, float):
+            acc_map[_dname] = f"{_acc:.2%}"
+    total_ds_count = len(sampling_plan) + len(resumed_ordered)
+    completed_ds_count = len(resumed_ordered)
     recorded_datasets = set()
+
+    def _render_acc_summary():
+        _ordered = list(dict.fromkeys(x.upper() for x in datasets))
+        return " | ".join(f"{k}: {acc_map[k]}" for k in _ordered if k in acc_map)
 
     try:
         for ds_idx, ds_item in enumerate(sampling_plan):
@@ -2247,7 +2850,7 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             if "bigcodebench" in ds.lower():
                 log_callback("WARNING", model_run.model_slug,
                              f"  ⚠️ 数据集 {ds.upper()} 评估需要代码执行沙盒环境支持，当前环境未开启，自动标定并顺畅推进后续数据集", "accuracy")
-                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="需要代码执行沙盒环境"))
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=ds_item["limit"], error="需要代码执行沙盒环境"))
                 db.commit()
                 recorded_datasets.add(ds.lower())
                 completed_ds_count += 1
@@ -2256,12 +2859,25 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             ds_work_dir = work_dir / f"ds_{ds}"
             ds_work_dir.mkdir(parents=True, exist_ok=True)
 
+            _ds_runner = None
+            if ds_item.get("exec") == "remote":
+                if node_runner is None:
+                    log_callback("ERROR", model_run.model_slug,
+                                 f"  ❌ {ds.upper()} 需在 x86 评测执行节点运行，但未配置节点 IP（请在设备/设置中配置）", "accuracy")
+                    db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None,
+                                     limit=ds_item["limit"], error="未配置评测执行节点(需 x86)"))
+                    db.commit()
+                    recorded_datasets.add(ds.lower())
+                    completed_ds_count += 1
+                    continue
+                _ds_runner = node_runner
+
             acc = None
             for attempt in range(1, 4):
                 try:
                     log_callback("INFO", model_run.model_slug,
                                  f"  正在评测 {ds.upper()} (第 {attempt}/3 次尝试)...", "accuracy")
-                    returncode, out_text = _run_evalscope_one(ds_item, ds_idx, total_ds_count, ds_work_dir)
+                    returncode, out_text = _run_evalscope_one(ds_item, ds_idx, total_ds_count, ds_work_dir, remote_runner=_ds_runner)
                     metrics = _parse_evalscope_output(out_text, work_dir=ds_work_dir, model_name=eval_model_name)
                     acc = _extract_acc(ds, metrics)
                     if acc is not None or returncode == 0:
@@ -2276,26 +2892,24 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
                 recorded_datasets.add(ds.lower())
                 elapsed_str = _format_duration(time.time() - acc_start_time)
                 acc_str = f"{acc:.2%}"
-                acc_summary.append(f"{ds.upper()}: {acc_str}")
-                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=acc, limit=limit, error=None))
+                acc_map[ds.upper()] = acc_str
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=acc, limit=ds_item["limit"], error=None))
                 db.commit()
                 model_run.progress = 60 + int(30 * (completed_ds_count / max(total_ds_count, 1)))
-                model_run.progress_detail = f"准确率测试 ({completed_ds_count}/{total_ds_count}) | 已用: {elapsed_str} | 结果: {' | '.join(acc_summary)}"
+                model_run.progress_detail = f"准确率测试 ({completed_ds_count}/{total_ds_count}) | 已用: {elapsed_str} | 结果: {_render_acc_summary()}"
                 db.commit()
                 log_callback("INFO", model_run.model_slug,
                              f"  ✅ 准确率 {ds.upper()}: {acc_str} (成绩已自动保存入库)", "accuracy")
             else:
-                if limit > 0:
-                    log_callback("INFO", model_run.model_slug,
-                                 f"  [容错降级] 启动真实题库 HTTP 评估引擎补全 {ds.upper()}...", "accuracy")
-                    _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, [ds], limit, acc_start_time)
-                else:
-                    db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="在线拉取超时/网络中断"))
-                    db.commit()
-                    log_callback("WARNING", model_run.model_slug,
-                                 f"  ❌ 数据集 {ds.upper()} 在线拉取超时，已自动记录并平滑推进后续测试", "accuracy")
+                # 已彻底禁用「伪造回退评测」(内置 canned 题)：评测未产出有效成绩时如实记录错误，
+                # 绝不产出与真实题库无关的假分数。
+                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None,
+                                 limit=ds_item["limit"], error="评测未产出有效成绩(已禁用伪造回退)"))
+                db.commit()
                 recorded_datasets.add(ds.lower())
                 completed_ds_count += 1
+                log_callback("WARNING", model_run.model_slug,
+                             f"  ❌ 数据集 {ds.upper()} 未产出有效成绩，已如实记录错误（未启用任何伪造回退）", "accuracy")
 
         _log_evalscope_details(work_dir, log_callback, model_run.model_slug)
 
@@ -2305,24 +2919,29 @@ def _run_accuracy_stage(db: Session, model_run: ModelRun, config: dict, log_call
             log_callback("INFO", model_run.model_slug, "准确率测试收到终止/重启指令，评测任务已停止", "accuracy")
             return
         log_callback("WARNING", model_run.model_slug,
-                     f"EvalScope 评测遇到网络或长跑中断 ({e})，正在启动未完成数据集的救底处理引擎...", "accuracy")
+                     f"EvalScope 评测遇到网络或长跑中断 ({e})，正在如实记录未完成数据集...", "accuracy")
+        plan_by_ds = {item["ds"]: item for item in sampling_plan}
         unprocessed = [item["ds"] for item in sampling_plan if item["ds"].lower() not in recorded_datasets]
         for ds in unprocessed:
-            if "bigcodebench" in ds.lower():
-                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="需要代码执行沙盒环境"))
-                db.commit()
-                continue
-            if limit > 0:
-                _run_real_http_accuracy_eval(db, model_run, config, log_callback, runner, [ds], limit, acc_start_time)
-            else:
-                db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None, limit=limit, error="长跑批处理网络中断/超时"))
-                db.commit()
-                log_callback("WARNING", model_run.model_slug,
-                             f"  ❌ 数据集 {ds.upper()} 自动记录中断，推进完成", "accuracy")
+            ds_item = plan_by_ds.get(ds, {})
+            db.add(AccResult(model_run_id=model_run.id, dataset=ds, accuracy=None,
+                             limit=ds_item.get("limit", 0), error="长跑批处理网络中断/超时(已禁用伪造回退)"))
+            db.commit()
+            log_callback("WARNING", model_run.model_slug,
+                         f"  ❌ 数据集 {ds.upper()} 自动记录中断，推进完成", "accuracy")
+
+    # 阶段结束：以数据库为准重建完整汇总（覆盖续跑/异常/提前返回等所有路径）
+    _finalize_acc_progress_detail(db, model_run, config, acc_start_time)
+    db.commit()
 
 
 def _run_real_http_accuracy_eval(db: Session, model_run: ModelRun, config: dict, log_callback, runner: RemoteRunner, datasets: list, limit: int, acc_start_time: float = None):
-    """基于 HTTP API 对真实题目逐题进行大模型推理解答与标答比对校对 (100% 真实评测，零模拟数据)"""
+    """[已废弃·禁止调用] 历史上此函数用内置的少量 canned 题目冒充"真实评测"，会产出与真实题库无关的假分数。
+
+    自 2026-09 起准确率阶段已彻底移除对它的调用：任何数据集未产出有效成绩时只记录 error。
+    保留函数体仅为兼容历史引用，切勿在任何新代码路径中重新启用。
+    """
+    raise RuntimeError("_run_real_http_accuracy_eval 已废弃：禁止使用伪造 canned 题产出假分数")
     if not datasets:
         return
 
@@ -2581,6 +3200,21 @@ def stop_task_containers(task):
                         os.kill(int(pid), 9)
                     except Exception:
                         pass
+    except Exception:
+        pass
+
+    # 终止评测执行节点上属于该任务的远程 evalscope 进程
+    try:
+        if task and hasattr(task, "id"):
+            from backend.models import PlatformSetting
+            from backend.database import session_factory
+            with session_factory() as sdb:
+                row = sdb.get(PlatformSetting, "eval_node_ip")
+                node_ip = (row.value or "").strip() if row else ""
+            if node_ip:
+                from backend.routers.eval_tools import build_eval_node_runner
+                nr = build_eval_node_runner(node_ip)
+                nr.run_shell(f"pkill -f 'aoni_acc/t{task.id}_mr' || true", timeout=25)
     except Exception:
         pass
 
